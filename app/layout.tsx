@@ -1,14 +1,12 @@
 import type { Metadata, Viewport } from 'next';
-import { Geist } from 'next/font/google';
+import '@fontsource-variable/instrument-sans';
 import './globals.css';
+import './typography.css';
 
-const geist = Geist({ variable: '--font-geist', subsets: ['latin'] });
 const title = 'Talvia — Toutes vos conversations commerciales au même endroit';
 const description = 'Centralisez LinkedIn, WhatsApp, Instagram et vos emails dans une inbox commerciale conçue pour vous aider à répondre, relancer et convertir vos prospects.';
 
-export const viewport: Viewport = {
-  themeColor: '#0D0B10',
-};
+export const viewport: Viewport = { themeColor: '#0D0B10' };
 
 export const metadata: Metadata = {
   metadataBase: new URL('https://talvia.io'),
@@ -29,5 +27,5 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  return <html lang="fr"><body className={geist.variable}>{children}</body></html>;
+  return <html lang="fr"><body>{children}</body></html>;
 }
