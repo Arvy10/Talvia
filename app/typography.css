@@ -1,8 +1,6 @@
 :root {
   --font-sans: 'Instrument Sans Variable', 'Segoe UI Variable', 'Segoe UI', sans-serif;
   --font-display: 'Instrument Serif', Georgia, serif;
-  --action-green: #5dd6a0;
-  --action-green-soft: #8be9bc;
   --type-display: clamp(3.25rem, 5vw, 4.25rem);
   --type-h2: clamp(2.25rem, 3.6vw, 3.125rem);
   --type-h3: 1.0625rem;
@@ -39,13 +37,16 @@ body {
 }
 
 .site-nav > div {
-  width: min(1200px, 100%);
+  width: fit-content;
+  max-width: calc(100% - 48px);
   height: auto;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  backdrop-filter: none;
+  min-height: 64px;
+  padding: 5px 6px 5px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  background: rgba(20, 16, 23, 0.7);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.3), inset 0 1px rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(20px) saturate(135%);
 }
 
 .site-nav > div > a {
@@ -53,16 +54,21 @@ body {
   padding: 0 12px;
   display: inline-flex;
   align-items: center;
+  border-radius: 999px;
+  transition: color 200ms ease, background-color 200ms ease, transform 200ms ease;
+}
+
+.site-nav > div > a:hover {
+  color: #fff;
+  background: rgba(5, 4, 7, 0.46);
+  transform: translateY(-1px);
 }
 
 .nav-cluster {
   min-height: 54px;
-  padding: 5px 6px 5px 20px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 999px;
-  background: rgba(20, 16, 23, 0.78);
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
-  backdrop-filter: blur(20px);
+  padding: 0;
+  border: 0;
+  background: transparent;
   display: flex;
   align-items: center;
   gap: 24px;
@@ -86,16 +92,19 @@ body {
 .button {
   font-weight: 610;
   letter-spacing: -0.008em;
+  transition: transform 220ms ease, color 220ms ease, background-color 220ms ease,
+    border-color 220ms ease, box-shadow 220ms ease, backdrop-filter 220ms ease;
 }
 
 .action-button {
   position: relative;
   overflow: hidden;
-  border-color: var(--action-green);
+  border-color: rgba(255, 142, 116, 0.72);
   border-radius: 999px;
-  background: var(--action-green);
-  color: #07150e;
-  box-shadow: 0 12px 34px rgba(93, 214, 160, 0.13);
+  background: linear-gradient(180deg, rgba(255, 132, 104, 0.92), rgba(255, 107, 74, 0.76));
+  color: #210d08;
+  box-shadow: 0 12px 34px rgba(255, 107, 74, 0.18), inset 0 1px rgba(255, 255, 255, 0.34);
+  backdrop-filter: blur(16px) saturate(145%);
   isolation: isolate;
 }
 
@@ -110,9 +119,11 @@ body {
 }
 
 .action-button:hover {
-  border-color: var(--action-green-soft);
-  background: var(--action-green-soft);
-  box-shadow: 0 16px 42px rgba(93, 214, 160, 0.22);
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(7, 6, 9, 0.84);
+  color: #fff;
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.34), inset 0 1px rgba(255, 255, 255, 0.07);
+  backdrop-filter: blur(18px) saturate(120%);
 }
 
 .action-button:hover::before {
@@ -131,6 +142,52 @@ body {
 
 .watch-button:hover span {
   transform: translateX(3px);
+}
+
+.site-nav nav a,
+.nav-cluster p > a:first-child {
+  padding: 10px 12px;
+  border-radius: 999px;
+  transition: color 200ms ease, background-color 200ms ease, transform 200ms ease,
+    backdrop-filter 200ms ease;
+}
+
+.site-nav nav a:hover,
+.nav-cluster p > a:first-child:hover {
+  color: #fff;
+  background: rgba(5, 4, 7, 0.58);
+  backdrop-filter: blur(12px);
+  transform: translateY(-1px);
+}
+
+.button:hover,
+.hero-actions .ghost:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(7, 6, 9, 0.84);
+  color: #fff;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.32), inset 0 1px rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(18px) saturate(120%);
+  transform: translateY(-2px);
+}
+
+.follow-card article button,
+.next button,
+.composer button,
+.password-field button {
+  transition: color 200ms ease, background-color 200ms ease, border-color 200ms ease,
+    box-shadow 200ms ease, transform 200ms ease, backdrop-filter 200ms ease;
+}
+
+.follow-card article button:hover,
+.next button:hover,
+.composer button:hover,
+.password-field button:hover {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(5, 4, 7, 0.82);
+  color: #fff;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(12px);
+  transform: translateY(-1px);
 }
 
 .hero {
@@ -293,9 +350,24 @@ body {
 .section-head > span,
 .section-kicker,
 .form-kicker {
+  font-family: var(--font-display);
   font-size: var(--type-label);
-  font-weight: 560;
-  letter-spacing: 0.105em;
+  font-weight: 400;
+  line-height: 1;
+  letter-spacing: 0.14em;
+}
+
+.inbox > header small,
+.insights header small,
+.next small,
+.intel-score small,
+.intel-visual footer small,
+.follow-card > header small,
+.crm-card section > small,
+.pricing-card > small:first-child {
+  font-family: var(--font-display);
+  font-weight: 400;
+  letter-spacing: 0.12em;
 }
 
 .section-head h2,
@@ -517,6 +589,17 @@ body {
     padding-left: 8px;
   }
 
+  .site-nav > div {
+    width: 100%;
+    max-width: none;
+    min-height: 58px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    backdrop-filter: none;
+  }
+
   .nav-cluster {
     min-height: 48px;
     padding: 4px;
@@ -619,7 +702,13 @@ body {
 
   .action-button::before,
   .action-button span,
-  .watch-button span {
+  .watch-button span,
+  .button,
+  .site-nav a,
+  .follow-card article button,
+  .next button,
+  .composer button,
+  .password-field button {
     transition: none;
   }
 }
