@@ -8,7 +8,7 @@ import { GlassCard, PageHeader, StatusBadge } from "../components/ui";
 import { useSandbox } from "../state/SandboxProvider";
 import type { ChannelId, ConnectionStatus } from "../state/types";
 import { ChannelLogo } from "./ChannelLogo";
-import { getNextConnectionStatus } from "./connection-flow";
+import { getNextConnectionStatus, getRecoveredConnectionStatus } from "./connection-flow";
 
 const channels: Array<{ id: ChannelId; name: string; description: string }> = [
   {
@@ -29,9 +29,10 @@ const channels: Array<{ id: ChannelId; name: string; description: string }> = [
 ];
 
 export function ConnectionsClient() {
-  const { dispatch, state } = useSandbox();
+  const { dispatch, hydrated, state } = useSandbox();
   const [disconnectingChannel, setDisconnectingChannel] = useState<ChannelId | null>(null);
   const timerIdsRef = useRef(new Map<ChannelId, ReturnType<typeof setTimeout>[]>());
+  const hasRecoveredTransientStatusesRef = useRef(false);
 
   const clearChannelTimers = (channel: ChannelId) => {
     timerIdsRef.current.get(channel)?.forEach(clearTimeout);
@@ -42,6 +43,21 @@ export function ConnectionsClient() {
     timerIdsRef.current.forEach((timerIds) => timerIds.forEach(clearTimeout));
     timerIdsRef.current.clear();
   }, []);
+
+  useEffect(() => {
+    if (!hydrated || hasRecoveredTransientStatusesRef.current) {
+      return;
+    }
+
+    channels.forEach(({ id }) => {
+      const status = state.connections[id].status;
+      const recoveredStatus = getRecoveredConnectionStatus(status);
+      if (recoveredStatus !== status) {
+        dispatch({ type: "SET_CONNECTION_STATUS", channel: id, status: recoveredStatus });
+      }
+    });
+    hasRecoveredTransientStatusesRef.current = true;
+  }, [dispatch, hydrated, state.connections]);
 
   const setStatus = (channel: ChannelId, status: ConnectionStatus) => {
     clearChannelTimers(channel);

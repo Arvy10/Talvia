@@ -11,3 +11,7 @@ const nextStatus: Record<ConnectionStatus, ConnectionStatus> = {
 export function getNextConnectionStatus(status: ConnectionStatus): ConnectionStatus {
   return nextStatus[status];
 }
+
+export function getRecoveredConnectionStatus(status: ConnectionStatus): ConnectionStatus {
+  return status === "connecting" || status === "syncing" ? "disconnected" : status;
+}

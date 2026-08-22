@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { getNextConnectionStatus } from "./connection-flow";
+import { getNextConnectionStatus, getRecoveredConnectionStatus } from "./connection-flow";
 
 describe("getNextConnectionStatus", () => {
   it.each([
@@ -11,5 +11,11 @@ describe("getNextConnectionStatus", () => {
     ["connected", "connected"],
   ] as const)("moves %s to %s", (status, expectedStatus) => {
     expect(getNextConnectionStatus(status)).toBe(expectedStatus);
+  });
+});
+
+describe("getRecoveredConnectionStatus", () => {
+  it.each(["connecting", "syncing"] as const)("recovers a persisted %s status as disconnected", (status) => {
+    expect(getRecoveredConnectionStatus(status)).toBe("disconnected");
   });
 });
