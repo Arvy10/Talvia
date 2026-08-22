@@ -43,6 +43,7 @@ export function SandboxProvider({ children }: { children: ReactNode }) {
     messages,
     campaigns,
     activities,
+    profile,
   } = state;
   const stateToPersist = useMemo<SandboxState>(
     () => ({
@@ -57,6 +58,7 @@ export function SandboxProvider({ children }: { children: ReactNode }) {
       ...(messages ? { messages } : {}),
       ...(campaigns ? { campaigns } : {}),
       ...(activities ? { activities } : {}),
+      ...(profile ? { profile } : {}),
     }),
     [
       schemaVersion,
@@ -69,6 +71,7 @@ export function SandboxProvider({ children }: { children: ReactNode }) {
       messages,
       campaigns,
       activities,
+      profile,
     ],
   );
 

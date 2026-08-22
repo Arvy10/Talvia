@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { LuDatabase, LuRefreshCcw, LuShieldAlert, LuSlidersHorizontal } from "react-icons/lu";
 
 import { Dialog } from "../components/Dialog";
@@ -41,6 +42,16 @@ export function SettingsClient() {
         <p>{state.storageAvailable ? "Le stockage local est disponible. Vos essais restent sur cet appareil." : "Le stockage local n’est pas disponible. Vos essais ne seront pas conservés après cette session."}</p>
       </GlassCard>
 
+      <GlassCard className="settings-card">
+        <div className="settings-card__heading"><LuSlidersHorizontal aria-hidden="true" /><div><p>WORKSPACE</p><h2>Workspace Talvia</h2></div></div>
+        <dl className="settings-details"><div><dt>Nom</dt><dd>Sandbox Talvia</dd></div><div><dt>Type</dt><dd>Environnement local</dd></div><div><dt>Propriétaire</dt><dd><Link href="/app/profile">Voir mon profil</Link></dd></div></dl>
+      </GlassCard>
+
+      <GlassCard className="settings-card" id="subscription">
+        <div className="settings-card__heading"><LuShieldAlert aria-hidden="true" /><div><p>ABONNEMENT</p><h2>Plan sandbox</h2></div></div>
+        <p>Le prototype fonctionne sans abonnement ni paiement réel. La facturation sera ajoutée lors de l’intégration du produit.</p>
+      </GlassCard>
+
       <GlassCard className="settings-card settings-card--preferences">
         <div className="settings-card__heading"><LuSlidersHorizontal aria-hidden="true" /><div><p>PRODUIT</p><h2>Préférences</h2></div></div>
         <dl className="settings-details">
@@ -52,7 +63,7 @@ export function SettingsClient() {
     </div>
 
     <GlassCard className="settings-danger-zone">
-      <div><div className="settings-card__heading"><LuShieldAlert aria-hidden="true" /><div><p>ZONE SENSIBLE</p><h2>Réinitialiser le bac à sable</h2></div></div><p>Supprime les configurations locales, les connexions simulées, les contacts, les opportunités et les automatisations créées pendant vos essais.</p></div>
+      <div><div className="settings-card__heading"><LuShieldAlert aria-hidden="true" /><div><p>ZONE SENSIBLE</p><h2>Réinitialiser le bac à sable</h2></div></div><p>Supprime les connexions simulées, contacts, messages, campagnes, opportunités, automatisations et activités créés pendant vos essais.</p></div>
       <button className="connection-button connection-button--danger" onClick={() => setIsResetDialogOpen(true)} type="button"><LuRefreshCcw aria-hidden="true" />Réinitialiser</button>
     </GlassCard>
 

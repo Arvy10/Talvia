@@ -140,6 +140,7 @@ function isPersistedSandboxState(value: unknown): value is PersistedSandboxState
     (state.messages === undefined || Array.isArray(state.messages)) &&
     (state.campaigns === undefined || Array.isArray(state.campaigns)) &&
     (state.activities === undefined || Array.isArray(state.activities))
+    && (state.profile === undefined || isRecord(state.profile))
   );
 }
 
@@ -186,6 +187,7 @@ export function saveSandboxState(state: SandboxState): void {
       ...(state.messages ? { messages: state.messages } : {}),
       ...(state.campaigns ? { campaigns: state.campaigns } : {}),
       ...(state.activities ? { activities: state.activities } : {}),
+      ...(state.profile ? { profile: state.profile } : {}),
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedState));
     storageAvailable = true;

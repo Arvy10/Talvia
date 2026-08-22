@@ -60,6 +60,8 @@ export function sandboxReducer(
       return { ...state, contacts: state.contacts.map((item) => item.id === action.contact.id ? action.contact : item) };
     case "DELETE_CONTACT":
       return { ...state, contacts: state.contacts.filter((item) => item.id !== action.id) };
+    case "UPDATE_PROFILE":
+      return { ...state, profile: action.profile };
     case "SET_PIPELINE_VIEW":
       return { ...state, pipelineView: action.view };
     case "RESTORE_SANDBOX_STATE":

@@ -54,6 +54,16 @@ export type SandboxActivity = {
   createdAt: string;
 };
 
+export type SandboxProfile = {
+  firstName: string;
+  lastName: string;
+  email: string;
+  company?: string;
+  role?: string;
+  language: string;
+  timezone: string;
+};
+
 export type Opportunity = {
   id: string;
   title: string;
@@ -86,6 +96,7 @@ export type SandboxState = {
   messages?: SandboxMessage[];
   campaigns?: SandboxCampaign[];
   activities?: SandboxActivity[];
+  profile?: SandboxProfile;
 };
 
 export type SandboxAction =
@@ -104,6 +115,7 @@ export type SandboxAction =
   | { type: "UPDATE_OPPORTUNITY_STAGE"; id: string; stage: OpportunityStage }
   | { type: "UPDATE_CONTACT"; contact: Contact }
   | { type: "DELETE_CONTACT"; id: string }
+  | { type: "UPDATE_PROFILE"; profile: SandboxProfile }
   | { type: "SET_PIPELINE_VIEW"; view: PipelineView }
   | { type: "RESTORE_SANDBOX_STATE"; state: SandboxState }
   | { type: "SET_STORAGE_AVAILABILITY"; available: boolean }

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { LuChevronUp } from "react-icons/lu";
 
 import { productNavigation } from "./navigation";
 
@@ -33,7 +34,10 @@ export function Sidebar({ pathname, drawer = false, onNavigate }: SidebarProps) 
     </nav>
     <footer className="app-sidebar__footer">
       <span aria-hidden="true">TS</span>
-      <div><strong>Sandbox Talvia</strong><small>Mode démonstration</small></div>
+      <details className="app-user-menu">
+        <summary><div><strong>Sandbox Talvia</strong><small>Mode démonstration</small></div><LuChevronUp aria-hidden="true" /></summary>
+        <div className="app-user-menu__panel"><Link href="/app/profile" onClick={onNavigate}>Mon profil</Link><Link href="/app/settings" onClick={onNavigate}>Mon workspace</Link><Link href="/app/settings#subscription" onClick={onNavigate}>Abonnement</Link><Link href="/app/settings" onClick={onNavigate}>Paramètres</Link><Link className="app-user-menu__logout" href="/login" onClick={onNavigate}>Se déconnecter</Link></div>
+      </details>
     </footer>
   </aside>;
 }
