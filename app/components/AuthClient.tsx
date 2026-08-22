@@ -1,9 +1,14 @@
 'use client';
 
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { FormEvent, useState } from 'react';
 
+import { activateSandboxSession } from '../app/state/session';
+import { loadSandboxState } from '../app/state/storage';
+
 export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
+  const router = useRouter();
   const signup = mode === 'signup';
   const [show, setShow] = useState(false);
   const [status, setStatus] = useState<'idle' | 'loading' | 'done'>('idle');
@@ -11,7 +16,11 @@ export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setStatus('loading');
-    window.setTimeout(() => setStatus('done'), 650);
+    window.setTimeout(() => {
+      activateSandboxSession(loadSandboxState());
+      setStatus('done');
+      router.push('/app');
+    }, 650);
   }
 
   return (
