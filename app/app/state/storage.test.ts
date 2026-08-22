@@ -29,13 +29,17 @@ describe("sandbox storage", () => {
   });
 
   it("returns a valid saved snapshot", () => {
-    const { storageAvailable: _storageAvailable, ...saved } = {
-      ...initialSandboxState,
+    const saved = {
+      schemaVersion: 1 as const,
+      sessionActive: false,
       connections: {
         ...initialSandboxState.connections,
         gmail: { status: "connected" as const },
       },
       contacts: [{ id: "contact-1", name: "Ada Lovelace" }],
+      opportunities: [],
+      automations: [],
+      pipelineView: "pipeline" as const,
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
 

@@ -6,7 +6,6 @@ import {
   useEffect,
   useMemo,
   useReducer,
-  useState,
   type Dispatch,
   type ReactNode,
 } from "react";
@@ -29,14 +28,14 @@ const SandboxContext = createContext<SandboxContextValue | null>(null);
 
 export function SandboxProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(sandboxReducer, initialSandboxState);
-  const [hydrated, setHydrated] = useState(false);
+  const [hydrated, markHydrated] = useReducer(() => true, false);
 
   useEffect(() => {
     dispatch({ type: "RESTORE_SANDBOX_STATE", state: loadSandboxState() });
     if (!isSandboxStorageAvailable()) {
       dispatch({ type: "SET_STORAGE_AVAILABILITY", available: false });
     }
-    setHydrated(true);
+    markHydrated();
   }, []);
 
   useEffect(() => {

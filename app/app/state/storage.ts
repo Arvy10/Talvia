@@ -84,7 +84,15 @@ export function saveSandboxState(state: SandboxState): void {
   }
 
   try {
-    const { storageAvailable: _storageAvailable, ...persistedState } = state;
+    const persistedState: PersistedSandboxState = {
+      schemaVersion: state.schemaVersion,
+      sessionActive: state.sessionActive,
+      connections: state.connections,
+      contacts: state.contacts,
+      opportunities: state.opportunities,
+      automations: state.automations,
+      pipelineView: state.pipelineView,
+    };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedState));
     storageAvailable = true;
   } catch {
