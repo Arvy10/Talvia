@@ -5,6 +5,8 @@ export const STORAGE_KEY = "talvia:sandbox:v1";
 
 let storageAvailable = true;
 
+type PersistedSandboxState = Omit<SandboxState, "storageAvailable">;
+
 const connectionStatuses: ConnectionStatus[] = [
   "disconnected",
   "connecting",
@@ -28,7 +30,7 @@ function isConnectionStatus(value: unknown): value is ConnectionStatus {
   );
 }
 
-function isSandboxState(value: unknown): value is SandboxState {
+function isPersistedSandboxState(value: unknown): value is PersistedSandboxState {
   if (typeof value !== "object" || value === null) {
     return false;
   }
@@ -39,7 +41,6 @@ function isSandboxState(value: unknown): value is SandboxState {
   return (
     state.schemaVersion === 1 &&
     typeof state.sessionActive === "boolean" &&
-    typeof state.storageAvailable === "boolean" &&
     typeof connections === "object" &&
     connections !== null &&
     isConnectionStatus(connections.linkedin?.status) &&
@@ -62,12 +63,15 @@ export function loadSandboxState(): SandboxState {
 
   try {
     const saved = window.localStorage.getItem(STORAGE_KEY);
+    storageAvailable = true;
     if (saved === null) {
       return createInitialSandboxState();
     }
 
     const parsed: unknown = JSON.parse(saved);
-    return isSandboxState(parsed) ? parsed : createInitialSandboxState();
+    return isPersistedSandboxState(parsed)
+      ? { ...parsed, storageAvailable }
+      : createInitialSandboxState();
   } catch {
     storageAvailable = false;
     return createInitialSandboxState();
@@ -80,7 +84,9 @@ export function saveSandboxState(state: SandboxState): void {
   }
 
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    const { storageAvailable: _storageAvailable, ...persistedState } = state;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedState));
+    storageAvailable = true;
   } catch {
     storageAvailable = false;
   }

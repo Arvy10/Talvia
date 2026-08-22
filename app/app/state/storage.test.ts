@@ -29,7 +29,7 @@ describe("sandbox storage", () => {
   });
 
   it("returns a valid saved snapshot", () => {
-    const saved = {
+    const { storageAvailable: _storageAvailable, ...saved } = {
       ...initialSandboxState,
       connections: {
         ...initialSandboxState.connections,
@@ -39,7 +39,18 @@ describe("sandbox storage", () => {
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
 
-    expect(loadSandboxState()).toEqual(saved);
+    expect(loadSandboxState()).toEqual({
+      ...saved,
+      storageAvailable: true,
+    });
+  });
+
+  it("does not persist the transient storage availability flag", () => {
+    saveSandboxState({ ...initialSandboxState, storageAvailable: false });
+
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
+
+    expect(saved).not.toHaveProperty("storageAvailable");
   });
 
   it("returns defaults when reading storage throws", () => {
@@ -48,6 +59,23 @@ describe("sandbox storage", () => {
     });
 
     expect(loadSandboxState()).toEqual(initialSandboxState);
+  });
+
+  it("restores availability after storage becomes healthy again", () => {
+    const getItem = vi
+      .spyOn(Storage.prototype, "getItem")
+      .mockImplementationOnce(() => {
+        throw new Error("storage unavailable");
+      });
+
+    loadSandboxState();
+    getItem.mockRestore();
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      ...initialSandboxState,
+      storageAvailable: false,
+    }));
+
+    expect(loadSandboxState().storageAvailable).toBe(true);
   });
 
   it("never throws when writing storage throws", () => {
