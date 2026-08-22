@@ -45,6 +45,8 @@ export function sandboxReducer(
       return { ...state, automations: [...state.automations, action.automation] };
     case "CREATE_MESSAGE":
       return { ...state, messages: [...(state.messages ?? []), action.message] };
+    case "CREATE_CONVERSATION":
+      return { ...state, conversations: (state.conversations ?? []).some((item) => item.contactId === action.conversation.contactId && item.channel === action.conversation.channel) ? state.conversations : [...(state.conversations ?? []), action.conversation] };
     case "CREATE_CAMPAIGN":
       return { ...state, campaigns: [...(state.campaigns ?? []), action.campaign] };
     case "UPDATE_CAMPAIGN":

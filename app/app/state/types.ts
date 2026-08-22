@@ -38,6 +38,14 @@ export type SandboxMessage = {
   createdAt: string;
 };
 
+export type SandboxConversation = {
+  id: string;
+  contactId: string;
+  channel: ChannelId;
+  createdAt: string;
+  unread?: boolean;
+};
+
 export type SandboxCampaign = {
   id: string;
   name: string;
@@ -75,6 +83,8 @@ export type Opportunity = {
   title: string;
   stage: OpportunityStage;
   organization?: string;
+  contactId?: string;
+  sourceChannel?: ChannelId;
 };
 
 export type Automation = {
@@ -100,6 +110,7 @@ export type SandboxState = {
   automations: Automation[];
   pipelineView: PipelineView;
   messages?: SandboxMessage[];
+  conversations?: SandboxConversation[];
   campaigns?: SandboxCampaign[];
   activities?: SandboxActivity[];
   profile?: SandboxProfile;
@@ -116,6 +127,7 @@ export type SandboxAction =
   | { type: "CREATE_OPPORTUNITY"; opportunity: Opportunity }
   | { type: "CREATE_AUTOMATION"; automation: Automation }
   | { type: "CREATE_MESSAGE"; message: SandboxMessage }
+  | { type: "CREATE_CONVERSATION"; conversation: SandboxConversation }
   | { type: "CREATE_CAMPAIGN"; campaign: SandboxCampaign }
   | { type: "UPDATE_CAMPAIGN"; campaign: SandboxCampaign }
   | { type: "DELETE_CAMPAIGN"; id: string }

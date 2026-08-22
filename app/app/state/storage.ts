@@ -9,6 +9,7 @@ import type {
   OpportunityStage,
   SandboxState,
   SandboxMessage,
+  SandboxConversation,
 } from "./types";
 
 export const STORAGE_KEY = "talvia:sandbox:v1";
@@ -80,11 +81,11 @@ function isContact(value: unknown): value is Contact {
 function isOpportunity(value: unknown): value is Opportunity {
   return (
     isRecord(value) &&
-    hasOnlyFields(value, ["id", "title", "stage", "organization"]) &&
+    hasOnlyFields(value, ["id", "title", "stage", "organization", "contactId", "sourceChannel"]) &&
     isNonEmptyString(value.id) &&
     isNonEmptyString(value.title) &&
     isOpportunityStage(value.stage) &&
-    isOptionalString(value.organization)
+    isOptionalString(value.organization) && isOptionalString(value.contactId) && isOptionalChannelId(value.sourceChannel)
   );
 }
 
@@ -113,6 +114,10 @@ function isSandboxMessage(value: unknown): value is SandboxMessage {
     isNonEmptyString(value.id) && isNonEmptyString(value.contactId) && isChannelId(value.channel) &&
     isNonEmptyString(value.body) && (value.direction === "inbound" || value.direction === "outbound") &&
     value.simulated === true && isNonEmptyString(value.createdAt);
+}
+
+function isSandboxConversation(value: unknown): value is SandboxConversation {
+  return isRecord(value) && hasOnlyFields(value, ["id", "contactId", "channel", "createdAt", "unread"]) && isNonEmptyString(value.id) && isNonEmptyString(value.contactId) && isChannelId(value.channel) && isNonEmptyString(value.createdAt) && (value.unread === undefined || typeof value.unread === "boolean");
 }
 
 function isConnectionStatus(value: unknown): value is ConnectionStatus {
@@ -146,6 +151,7 @@ function isPersistedSandboxState(value: unknown): value is PersistedSandboxState
     state.automations.every(isAutomation) &&
     (state.pipelineView === "pipeline" || state.pipelineView === "list") &&
     (state.messages === undefined || (Array.isArray(state.messages) && state.messages.every(isSandboxMessage))) &&
+    (state.conversations === undefined || (Array.isArray(state.conversations) && state.conversations.every(isSandboxConversation))) &&
     (state.campaigns === undefined || Array.isArray(state.campaigns)) &&
     (state.activities === undefined || Array.isArray(state.activities))
     && (state.profile === undefined || isRecord(state.profile))
@@ -193,6 +199,7 @@ export function saveSandboxState(state: SandboxState): void {
       automations: state.automations,
       pipelineView: state.pipelineView,
       ...(state.messages ? { messages: state.messages } : {}),
+      ...(state.conversations ? { conversations: state.conversations } : {}),
       ...(state.campaigns ? { campaigns: state.campaigns } : {}),
       ...(state.activities ? { activities: state.activities } : {}),
       ...(state.profile ? { profile: state.profile } : {}),
