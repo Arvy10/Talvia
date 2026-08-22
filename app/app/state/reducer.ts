@@ -47,6 +47,10 @@ export function sandboxReducer(
       return { ...state, messages: [...(state.messages ?? []), action.message] };
     case "CREATE_CAMPAIGN":
       return { ...state, campaigns: [...(state.campaigns ?? []), action.campaign] };
+    case "UPDATE_CAMPAIGN":
+      return { ...state, campaigns: (state.campaigns ?? []).map((item) => item.id === action.campaign.id ? action.campaign : item) };
+    case "DELETE_CAMPAIGN":
+      return { ...state, campaigns: (state.campaigns ?? []).filter((item) => item.id !== action.id) };
     case "ADD_ACTIVITY":
       return { ...state, activities: [...(state.activities ?? []), action.activity] };
     case "UPDATE_OPPORTUNITY_STAGE":

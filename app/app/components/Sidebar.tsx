@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { LuChevronUp } from "react-icons/lu";
+import { LuChevronLeft, LuChevronRight, LuChevronUp } from "react-icons/lu";
 
 import { productNavigation } from "./navigation";
 
@@ -7,14 +7,16 @@ type SidebarProps = {
   pathname: string;
   drawer?: boolean;
   onNavigate?: () => void;
+  collapsed?: boolean;
+  onCollapse?: () => void;
 };
 
 function isActive(pathname: string, href: string) {
   return href === "/app" ? pathname === href : pathname.startsWith(href);
 }
 
-export function Sidebar({ pathname, drawer = false, onNavigate }: SidebarProps) {
-  return <aside className={drawer ? "app-sidebar app-sidebar--drawer" : "app-sidebar"}>
+export function Sidebar({ pathname, drawer = false, onNavigate, collapsed = false, onCollapse }: SidebarProps) {
+  return <aside className={`${drawer ? "app-sidebar app-sidebar--drawer" : "app-sidebar"}${collapsed ? " is-collapsed" : ""}`}>
     <Link aria-label="Accueil Talvia" className="app-brand" href="/app" onClick={onNavigate}>
       <span aria-hidden="true" className="app-brand__mark"><i /><i /><i /><i /></span>
       <span>talvia</span>
@@ -32,6 +34,7 @@ export function Sidebar({ pathname, drawer = false, onNavigate }: SidebarProps) 
         </div>;
       })}
     </nav>
+    {!drawer ? <button aria-label={collapsed ? "Agrandir la sidebar" : "Réduire la sidebar"} className="sidebar-collapse-button" onClick={onCollapse} title={collapsed ? "Agrandir" : "Réduire"} type="button">{collapsed ? <LuChevronRight /> : <><LuChevronLeft /><span>Réduire</span></>}</button> : null}
     <footer className="app-sidebar__footer">
       <span aria-hidden="true">TS</span>
       <details className="app-user-menu">

@@ -14,10 +14,16 @@ const drawerFocusableSelector = "a[href], button:not([disabled]), [tabindex]:not
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const openingTriggerRef = useRef<HTMLElement | null>(null);
   const drawerRef = useRef<HTMLDivElement>(null);
   const activeItem = productNavigation.find((item) => item.href === "/app" ? pathname === item.href : pathname.startsWith(item.href));
   const title = activeItem?.label ?? "Talvia";
+
+  useEffect(() => {
+    setSidebarCollapsed(window.localStorage.getItem("talvia:sidebar-collapsed") === "true");
+  }, []);
+  const toggleSidebar = () => setSidebarCollapsed((current) => { const next = !current; window.localStorage.setItem("talvia:sidebar-collapsed", String(next)); return next; });
 
   const openDrawer = () => {
     openingTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -64,8 +70,8 @@ export function AppShell({ children }: { children: ReactNode }) {
     };
   }, [drawerOpen]);
 
-  return <div className="talvia-app">
-    <Sidebar pathname={pathname} />
+  return <div className={sidebarCollapsed ? "talvia-app is-sidebar-collapsed" : "talvia-app"}>
+    <Sidebar collapsed={sidebarCollapsed} onCollapse={toggleSidebar} pathname={pathname} />
     <div className="app-workspace">
       <Topbar onMenuOpen={openDrawer} title={title} />
       <main className="app-main">{children}</main>

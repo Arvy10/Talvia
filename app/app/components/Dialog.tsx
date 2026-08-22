@@ -11,6 +11,7 @@ type DialogProps = {
   title: string;
   description?: string;
   children: ReactNode;
+  className?: string;
 };
 
 const focusableSelector = [
@@ -22,7 +23,7 @@ const focusableSelector = [
   "[tabindex]:not([tabindex='-1'])",
 ].join(",");
 
-export function Dialog({ open, onClose, title, description, children }: DialogProps) {
+export function Dialog({ open, onClose, title, description, children, className }: DialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const openingTriggerRef = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
@@ -88,7 +89,7 @@ export function Dialog({ open, onClose, title, description, children }: DialogPr
       onClose();
     }
   }}>
-    <div aria-describedby={description ? descriptionId : undefined} aria-labelledby={titleId} aria-modal="true" className="dialog" ref={dialogRef} role="dialog" tabIndex={-1}>
+    <div aria-describedby={description ? descriptionId : undefined} aria-labelledby={titleId} aria-modal="true" className={`dialog${className ? ` ${className}` : ""}`} ref={dialogRef} role="dialog" tabIndex={-1}>
       <header className="dialog__header">
         <div>
           <h2 id={titleId}>{title}</h2>

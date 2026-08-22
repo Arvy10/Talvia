@@ -46,6 +46,12 @@ export type SandboxCampaign = {
   channels: ChannelId[];
   status: "draft" | "active" | "paused" | "completed";
   sequence: string[];
+  channel?: ChannelId;
+  initialMessage?: string;
+  followUpMessage?: string;
+  waitDays?: number;
+  stopOnReply?: boolean;
+  participantStatuses?: Record<string, "waiting" | "active" | "replied" | "completed" | "stopped">;
 };
 
 export type SandboxActivity = {
@@ -111,6 +117,8 @@ export type SandboxAction =
   | { type: "CREATE_AUTOMATION"; automation: Automation }
   | { type: "CREATE_MESSAGE"; message: SandboxMessage }
   | { type: "CREATE_CAMPAIGN"; campaign: SandboxCampaign }
+  | { type: "UPDATE_CAMPAIGN"; campaign: SandboxCampaign }
+  | { type: "DELETE_CAMPAIGN"; id: string }
   | { type: "ADD_ACTIVITY"; activity: SandboxActivity }
   | { type: "UPDATE_OPPORTUNITY_STAGE"; id: string; stage: OpportunityStage }
   | { type: "UPDATE_CONTACT"; contact: Contact }
