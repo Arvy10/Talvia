@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { LuPanelRight, LuPlus, LuSearch, LuUserRound, LuUsers } from "react-icons/lu";
+import { LuArrowLeft, LuPanelRight, LuPlus, LuSearch, LuUserRound, LuUsers } from "react-icons/lu";
 
 import { Dialog } from "../components/Dialog";
 import { EmptyState, PageHeader } from "../components/ui";
@@ -21,6 +21,10 @@ export function ContactsClient() {
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [phone, setPhone] = useState("");
+  const [company, setCompany] = useState("");
+  const [role, setRole] = useState("");
+  const [status, setStatus] = useState<"prospect" | "lead" | "client" | "other">("prospect");
+  const [notes, setNotes] = useState("");
   const [channel, setChannel] = useState<ChannelId | "">("");
   const [nameError, setNameError] = useState("");
   const [search, setSearch] = useState("");
@@ -32,6 +36,7 @@ export function ContactsClient() {
     setDisplayName("");
     setEmail("");
     setPhone("");
+    setCompany(""); setRole(""); setStatus("prospect"); setNotes("");
     setChannel("");
     setNameError("");
   };
@@ -53,6 +58,7 @@ export function ContactsClient() {
       ...(trimmedEmail ? { email: trimmedEmail } : {}),
       ...(trimmedPhone ? { phone: trimmedPhone } : {}),
       ...(channel ? { channel } : {}),
+      ...(company.trim() ? { company: company.trim() } : {}), ...(role.trim() ? { role: role.trim() } : {}), status, ...(notes.trim() ? { notes: notes.trim() } : {}),
     };
     dispatch({ type: "CREATE_CONTACT", contact });
     setSelectedContactId(contact.id);
@@ -60,8 +66,7 @@ export function ContactsClient() {
   };
 
   const visibleContacts = state.contacts.filter((contact) => {
-    const name = typeof contact.name === "string" ? contact.name : "";
-    const matchesSearch = name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase());
+    const matchesSearch = contact.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase());
     const matchesChannel = channelFilter === null || contact.channel === channelFilter;
     return matchesSearch && matchesChannel;
   });
@@ -75,7 +80,7 @@ export function ContactsClient() {
       actions={<button className="connection-button" onClick={() => setIsDialogOpen(true)} type="button"><LuPlus aria-hidden="true" />Nouveau contact</button>}
     />
 
-    <section aria-label="Répertoire de contacts" className="contacts-workspace">
+    <section aria-label="Répertoire de contacts" className={selectedContact === null ? "contacts-workspace" : "contacts-workspace has-selected-contact"}>
       <aside className="contacts-list-panel">
         <label className="inbox-search"><LuSearch aria-hidden="true" /><span className="sr-only">Rechercher des contacts</span><input onChange={(event) => setSearch(event.target.value)} placeholder="Rechercher un contact" type="search" value={search} /></label>
         <div aria-label="Filtrer par canal" className="contacts-channel-filters">
@@ -87,21 +92,22 @@ export function ContactsClient() {
           title="Aucun contact"
           description={search || channelFilter ? "Aucun contact créé ne correspond à ce filtre." : "Les contacts que vous créerez apparaîtront ici."}
         /> : <div className="contacts-list">
-          {visibleContacts.map((contact) => <button aria-pressed={selectedContactId === contact.id} className={selectedContactId === contact.id ? "is-active" : undefined} key={contact.id} onClick={() => setSelectedContactId(contact.id)} type="button"><LuUserRound aria-hidden="true" /><span>{typeof contact.name === "string" ? contact.name : "Contact sans nom"}</span></button>)}
+          {visibleContacts.map((contact) => <button aria-pressed={selectedContactId === contact.id} className={selectedContactId === contact.id ? "is-active" : undefined} key={contact.id} onClick={() => setSelectedContactId(contact.id)} type="button"><LuUserRound aria-hidden="true" /><span>{contact.name}</span></button>)}
         </div>}
       </aside>
 
       <section className="contacts-detail-panel">
+        {selectedContact === null ? null : <button className="contacts-mobile-back" onClick={() => setSelectedContactId(null)} type="button"><LuArrowLeft aria-hidden="true" />Retour à la liste des contacts</button>}
         {selectedContact === null ? <EmptyState
           icon={<LuPanelRight />}
           title="Sélectionnez un contact"
           description="Les détails d’un contact que vous aurez créé s’afficheront ici."
         /> : <article className="contact-detail">
           <p>CONTACT</p>
-          <h2>{typeof selectedContact.name === "string" ? selectedContact.name : "Contact sans nom"}</h2>
-          {typeof selectedContact.email === "string" ? <span>{selectedContact.email}</span> : null}
-          {typeof selectedContact.phone === "string" ? <span>{selectedContact.phone}</span> : null}
-          {typeof selectedContact.channel === "string" ? <span>{channels.find(({ id }) => id === selectedContact.channel)?.label}</span> : null}
+          <h2>{selectedContact.name}</h2>
+          {selectedContact.email ? <span>{selectedContact.email}</span> : null}
+          {selectedContact.phone ? <span>{selectedContact.phone}</span> : null}
+          {selectedContact.channel ? <span>{channels.find(({ id }) => id === selectedContact.channel)?.label}</span> : null}
         </article>}
       </section>
     </section>
@@ -113,7 +119,15 @@ export function ContactsClient() {
       title="Nouveau contact"
     >
       <form className="workspace-form" onSubmit={submitContact}>
-        <label>
+          <label>
+          <span>Entreprise <i>(facultatif)</i></span><input onChange={(event) => setCompany(event.target.value)} value={company} />
+        </label><label>
+          <span>Rôle <i>(facultatif)</i></span><input onChange={(event) => setRole(event.target.value)} value={role} />
+        </label><label>
+          <span>Statut</span><select onChange={(event) => setStatus(event.target.value as typeof status)} value={status}><option value="prospect">Prospect</option><option value="lead">Lead</option><option value="client">Client</option><option value="other">Autre</option></select>
+        </label><label>
+          <span>Notes <i>(facultatif)</i></span><textarea onChange={(event) => setNotes(event.target.value)} rows={3} value={notes} />
+        </label><label>
           <span>Nom d’affichage <em aria-hidden="true">*</em></span>
           <input aria-describedby={nameError ? "contact-name-error" : undefined} autoFocus onChange={(event) => { setDisplayName(event.target.value); setNameError(""); }} value={displayName} />
           {nameError ? <small id="contact-name-error" role="alert">{nameError}</small> : null}

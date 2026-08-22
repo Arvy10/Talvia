@@ -20,6 +20,16 @@ describe("sandboxReducer", () => {
     expect(connected.connections.whatsapp.status).toBe("disconnected");
   });
 
+  it("activates the sandbox session through a semantic action", () => {
+    const active = sandboxReducer(initialSandboxState, {
+      type: "ACTIVATE_SANDBOX_SESSION",
+    });
+
+    expect(active.sessionActive).toBe(true);
+    expect(active.connections).toBe(initialSandboxState.connections);
+    expect(active.contacts).toBe(initialSandboxState.contacts);
+  });
+
   it("resets state to the deterministic defaults", () => {
     const connected = sandboxReducer(initialSandboxState, {
       type: "SET_CONNECTION_STATUS",

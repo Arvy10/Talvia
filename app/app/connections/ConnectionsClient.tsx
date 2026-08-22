@@ -32,7 +32,8 @@ export function ConnectionsClient() {
   const { dispatch, hydrated, state } = useSandbox();
   const [disconnectingChannel, setDisconnectingChannel] = useState<ChannelId | null>(null);
   const timerIdsRef = useRef(new Map<ChannelId, ReturnType<typeof setTimeout>[]>());
-  const hasRecoveredTransientStatusesRef = useRef(false);
+  const connectionsRef = useRef(state.connections);
+  connectionsRef.current = state.connections;
 
   const clearChannelTimers = (channel: ChannelId) => {
     timerIdsRef.current.get(channel)?.forEach(clearTimeout);
@@ -40,24 +41,16 @@ export function ConnectionsClient() {
   };
 
   useEffect(() => () => {
-    timerIdsRef.current.forEach((timerIds) => timerIds.forEach(clearTimeout));
-    timerIdsRef.current.clear();
-  }, []);
-
-  useEffect(() => {
-    if (!hydrated || hasRecoveredTransientStatusesRef.current) {
-      return;
-    }
-
     channels.forEach(({ id }) => {
-      const status = state.connections[id].status;
+      const status = connectionsRef.current[id].status;
       const recoveredStatus = getRecoveredConnectionStatus(status);
       if (recoveredStatus !== status) {
         dispatch({ type: "SET_CONNECTION_STATUS", channel: id, status: recoveredStatus });
       }
     });
-    hasRecoveredTransientStatusesRef.current = true;
-  }, [dispatch, hydrated, state.connections]);
+    timerIdsRef.current.forEach((timerIds) => timerIds.forEach(clearTimeout));
+    timerIdsRef.current.clear();
+  }, [dispatch]);
 
   const setStatus = (channel: ChannelId, status: ConnectionStatus) => {
     clearChannelTimers(channel);

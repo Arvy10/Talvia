@@ -32,10 +32,6 @@ const emptyForm: AutomationForm = {
   enabled: true,
 };
 
-function getAutomationValue(automation: Record<string, unknown>, key: string) {
-  return typeof automation[key] === "string" ? automation[key] : "";
-}
-
 export function AutomationsClient() {
   const { dispatch, state } = useSandbox();
   const [isDialogOpen, setIsDialogOpen] = useState(false);
@@ -103,16 +99,14 @@ export function AutomationsClient() {
         action={<button className="connection-button connection-button--secondary" onClick={() => openBuilder()} type="button">Configurer un flux</button>}
       /> : <div className="automations-list">
         {state.automations.map((automation) => {
-          const channel = getAutomationValue(automation, "channel") as ChannelId;
-          const enabled = automation.enabled === true;
           return <GlassCard className="automation-card" key={automation.id}>
             <div className="automation-card__heading">
-              {channels.some(({ id }) => id === channel) ? <ChannelLogo channel={channel} /> : null}
-              <div><h3>{getAutomationValue(automation, "name") || "Automatisation sans nom"}</h3><span>{enabled ? "Activée" : "Désactivée"}</span></div>
+              <ChannelLogo channel={automation.channel} />
+              <div><h3>{automation.name}</h3><span>{automation.enabled ? "Activée" : "Désactivée"}</span></div>
             </div>
             <dl>
-              <div><dt>Déclencheur</dt><dd>{getAutomationValue(automation, "trigger") || "À définir"}</dd></div>
-              <div><dt>Action</dt><dd>{getAutomationValue(automation, "action") || "À définir"}</dd></div>
+              <div><dt>Déclencheur</dt><dd>{automation.trigger || "À définir"}</dd></div>
+              <div><dt>Action</dt><dd>{automation.action || "À définir"}</dd></div>
             </dl>
           </GlassCard>;
         })}

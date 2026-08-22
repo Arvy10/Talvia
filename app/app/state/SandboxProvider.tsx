@@ -6,6 +6,7 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useRef,
   type Dispatch,
   type ReactNode,
 } from "react";
@@ -29,11 +30,59 @@ const SandboxContext = createContext<SandboxContextValue | null>(null);
 export function SandboxProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(sandboxReducer, initialSandboxState);
   const [hydrated, markHydrated] = useReducer(() => true, false);
+  const storageAvailableRef = useRef(state.storageAvailable);
+  storageAvailableRef.current = state.storageAvailable;
+  const {
+    schemaVersion,
+    sessionActive,
+    connections,
+    contacts,
+    opportunities,
+    automations,
+    pipelineView,
+    messages,
+    campaigns,
+    activities,
+  } = state;
+  const stateToPersist = useMemo<SandboxState>(
+    () => ({
+      schemaVersion,
+      sessionActive,
+      storageAvailable: true,
+      connections,
+      contacts,
+      opportunities,
+      automations,
+      pipelineView,
+      ...(messages ? { messages } : {}),
+      ...(campaigns ? { campaigns } : {}),
+      ...(activities ? { activities } : {}),
+    }),
+    [
+      schemaVersion,
+      sessionActive,
+      connections,
+      contacts,
+      opportunities,
+      automations,
+      pipelineView,
+      messages,
+      campaigns,
+      activities,
+    ],
+  );
 
   useEffect(() => {
-    dispatch({ type: "RESTORE_SANDBOX_STATE", state: loadSandboxState() });
-    if (!isSandboxStorageAvailable()) {
-      dispatch({ type: "SET_STORAGE_AVAILABILITY", available: false });
+    const restoredState = loadSandboxState();
+    dispatch({
+      type: "RESTORE_SANDBOX_STATE",
+      state: {
+        ...restoredState,
+        storageAvailable: isSandboxStorageAvailable(),
+      },
+    });
+    if (!restoredState.sessionActive) {
+      dispatch({ type: "ACTIVATE_SANDBOX_SESSION" });
     }
     markHydrated();
   }, []);
@@ -43,11 +92,12 @@ export function SandboxProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    saveSandboxState(state);
-    if (!isSandboxStorageAvailable() && state.storageAvailable) {
-      dispatch({ type: "SET_STORAGE_AVAILABILITY", available: false });
+    saveSandboxState(stateToPersist);
+    const available = isSandboxStorageAvailable();
+    if (available !== storageAvailableRef.current) {
+      dispatch({ type: "SET_STORAGE_AVAILABILITY", available });
     }
-  }, [hydrated, state]);
+  }, [hydrated, stateToPersist]);
 
   const value = useMemo(
     () => ({ state, hydrated, dispatch }),

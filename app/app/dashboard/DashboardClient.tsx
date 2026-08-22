@@ -18,12 +18,16 @@ export function DashboardClient() {
   const { state } = useSandbox();
   const connectedCount = getConnectedChannelCount(state);
   const remainingCount = channelMap.length - connectedCount;
+  const messages = state.messages ?? [];
+  const activities = state.activities ?? [];
+  const inbound = messages.filter((message) => message.direction === "inbound").length;
+  const activeCampaigns = (state.campaigns ?? []).filter((campaign) => campaign.status === "active").length;
 
   return <div className="dashboard-page">
     <PageHeader
       eyebrow="Aujourd’hui"
       title="Votre espace commercial commence ici."
-      description="Reliez vos canaux pour retrouver chaque conversation au même endroit, sans inventer d’activité avant vos premiers échanges."
+      description="Retrouvez vos priorités commerciales à partir des données que vous créez dans le sandbox."
       actions={<Link className="connection-button" href="/app/connections"><LuUnplug aria-hidden="true" />Connexions</Link>}
     />
 
@@ -54,11 +58,7 @@ export function DashboardClient() {
       </Link>)}
     </section>
 
-    <EmptyState
-      className="dashboard-summary-empty"
-      icon={<LuInbox />}
-      title="L’essentiel apparaîtra ici"
-      description="Les nouveaux messages, suivis et signaux utiles prendront leur place après la connexion de vos canaux."
-    />
+    <section className="dashboard-priority-grid"><GlassCard className="dashboard-priority-card"><span>À répondre</span><strong>{inbound}</strong><p>Réponses entrantes simulées</p></GlassCard><GlassCard className="dashboard-priority-card"><span>Campagnes actives</span><strong>{activeCampaigns}</strong><p>Campagnes actuellement en cours</p></GlassCard><GlassCard className="dashboard-priority-card"><span>Activité récente</span><strong>{activities.length}</strong><p>Événements du sandbox</p></GlassCard></section>
+    {activities.length === 0 ? <EmptyState className="dashboard-summary-empty" icon={<LuInbox />} title="L’essentiel apparaîtra ici" description="Ajoutez un contact, envoyez un message ou créez une campagne pour alimenter votre espace." /> : <GlassCard className="dashboard-activity"><p className="dashboard-kicker">ACTIVITÉ RÉCENTE</p>{activities.slice(-6).reverse().map((activity) => <div key={activity.id}><span>{activity.label}</span><small>Simulé</small></div>)}</GlassCard>}
   </div>;
 }

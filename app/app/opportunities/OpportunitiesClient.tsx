@@ -73,8 +73,8 @@ export function OpportunitiesClient() {
             description="Les opportunités que vous créerez dans cette étape apparaîtront ici."
           /> : <div className="opportunity-cards">
             {opportunities.map((opportunity) => <article className="opportunity-card" key={opportunity.id}>
-              <strong>{typeof opportunity.title === "string" ? opportunity.title : "Opportunité sans titre"}</strong>
-              {typeof opportunity.organization === "string" ? <span>{opportunity.organization}</span> : null}
+              <strong>{opportunity.title}</strong>
+              {opportunity.organization ? <span>{opportunity.organization}</span> : null}
             </article>)}
           </div>}
         </section>;
@@ -86,8 +86,8 @@ export function OpportunitiesClient() {
         description="Créez votre première opportunité lorsque vous aurez une piste à suivre."
       /> : <div className="opportunity-cards">
         {state.opportunities.map((opportunity) => <article className="opportunity-card" key={opportunity.id}>
-          <strong>{typeof opportunity.title === "string" ? opportunity.title : "Opportunité sans titre"}</strong>
-          {typeof opportunity.organization === "string" ? <span>{opportunity.organization}</span> : null}
+          <strong>{opportunity.title}</strong>
+          {opportunity.organization ? <span>{opportunity.organization}</span> : null}
         </article>)}
       </div>}
     </section>}

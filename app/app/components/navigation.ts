@@ -1,6 +1,7 @@
 import type { IconType } from "react-icons";
 import {
   LuChartNoAxesColumnIncreasing,
+  LuSend,
   LuHouse,
   LuInbox,
   LuSettings,
@@ -18,6 +19,7 @@ export type ProductNavigationItem = {
 export const productNavigation: ProductNavigationItem[] = [
   { href: "/app", label: "Aujourd’hui", icon: LuHouse },
   { href: "/app/inbox", label: "Inbox", icon: LuInbox },
+  { href: "/app/campaigns", label: "Campagnes", icon: LuSend },
   { href: "/app/opportunities", label: "Opportunités", icon: LuChartNoAxesColumnIncreasing },
   { href: "/app/contacts", label: "Contacts", icon: LuUsers },
   { href: "/app/automations", label: "Automatisations", icon: LuWorkflow },

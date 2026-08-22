@@ -1,65 +1,21 @@
 "use client";
 
-import { LuChevronLeft, LuInbox, LuPanelRight, LuSearch, LuSlidersHorizontal } from "react-icons/lu";
-
-import { ChannelLogo } from "../connections/ChannelLogo";
+import { useState, type FormEvent } from "react";
+import { LuInbox, LuMessageCircle, LuPanelRight, LuPlus, LuSend } from "react-icons/lu";
+import { Dialog } from "../components/Dialog";
 import { EmptyState, PageHeader } from "../components/ui";
+import { ChannelLogo } from "../connections/ChannelLogo";
 import { useSandbox } from "../state/SandboxProvider";
-import { channelMap, getInboxAvailability, type InboxAvailability } from "./inbox-model";
-
-const availabilityLabels: Record<InboxAvailability, string> = {
-  disconnected: "Non connecté",
-  syncing: "Synchronisation…",
-  "connected-empty": "Prêt, aucune conversation",
-  error: "Connexion à vérifier",
-};
+import type { ChannelId } from "../state/types";
+import { channelMap } from "./inbox-model";
 
 export function InboxClient() {
-  const { state } = useSandbox();
-  const availability = getInboxAvailability(state.connections);
-
-  return <div className="inbox-page">
-    <PageHeader
-      eyebrow="Espace partagé"
-      title="Inbox"
-      description="Chaque conversation reliée à Talvia apparaîtra ici. Pour le moment, votre liste reste volontairement vide."
-    />
-
-    <section aria-label="Espace de conversations" className="inbox-workspace">
-      <aside className="inbox-list-panel">
-        <header className="inbox-list-panel__header">
-          <div><p>CONVERSATIONS</p><h2>Tout est calme</h2></div>
-          <LuSlidersHorizontal aria-hidden="true" />
-        </header>
-        <label className="inbox-search"><LuSearch aria-hidden="true" /><span className="sr-only">Rechercher dans les conversations</span><input disabled placeholder="Rechercher bientôt" type="search" /></label>
-        <div aria-label="Filtres de canaux" className="inbox-channel-filters">
-          {channelMap.map(({ id, label }) => <div className={`inbox-channel-filter inbox-channel-filter--${availability[id]}`} key={id}>
-            <ChannelLogo channel={id} />
-            <div><strong>{label}</strong><span>{availabilityLabels[availability[id]]}</span></div>
-          </div>)}
-        </div>
-        <EmptyState
-          className="inbox-list-empty"
-          icon={<LuInbox />}
-          title="Aucune conversation"
-          description="Connectez un canal, puis les conversations réelles arriveront ici."
-        />
-      </aside>
-
-      <section className="inbox-conversation-canvas">
-        <button className="inbox-mobile-back" type="button"><LuChevronLeft aria-hidden="true" />Retour à la liste</button>
-        <EmptyState
-          icon={<LuInbox />}
-          title="Sélectionnez une conversation"
-          description="Dès qu’un échange arrivera dans votre inbox, vous pourrez le consulter ici sans quitter Talvia."
-        />
-      </section>
-
-      <aside className="inbox-context-panel">
-        <button className="inbox-mobile-back" type="button"><LuChevronLeft aria-hidden="true" />Retour</button>
-        <div className="inbox-context-panel__heading"><LuPanelRight aria-hidden="true" /><div><p>CONTEXTE</p><h2>Aucun échange sélectionné</h2></div></div>
-        <p>Les informations utiles d’une conversation seront affichées ici, uniquement après sa réception.</p>
-      </aside>
-    </section>
-  </div>;
+  const { state, dispatch } = useSandbox();
+  const messages = state.messages ?? [];
+  const [open, setOpen] = useState(false); const [contactId, setContactId] = useState(""); const [channel, setChannel] = useState<ChannelId>("linkedin"); const [body, setBody] = useState(""); const [filter, setFilter] = useState<ChannelId | "all">("all");
+  const visible = messages.filter((message) => filter === "all" || message.channel === filter);
+  const close = () => { setOpen(false); setContactId(""); setBody(""); };
+  const submit = (event: FormEvent) => { event.preventDefault(); if (!contactId || !body.trim()) return; const now = new Date().toISOString(); dispatch({ type: "CREATE_MESSAGE", message: { id: crypto.randomUUID(), contactId, channel, body: body.trim(), direction: "outbound", simulated: true, createdAt: now } }); dispatch({ type: "ADD_ACTIVITY", activity: { id: crypto.randomUUID(), label: "Message sandbox envoyé", createdAt: now } }); close(); };
+  const simulateReply = (message: (typeof messages)[number]) => { const now = new Date().toISOString(); dispatch({ type: "CREATE_MESSAGE", message: { id: crypto.randomUUID(), contactId: message.contactId, channel: message.channel, body: "Réponse simulée du contact — merci pour votre message.", direction: "inbound", simulated: true, createdAt: now } }); dispatch({ type: "ADD_ACTIVITY", activity: { id: crypto.randomUUID(), label: "Réponse sandbox simulée", createdAt: now } }); };
+  return <div className="inbox-page"><PageHeader eyebrow="Espace partagé" title="Inbox" description="Centralisez vos conversations commerciales et testez vos messages dans le sandbox." actions={<button className="connection-button" onClick={() => setOpen(true)} type="button"><LuPlus />Nouvelle conversation</button>} /><section aria-label="Espace de conversations" className="inbox-workspace"><aside className="inbox-list-panel"><header className="inbox-list-panel__header"><div><p>CONVERSATIONS</p><h2>{visible.length ? `${visible.length} message(s)` : "Tout est calme"}</h2></div></header><div className="inbox-channel-filters"><button className={filter === "all" ? "is-active" : undefined} onClick={() => setFilter("all")} type="button"><LuInbox /><span>Toutes</span></button>{channelMap.map(({ id, label }) => <button className={filter === id ? "is-active" : undefined} key={id} onClick={() => setFilter(id)} type="button"><ChannelLogo channel={id} /><span>{label}</span></button>)}</div>{visible.length === 0 ? <EmptyState className="inbox-list-empty" icon={<LuInbox />} title="Aucune conversation" description="Créez une conversation sandbox pour commencer à tester vos échanges." /> : <div className="inbox-message-list">{visible.map((message) => <article className="inbox-message-preview" key={message.id}><ChannelLogo channel={message.channel} /><div><strong>{state.contacts.find((c) => c.id === message.contactId)?.name ?? "Contact sandbox"}</strong><p>{message.body}</p><small>{message.direction === "inbound" ? "Entrant" : "Envoyé"} · Simulé</small></div></article>)}</div>}</aside><section className="inbox-conversation-canvas">{visible.length === 0 ? <EmptyState icon={<LuMessageCircle />} title="Sélectionnez une conversation" description="Dès qu’un échange arrivera ici, vous pourrez le consulter." /> : <div className="inbox-thread"><div className="inbox-thread__heading"><div><p>CONVERSATION SANDBOX</p><h2>{state.contacts.find((c) => c.id === visible[0].contactId)?.name ?? "Contact sandbox"}</h2></div><button className="connection-button connection-button--secondary" onClick={() => simulateReply(visible[0])} type="button"><LuSend />Simuler une réponse</button></div>{visible.map((message) => <div className={`inbox-bubble inbox-bubble--${message.direction}`} key={message.id}><p>{message.body}</p><small>{message.direction === "inbound" ? "Réponse entrante" : "Message envoyé"} · Simulé</small></div>)}</div>}</section><aside className="inbox-context-panel"><div className="inbox-context-panel__heading"><LuPanelRight /><div><p>CONTEXTE</p><h2>Sandbox actif</h2></div></div><p>Les échanges ici sont fictifs. Ils ne déclenchent aucune API réelle.</p></aside></section><Dialog description="Choisissez un contact et envoyez un message fictif." onClose={close} open={open} title="Nouvelle conversation"><form className="workspace-form" onSubmit={submit}><label><span>Contact</span><select onChange={(e) => setContactId(e.target.value)} value={contactId}><option value="">Choisir un contact</option>{state.contacts.map((contact) => <option key={contact.id} value={contact.id}>{contact.name}</option>)}</select></label><label><span>Canal</span><select onChange={(e) => setChannel(e.target.value as ChannelId)} value={channel}>{channelMap.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}</select></label><label><span>Message</span><textarea onChange={(e) => setBody(e.target.value)} rows={4} value={body} /></label><div className="workspace-form__actions"><button className="connection-button connection-button--secondary" onClick={close} type="button">Annuler</button><button className="connection-button" type="submit">Envoyer en sandbox</button></div></form></Dialog></div>;
 }

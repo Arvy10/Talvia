@@ -24,6 +24,8 @@ export function sandboxReducer(
   action: SandboxAction,
 ): SandboxState {
   switch (action.type) {
+    case "ACTIVATE_SANDBOX_SESSION":
+      return state.sessionActive ? state : { ...state, sessionActive: true };
     case "SET_CONNECTION_STATUS":
       return {
         ...state,
@@ -41,6 +43,23 @@ export function sandboxReducer(
       };
     case "CREATE_AUTOMATION":
       return { ...state, automations: [...state.automations, action.automation] };
+    case "CREATE_MESSAGE":
+      return { ...state, messages: [...(state.messages ?? []), action.message] };
+    case "CREATE_CAMPAIGN":
+      return { ...state, campaigns: [...(state.campaigns ?? []), action.campaign] };
+    case "ADD_ACTIVITY":
+      return { ...state, activities: [...(state.activities ?? []), action.activity] };
+    case "UPDATE_OPPORTUNITY_STAGE":
+      return {
+        ...state,
+        opportunities: state.opportunities.map((item) =>
+          item.id === action.id ? { ...item, stage: action.stage } : item,
+        ),
+      };
+    case "UPDATE_CONTACT":
+      return { ...state, contacts: state.contacts.map((item) => item.id === action.contact.id ? action.contact : item) };
+    case "DELETE_CONTACT":
+      return { ...state, contacts: state.contacts.filter((item) => item.id !== action.id) };
     case "SET_PIPELINE_VIEW":
       return { ...state, pipelineView: action.view };
     case "RESTORE_SANDBOX_STATE":

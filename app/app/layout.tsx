@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 import "./app.css";
+import "./v2.css";
 import { AppShell } from "./components/AppShell";
 import { SandboxProvider } from "./state/SandboxProvider";
 

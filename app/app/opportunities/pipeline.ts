@@ -1,3 +1,5 @@
+import type { OpportunityStage } from "../state/types";
+
 export const PIPELINE_STAGES = [
   ["new", "Nouveau"],
   ["qualified", "Qualifié"],
@@ -6,4 +8,4 @@ export const PIPELINE_STAGES = [
   ["won", "Gagné"],
 ] as const;
 
-export type PipelineStage = (typeof PIPELINE_STAGES)[number][0];
+export type PipelineStage = OpportunityStage;

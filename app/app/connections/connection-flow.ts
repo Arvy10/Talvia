@@ -1,4 +1,5 @@
 import type { ConnectionStatus } from "../state/types";
+import { normalizeTransientConnectionStatus } from "../state/connection-status";
 
 const nextStatus: Record<ConnectionStatus, ConnectionStatus> = {
   disconnected: "connecting",
@@ -13,5 +14,5 @@ export function getNextConnectionStatus(status: ConnectionStatus): ConnectionSta
 }
 
 export function getRecoveredConnectionStatus(status: ConnectionStatus): ConnectionStatus {
-  return status === "connecting" || status === "syncing" ? "disconnected" : status;
+  return normalizeTransientConnectionStatus(status);
 }

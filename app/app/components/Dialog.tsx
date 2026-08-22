@@ -25,8 +25,13 @@ const focusableSelector = [
 export function Dialog({ open, onClose, title, description, children }: DialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const openingTriggerRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
   const titleId = useId();
   const descriptionId = useId();
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     if (!open) {
@@ -41,7 +46,7 @@ export function Dialog({ open, onClose, title, description, children }: DialogPr
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
 
@@ -72,7 +77,7 @@ export function Dialog({ open, onClose, title, description, children }: DialogPr
       document.removeEventListener("keydown", onKeyDown);
       openingTriggerRef.current?.focus();
     };
-  }, [onClose, open]);
+  }, [open]);
 
   if (!open) {
     return null;
