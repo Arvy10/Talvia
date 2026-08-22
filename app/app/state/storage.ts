@@ -8,6 +8,7 @@ import type {
   Opportunity,
   OpportunityStage,
   SandboxState,
+  SandboxMessage,
 } from "./types";
 
 export const STORAGE_KEY = "talvia:sandbox:v1";
@@ -107,6 +108,13 @@ function isAutomation(value: unknown): value is Automation {
   );
 }
 
+function isSandboxMessage(value: unknown): value is SandboxMessage {
+  return isRecord(value) && hasOnlyFields(value, ["id", "contactId", "channel", "body", "direction", "simulated", "createdAt"]) &&
+    isNonEmptyString(value.id) && isNonEmptyString(value.contactId) && isChannelId(value.channel) &&
+    isNonEmptyString(value.body) && (value.direction === "inbound" || value.direction === "outbound") &&
+    value.simulated === true && isNonEmptyString(value.createdAt);
+}
+
 function isConnectionStatus(value: unknown): value is ConnectionStatus {
   return (
     typeof value === "string" &&
@@ -137,7 +145,7 @@ function isPersistedSandboxState(value: unknown): value is PersistedSandboxState
     Array.isArray(state.automations) &&
     state.automations.every(isAutomation) &&
     (state.pipelineView === "pipeline" || state.pipelineView === "list") &&
-    (state.messages === undefined || Array.isArray(state.messages)) &&
+    (state.messages === undefined || (Array.isArray(state.messages) && state.messages.every(isSandboxMessage))) &&
     (state.campaigns === undefined || Array.isArray(state.campaigns)) &&
     (state.activities === undefined || Array.isArray(state.activities))
     && (state.profile === undefined || isRecord(state.profile))
