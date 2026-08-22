@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from 'next';
+import '@fontsource/instrument-serif';
 import '@fontsource-variable/instrument-sans';
 import './globals.css';
 import './typography.css';
