@@ -22,10 +22,13 @@ export type Contact = {
   email?: string;
   phone?: string;
   channel?: ChannelId;
+  linkedinUrl?: string;
   company?: string;
   role?: string;
-  status?: "prospect" | "lead" | "client" | "other";
+  website?: string;
+  status?: "new" | "follow_up" | "qualified" | "client" | "inactive" | "prospect" | "lead" | "other";
   notes?: string;
+  notesUpdatedAt?: string;
 };
 
 export type SandboxMessage = {

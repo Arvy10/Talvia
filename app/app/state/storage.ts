@@ -66,15 +66,16 @@ function isOpportunityStage(value: unknown): value is OpportunityStage {
 function isContact(value: unknown): value is Contact {
   return (
     isRecord(value) &&
-    hasOnlyFields(value, ["id", "name", "email", "phone", "channel", "company", "role", "status", "notes"]) &&
+    hasOnlyFields(value, ["id", "name", "email", "phone", "channel", "linkedinUrl", "company", "role", "website", "status", "notes", "notesUpdatedAt"]) &&
     isNonEmptyString(value.id) &&
     isNonEmptyString(value.name) &&
     isOptionalString(value.email) &&
     isOptionalString(value.phone) &&
     isOptionalChannelId(value.channel) &&
     isOptionalString(value.company) && isOptionalString(value.role) &&
-    (value.status === undefined || ["prospect", "lead", "client", "other"].includes(value.status as string)) &&
-    isOptionalString(value.notes)
+    isOptionalString(value.linkedinUrl) && isOptionalString(value.website) &&
+    (value.status === undefined || ["new", "follow_up", "qualified", "client", "inactive", "prospect", "lead", "other"].includes(value.status as string)) &&
+    isOptionalString(value.notes) && isOptionalString(value.notesUpdatedAt)
   );
 }
 

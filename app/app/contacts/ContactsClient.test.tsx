@@ -6,7 +6,11 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: vi.fn() }),
+}));
 
 import { SandboxProvider } from "../state/SandboxProvider";
 import { STORAGE_KEY } from "../state/storage";
@@ -50,29 +54,29 @@ describe("Contacts mobile detail flow", () => {
       </SandboxProvider>,
     );
 
-    const contact = await screen.findByRole("button", {
-      name: "Persona Synthétique",
-    });
-    fireEvent.click(contact);
+    const contactName = await screen.findByText("Persona Synthétique");
+    const contact = contactName.closest("button");
+    expect(contact).not.toBeNull();
+    fireEvent.click(contact!);
 
     const detailHeading = screen.getByRole("heading", {
-      level: 2,
+      level: 1,
       name: "Persona Synthétique",
     });
-    const detail = detailHeading.closest("article");
+    const detail = detailHeading.closest(".contact-record");
     expect(detail).not.toBeNull();
     expect(within(detail!).getByText("persona@example.test")).toBeDefined();
     expect(within(detail!).getByText("+000 000 000")).toBeDefined();
     expect(within(detail!).getByText("LinkedIn")).toBeDefined();
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Retour à la liste des contacts" }),
+      screen.getByRole("button", { name: "Retour aux contacts" }),
     );
 
     await waitFor(() => {
       expect(
         screen.queryByRole("heading", {
-          level: 2,
+          level: 1,
           name: "Persona Synthétique",
         }),
       ).toBeNull();

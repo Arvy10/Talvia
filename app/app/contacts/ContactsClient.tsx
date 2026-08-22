@@ -1,157 +1,60 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
-import { LuArrowLeft, LuPanelRight, LuPlus, LuSearch, LuUserRound, LuUsers } from "react-icons/lu";
-
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useMemo, useState, type FormEvent } from "react";
+import { LuArrowLeft, LuBuilding2, LuEllipsis, LuFileUp, LuMail, LuMessageSquare, LuPencil, LuPhone, LuPlus, LuSearch, LuTrash2, LuUserRound, LuUsers } from "react-icons/lu";
 import { Dialog } from "../components/Dialog";
 import { EmptyState, PageHeader } from "../components/ui";
 import { ChannelLogo } from "../connections/ChannelLogo";
 import { useSandbox } from "../state/SandboxProvider";
-import type { ChannelId } from "../state/types";
+import type { ChannelId, Contact } from "../state/types";
+import { findDuplicateContact, parseContactsCsv, type CsvContact } from "./contact-utils";
 
-const channels: Array<{ id: ChannelId; label: string }> = [
-  { id: "linkedin", label: "LinkedIn" },
-  { id: "whatsapp", label: "WhatsApp" },
-  { id: "gmail", label: "Gmail" },
-];
+type ContactStatus = NonNullable<Contact["status"]>;
+const statusLabels: Record<ContactStatus, string> = { new: "Nouveau", follow_up: "À suivre", qualified: "Qualifié", client: "Client", inactive: "Inactif", prospect: "Nouveau", lead: "À suivre", other: "Inactif" };
+const channelLabels: Record<ChannelId, string> = { linkedin: "LinkedIn", whatsapp: "WhatsApp", gmail: "Email" };
+const emptyForm = { firstName: "", lastName: "", company: "", role: "", email: "", phone: "", linkedinUrl: "", website: "", status: "new" as ContactStatus, notes: "" };
 
 export function ContactsClient() {
-  const { dispatch, state } = useSandbox();
-  const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [displayName, setDisplayName] = useState("");
-  const [email, setEmail] = useState("");
-  const [phone, setPhone] = useState("");
-  const [company, setCompany] = useState("");
-  const [role, setRole] = useState("");
-  const [status, setStatus] = useState<"prospect" | "lead" | "client" | "other">("prospect");
-  const [notes, setNotes] = useState("");
-  const [channel, setChannel] = useState<ChannelId | "">("");
-  const [nameError, setNameError] = useState("");
+  const { state, dispatch } = useSandbox();
+  const router = useRouter();
   const [search, setSearch] = useState("");
-  const [channelFilter, setChannelFilter] = useState<ChannelId | null>(null);
-  const [selectedContactId, setSelectedContactId] = useState<string | null>(null);
+  const [channelFilter, setChannelFilter] = useState<ChannelId | "all">("all");
+  const [statusFilter, setStatusFilter] = useState<ContactStatus | "all">("all");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [formOpen, setFormOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [form, setForm] = useState(emptyForm);
+  const [error, setError] = useState("");
+  const [duplicateId, setDuplicateId] = useState<string | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [csvRows, setCsvRows] = useState<CsvContact[]>([]);
+  const selected = state.contacts.find((contact) => contact.id === selectedId) ?? null;
 
-  const closeDialog = () => {
-    setIsDialogOpen(false);
-    setDisplayName("");
-    setEmail("");
-    setPhone("");
-    setCompany(""); setRole(""); setStatus("prospect"); setNotes("");
-    setChannel("");
-    setNameError("");
-  };
+  const visible = useMemo(() => state.contacts.filter((contact) => { const haystack = `${contact.name} ${contact.company ?? ""} ${contact.email ?? ""} ${contact.phone ?? ""}`.toLowerCase(); return haystack.includes(search.toLowerCase()) && (channelFilter === "all" || getChannels(contact).includes(channelFilter)) && (statusFilter === "all" || contact.status === statusFilter); }), [channelFilter, search, state.contacts, statusFilter]);
+  const conversations = selected ? (state.conversations ?? []).filter((item) => item.contactId === selected.id) : [];
+  const campaigns = selected ? (state.campaigns ?? []).filter((item) => item.contactIds.includes(selected.id)) : [];
+  const opportunities = selected ? state.opportunities.filter((item) => item.contactId === selected.id) : [];
+  const contactMessages = selected ? (state.messages ?? []).filter((item) => item.contactId === selected.id) : [];
 
-  const submitContact = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const trimmedName = displayName.trim();
+  const closeForm = () => { setFormOpen(false); setEditingId(null); setForm(emptyForm); setError(""); setDuplicateId(null); };
+  const openEdit = (contact: Contact) => { const parts = contact.name.split(" "); setEditingId(contact.id); setForm({ firstName: parts[0] ?? "", lastName: parts.slice(1).join(" "), company: contact.company ?? "", role: contact.role ?? "", email: contact.email ?? "", phone: contact.phone ?? "", linkedinUrl: contact.linkedinUrl ?? "", website: contact.website ?? "", status: contact.status ?? "new", notes: contact.notes ?? "" }); setFormOpen(true); };
+  const saveContact = (event: FormEvent) => { event.preventDefault(); const name = `${form.firstName} ${form.lastName}`.trim(); if (!name) { setError("Renseignez au moins un prénom ou un nom."); return; } if (!form.email && !form.phone && !form.linkedinUrl) { setError("Ajoutez au moins un moyen de contact."); return; } const candidate: Contact = { id: editingId ?? crypto.randomUUID(), name, email: form.email || undefined, phone: form.phone || undefined, linkedinUrl: form.linkedinUrl || undefined, channel: form.linkedinUrl ? "linkedin" : form.phone ? "whatsapp" : "gmail", company: form.company || undefined, role: form.role || undefined, website: form.website || undefined, status: form.status, notes: form.notes || undefined, notesUpdatedAt: form.notes ? new Date().toISOString() : undefined }; const duplicate = findDuplicateContact(state.contacts, candidate, editingId ?? undefined); if (duplicate) { setDuplicateId(duplicate.id); setError("Un contact similaire existe déjà."); return; } dispatch(editingId ? { type: "UPDATE_CONTACT", contact: candidate } : { type: "CREATE_CONTACT", contact: candidate }); if (!editingId) dispatch({ type: "ADD_ACTIVITY", activity: { id: crypto.randomUUID(), label: `Contact ${name} ajouté`, createdAt: new Date().toISOString() } }); setSelectedId(candidate.id); closeForm(); };
+  const startConversation = (channel: ChannelId) => { if (!selected) return; dispatch({ type: "CREATE_CONVERSATION", conversation: { id: crypto.randomUUID(), contactId: selected.id, channel, createdAt: new Date().toISOString() } }); router.push("/app/inbox"); };
+  const deleteContact = () => { if (!selected) return; dispatch({ type: "DELETE_CONTACT", id: selected.id }); setSelectedId(null); setDeleteOpen(false); };
+  const importRows = () => { csvRows.filter((row) => row.valid && !row.duplicate).forEach((row) => dispatch({ type: "CREATE_CONTACT", contact: { id: crypto.randomUUID(), name: `${row.firstName} ${row.lastName}`.trim(), email: row.email || undefined, phone: row.phone || undefined, linkedinUrl: row.linkedinUrl || undefined, channel: row.linkedinUrl ? "linkedin" : row.phone ? "whatsapp" : "gmail", company: row.company || undefined, role: row.role || undefined, status: "new" } })); setImportOpen(false); setCsvRows([]); };
 
-    if (!trimmedName) {
-      setNameError("Saisissez un nom d’affichage pour créer le contact.");
-      return;
-    }
-
-    const trimmedEmail = email.trim();
-    const trimmedPhone = phone.trim();
-    const contact = {
-      id: crypto.randomUUID(),
-      name: trimmedName,
-      ...(trimmedEmail ? { email: trimmedEmail } : {}),
-      ...(trimmedPhone ? { phone: trimmedPhone } : {}),
-      ...(channel ? { channel } : {}),
-      ...(company.trim() ? { company: company.trim() } : {}), ...(role.trim() ? { role: role.trim() } : {}), status, ...(notes.trim() ? { notes: notes.trim() } : {}),
-    };
-    dispatch({ type: "CREATE_CONTACT", contact });
-    setSelectedContactId(contact.id);
-    closeDialog();
-  };
-
-  const visibleContacts = state.contacts.filter((contact) => {
-    const matchesSearch = contact.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase());
-    const matchesChannel = channelFilter === null || contact.channel === channelFilter;
-    return matchesSearch && matchesChannel;
-  });
-  const selectedContact = state.contacts.find((contact) => contact.id === selectedContactId) ?? null;
-
-  return <div className="contacts-page">
-    <PageHeader
-      eyebrow="Répertoire"
-      title="Contacts"
-      description="Votre répertoire reste vide jusqu’à ce que vous y ajoutiez un contact réel à tester."
-      actions={<button className="connection-button" onClick={() => setIsDialogOpen(true)} type="button"><LuPlus aria-hidden="true" />Nouveau contact</button>}
-    />
-
-    <section aria-label="Répertoire de contacts" className={selectedContact === null ? "contacts-workspace" : "contacts-workspace has-selected-contact"}>
-      <aside className="contacts-list-panel">
-        <label className="inbox-search"><LuSearch aria-hidden="true" /><span className="sr-only">Rechercher des contacts</span><input onChange={(event) => setSearch(event.target.value)} placeholder="Rechercher un contact" type="search" value={search} /></label>
-        <div aria-label="Filtrer par canal" className="contacts-channel-filters">
-          {channels.map(({ id, label }) => <button aria-pressed={channelFilter === id} className={channelFilter === id ? "is-active" : undefined} key={id} onClick={() => setChannelFilter(channelFilter === id ? null : id)} type="button"><ChannelLogo channel={id} /><span>{label}</span></button>)}
-        </div>
-        {visibleContacts.length === 0 ? <EmptyState
-          className="contacts-list-empty"
-          icon={<LuUsers />}
-          title="Aucun contact"
-          description={search || channelFilter ? "Aucun contact créé ne correspond à ce filtre." : "Les contacts que vous créerez apparaîtront ici."}
-        /> : <div className="contacts-list">
-          {visibleContacts.map((contact) => <button aria-pressed={selectedContactId === contact.id} className={selectedContactId === contact.id ? "is-active" : undefined} key={contact.id} onClick={() => setSelectedContactId(contact.id)} type="button"><LuUserRound aria-hidden="true" /><span>{contact.name}</span></button>)}
-        </div>}
-      </aside>
-
-      <section className="contacts-detail-panel">
-        {selectedContact === null ? null : <button className="contacts-mobile-back" onClick={() => setSelectedContactId(null)} type="button"><LuArrowLeft aria-hidden="true" />Retour à la liste des contacts</button>}
-        {selectedContact === null ? <EmptyState
-          icon={<LuPanelRight />}
-          title="Sélectionnez un contact"
-          description="Les détails d’un contact que vous aurez créé s’afficheront ici."
-        /> : <article className="contact-detail">
-          <p>CONTACT</p>
-          <h2>{selectedContact.name}</h2>
-          {selectedContact.email ? <span>{selectedContact.email}</span> : null}
-          {selectedContact.phone ? <span>{selectedContact.phone}</span> : null}
-          {selectedContact.channel ? <span>{channels.find(({ id }) => id === selectedContact.channel)?.label}</span> : null}
-        </article>}
-      </section>
-    </section>
-
-    <Dialog
-      description="Les informations restent dans votre bac à sable tant que vous ne les réinitialisez pas."
-      onClose={closeDialog}
-      open={isDialogOpen}
-      title="Nouveau contact"
-    >
-      <form className="workspace-form" onSubmit={submitContact}>
-          <label>
-          <span>Entreprise <i>(facultatif)</i></span><input onChange={(event) => setCompany(event.target.value)} value={company} />
-        </label><label>
-          <span>Rôle <i>(facultatif)</i></span><input onChange={(event) => setRole(event.target.value)} value={role} />
-        </label><label>
-          <span>Statut</span><select onChange={(event) => setStatus(event.target.value as typeof status)} value={status}><option value="prospect">Prospect</option><option value="lead">Lead</option><option value="client">Client</option><option value="other">Autre</option></select>
-        </label><label>
-          <span>Notes <i>(facultatif)</i></span><textarea onChange={(event) => setNotes(event.target.value)} rows={3} value={notes} />
-        </label><label>
-          <span>Nom d’affichage <em aria-hidden="true">*</em></span>
-          <input aria-describedby={nameError ? "contact-name-error" : undefined} autoFocus onChange={(event) => { setDisplayName(event.target.value); setNameError(""); }} value={displayName} />
-          {nameError ? <small id="contact-name-error" role="alert">{nameError}</small> : null}
-        </label>
-        <label>
-          <span>Email <i>(facultatif)</i></span>
-          <input onChange={(event) => setEmail(event.target.value)} type="email" value={email} />
-        </label>
-        <label>
-          <span>Téléphone <i>(facultatif)</i></span>
-          <input onChange={(event) => setPhone(event.target.value)} type="tel" value={phone} />
-        </label>
-        <label>
-          <span>Canal <i>(facultatif)</i></span>
-          <select onChange={(event) => setChannel(event.target.value as ChannelId | "")} value={channel}>
-            <option value="">Aucun canal</option>
-            {channels.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
-          </select>
-        </label>
-        <div className="workspace-form__actions">
-          <button className="connection-button connection-button--secondary" onClick={closeDialog} type="button">Annuler</button>
-          <button className="connection-button" type="submit">Créer le contact</button>
-        </div>
-      </form>
-    </Dialog>
+  return <div className="contacts-page contacts-page--crm">
+    <PageHeader title="Contacts" description="Centralisez les personnes avec lesquelles vous développez vos relations commerciales." actions={<><button className="connection-button connection-button--secondary" onClick={() => setImportOpen(true)} type="button"><LuFileUp />Importer</button><button className="connection-button" onClick={() => setFormOpen(true)} type="button"><LuPlus />Ajouter un contact</button></>} />
+    {!selected ? <><div className="contacts-toolbar"><label><LuSearch /><input onChange={(event) => setSearch(event.target.value)} placeholder="Rechercher par nom, entreprise, email ou téléphone..." value={search} /></label><select onChange={(event) => setChannelFilter(event.target.value as ChannelId | "all")} value={channelFilter}><option value="all">Tous les canaux</option><option value="linkedin">LinkedIn</option><option value="whatsapp">WhatsApp</option><option value="gmail">Email</option></select><select onChange={(event) => setStatusFilter(event.target.value as ContactStatus | "all")} value={statusFilter}><option value="all">Tous les statuts</option><option value="new">Nouveau</option><option value="follow_up">À suivre</option><option value="qualified">Qualifié</option><option value="client">Client</option><option value="inactive">Inactif</option></select></div>{visible.length === 0 ? <EmptyState icon={<LuUsers />} title="Aucun contact pour le moment" description="Ajoutez vos premiers contacts ou enregistrez les personnes avec lesquelles vous échangez." action={<div className="contacts-empty-actions"><button className="connection-button" onClick={() => setFormOpen(true)} type="button">Ajouter un contact</button><button className="connection-button connection-button--secondary" onClick={() => setImportOpen(true)} type="button">Importer</button></div>} /> : <div className="contacts-table"><div className="contacts-table__head"><span>Contact</span><span>Entreprise / Fonction</span><span>Canaux</span><span>Statut</span><span>Dernière activité</span><span /></div>{visible.map((contact) => { const latest = [...(state.messages ?? [])].reverse().find((message) => message.contactId === contact.id); return <button className="contact-row" key={contact.id} onClick={() => setSelectedId(contact.id)} type="button"><span className="contact-row__identity"><i>{contact.name.slice(0, 2).toUpperCase()}</i><span><strong>{contact.name}</strong><small>{contact.email ?? ""}</small></span></span><span><strong>{contact.company ?? "—"}</strong><small>{contact.role ?? ""}</small></span><span className="contact-row__channels">{getChannels(contact).map((item) => <ChannelLogo channel={item} key={item} />)}</span><span><em className={`contact-status contact-status--${contact.status ?? "new"}`}>{statusLabels[contact.status ?? "new"]}</em></span><span>{latest ? new Date(latest.createdAt).toLocaleDateString("fr") : "Aucune"}</span><LuEllipsis /></button>; })}</div>}</> : <ContactDetail contact={selected} conversations={conversations} campaigns={campaigns} opportunities={opportunities} messages={contactMessages} onBack={() => setSelectedId(null)} onDelete={() => setDeleteOpen(true)} onEdit={() => openEdit(selected)} onMessage={startConversation} onNote={(notes) => dispatch({ type: "UPDATE_CONTACT", contact: { ...selected, notes, notesUpdatedAt: new Date().toISOString() } })} onOpportunity={() => dispatch({ type: "CREATE_OPPORTUNITY", opportunity: { id: crypto.randomUUID(), title: `Opportunité — ${selected.name}`, stage: "new", organization: selected.company, contactId: selected.id } })} />}
+    <Dialog className="contact-form-dialog" description="Une même personne peut réunir plusieurs canaux dans une seule fiche Talvia." onClose={closeForm} open={formOpen} title={editingId ? "Modifier le contact" : "Ajouter un contact"}><form className="workspace-form contact-form" onSubmit={saveContact}><div className="contact-form-grid"><label><span>Prénom</span><input autoFocus onChange={(event) => setForm({ ...form, firstName: event.target.value })} value={form.firstName} /></label><label><span>Nom</span><input onChange={(event) => setForm({ ...form, lastName: event.target.value })} value={form.lastName} /></label><label><span>Entreprise</span><input onChange={(event) => setForm({ ...form, company: event.target.value })} value={form.company} /></label><label><span>Fonction</span><input onChange={(event) => setForm({ ...form, role: event.target.value })} value={form.role} /></label></div><fieldset><legend>Canaux</legend><label><span>URL LinkedIn</span><input onChange={(event) => setForm({ ...form, linkedinUrl: event.target.value })} placeholder="https://linkedin.com/in/..." type="url" value={form.linkedinUrl} /></label><label><span>WhatsApp / téléphone</span><input onChange={(event) => setForm({ ...form, phone: event.target.value })} placeholder="+242..." type="tel" value={form.phone} /></label><label><span>Email professionnel</span><input onChange={(event) => setForm({ ...form, email: event.target.value })} type="email" value={form.email} /></label></fieldset><div className="contact-form-grid"><label><span>Statut</span><select onChange={(event) => setForm({ ...form, status: event.target.value as ContactStatus })} value={form.status}><option value="new">Nouveau</option><option value="follow_up">À suivre</option><option value="qualified">Qualifié</option><option value="client">Client</option><option value="inactive">Inactif</option></select></label><label><span>Site web</span><input onChange={(event) => setForm({ ...form, website: event.target.value })} type="url" value={form.website} /></label></div>{error ? <div className="contact-duplicate" role="alert"><strong>{error}</strong>{duplicateId ? <button onClick={() => { setSelectedId(duplicateId); closeForm(); }} type="button">Voir le contact existant</button> : null}</div> : null}<div className="workspace-form__actions"><button className="connection-button connection-button--secondary" onClick={closeForm} type="button">Annuler</button><button className="connection-button" type="submit">{editingId ? "Enregistrer" : "Ajouter le contact"}</button></div></form></Dialog>
+    <Dialog description="Le fichier reste sur cet appareil. Les doublons ne seront pas importés." onClose={() => { setImportOpen(false); setCsvRows([]); }} open={importOpen} title="Importer des contacts CSV"><div className="csv-import"><label className="csv-drop"><LuFileUp /><span>Sélectionner un fichier CSV</span><input accept=".csv,text/csv" onChange={async (event) => { const file = event.target.files?.[0]; if (file) setCsvRows(parseContactsCsv(await file.text(), state.contacts)); }} type="file" /></label>{csvRows.length ? <><div className="csv-summary"><span><strong>{csvRows.length}</strong>Lignes</span><span><strong>{csvRows.filter((row) => row.valid && !row.duplicate).length}</strong>Valides</span><span><strong>{csvRows.filter((row) => row.duplicate).length}</strong>Doublons</span><span><strong>{csvRows.filter((row) => !row.valid).length}</strong>Erreurs</span></div><div className="csv-preview">{csvRows.slice(0, 8).map((row, index) => <div key={index}><span>{`${row.firstName} ${row.lastName}`.trim() || "Ligne sans nom"}</span><span>{row.email || row.phone || row.linkedinUrl}</span><em>{row.duplicate ? "Doublon" : row.valid ? "Valide" : "Erreur"}</em></div>)}</div></> : <p>Colonnes supportées : first_name, last_name, email, phone, company, job_title, linkedin_url.</p>}<div className="workspace-form__actions"><button className="connection-button connection-button--secondary" onClick={() => setImportOpen(false)} type="button">Annuler</button><button className="connection-button" disabled={!csvRows.some((row) => row.valid && !row.duplicate)} onClick={importRows} type="button">Importer les contacts</button></div></div></Dialog>
+    <Dialog description="Les conversations, campagnes et opportunités liées resteront dans le sandbox mais ne pourront plus afficher cette identité." onClose={() => setDeleteOpen(false)} open={deleteOpen} title="Supprimer ce contact ?"><div className="contact-delete-warning"><p>{conversations.length} conversation(s), {campaigns.length} campagne(s) et {opportunities.length} opportunité(s) sont associées à ce contact.</p><div className="workspace-form__actions"><button className="connection-button connection-button--secondary" onClick={() => setDeleteOpen(false)} type="button">Annuler</button><button className="connection-button connection-button--danger" onClick={deleteContact} type="button">Supprimer le contact</button></div></div></Dialog>
   </div>;
 }
+
+function getChannels(contact: Contact): ChannelId[] { const result = new Set<ChannelId>(); if (contact.linkedinUrl || contact.channel === "linkedin") result.add("linkedin"); if (contact.phone || contact.channel === "whatsapp") result.add("whatsapp"); if (contact.email || contact.channel === "gmail") result.add("gmail"); return [...result]; }
+
+function ContactDetail({ contact, conversations, campaigns, opportunities, messages, onBack, onDelete, onEdit, onMessage, onNote, onOpportunity }: { contact: Contact; conversations: NonNullable<ReturnType<typeof useSandbox>["state"]["conversations"]>; campaigns: NonNullable<ReturnType<typeof useSandbox>["state"]["campaigns"]>; opportunities: ReturnType<typeof useSandbox>["state"]["opportunities"]; messages: NonNullable<ReturnType<typeof useSandbox>["state"]["messages"]>; onBack: () => void; onDelete: () => void; onEdit: () => void; onMessage: (channel: ChannelId) => void; onNote: (note: string) => void; onOpportunity: () => void }) { const channels = getChannels(contact); return <div className="contact-record"><button className="contact-record__back" onClick={onBack} type="button"><LuArrowLeft />Retour aux contacts</button><header className="contact-record__header"><div className="contact-record__person"><span>{contact.name.slice(0, 2).toUpperCase()}</span><div><h1>{contact.name}</h1><p>{contact.role ?? "Fonction non renseignée"}{contact.company ? ` · ${contact.company}` : ""}</p></div></div><div><div className="contact-message-menu"><button className="connection-button" disabled={!channels.length} type="button"><LuMessageSquare />Message</button><div>{channels.map((channel) => <button key={channel} onClick={() => onMessage(channel)} type="button"><ChannelLogo channel={channel} />{channelLabels[channel]}</button>)}</div></div><button className="connection-button connection-button--secondary" onClick={onEdit} type="button"><LuPencil />Modifier</button><button className="connection-button connection-button--quiet" onClick={onDelete} type="button"><LuTrash2 /></button></div></header><div className="contact-record-grid"><section><h2>Coordonnées</h2><dl>{contact.linkedinUrl ? <div><dt><ChannelLogo channel="linkedin" />LinkedIn</dt><dd>{contact.linkedinUrl}</dd></div> : null}{contact.phone ? <div><dt><LuPhone />WhatsApp</dt><dd>{contact.phone}</dd></div> : null}{contact.email ? <div><dt><LuMail />Email</dt><dd>{contact.email}</dd></div> : null}</dl></section><section><h2>Professionnel</h2><dl><div><dt><LuBuilding2 />Entreprise</dt><dd>{contact.company ?? "Non renseignée"}</dd></div><div><dt><LuUserRound />Fonction</dt><dd>{contact.role ?? "Non renseignée"}</dd></div></dl></section><section className="contact-notes-section"><h2>Notes</h2><textarea onChange={(event) => onNote(event.target.value)} placeholder="Ajoutez une note commerciale..." rows={5} value={contact.notes ?? ""} />{contact.notesUpdatedAt ? <small>Modifiée le {new Date(contact.notesUpdatedAt).toLocaleDateString("fr")}</small> : null}</section><section><h2>Opportunité</h2>{opportunities.length ? opportunities.map((item) => <div className="contact-related-item" key={item.id}><strong>{item.title}</strong><span>{item.stage}</span></div>) : <div className="contact-related-empty"><span>Aucune opportunité associée.</span><button onClick={onOpportunity} type="button">Créer une opportunité</button></div>}</section><section><h2>Conversations</h2>{conversations.length ? conversations.map((item) => { const latest = [...messages].reverse().find((message) => message.channel === item.channel); return <Link className="contact-related-item" href="/app/inbox" key={item.id}><span><ChannelLogo channel={item.channel} />{channelLabels[item.channel]}</span><small>{latest ? new Date(latest.createdAt).toLocaleDateString("fr") : "Aucun message"}</small></Link>; }) : <p className="contact-section-empty">Aucune conversation.</p>}</section><section><h2>Campagnes</h2>{campaigns.length ? campaigns.map((item) => <Link className="contact-related-item" href="/app/campaigns" key={item.id}><strong>{item.name}</strong><span>{item.participantStatuses?.[contact.id] ?? item.status}</span></Link>) : <p className="contact-section-empty">Aucune campagne.</p>}</section></div></div>; }
