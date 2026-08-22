@@ -7,6 +7,7 @@ describe("productNavigation", () => {
     expect(productNavigation.map((item) => item.href)).toEqual([
       "/app",
       "/app/inbox",
+      "/app/campaigns",
       "/app/opportunities",
       "/app/contacts",
       "/app/automations",

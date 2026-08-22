@@ -24,7 +24,7 @@ export function Sidebar({ pathname, drawer = false, onNavigate, collapsed = fals
     <nav aria-label="Navigation de l’application" className="app-navigation">
       {productNavigation.map((item, index) => {
         const Icon = item.icon;
-        const utilityItem = index === 5;
+        const utilityItem = item.href === "/app/connections";
         return <div className={utilityItem ? "app-navigation__utility" : undefined} key={item.href}>
           {utilityItem ? <span aria-hidden="true" className="app-navigation__divider" /> : null}
           <Link aria-current={isActive(pathname, item.href) ? "page" : undefined} className={isActive(pathname, item.href) ? "app-navigation__link is-active" : "app-navigation__link"} href={item.href} onClick={onNavigate} title={item.label}>
