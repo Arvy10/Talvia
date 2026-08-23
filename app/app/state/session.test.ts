@@ -18,8 +18,8 @@ describe("sandbox session activation", () => {
         linkedin: { status: "connected" as const },
       },
       contacts: [{ id: "contact-1", name: "Ada Lovelace" }],
-      opportunities: [{ id: "opportunity-1", stage: "proposal" }],
-      automations: [{ id: "automation-1", enabled: true }],
+      opportunities: [{ id: "opportunity-1", title: "Proposal", stage: "proposal" as const }],
+      automations: [{ id: "automation-1", name: "Test", trigger: "message_received", channel: "gmail" as const, action: "prepare_draft", enabled: true }],
       pipelineView: "list" as const,
     };
 

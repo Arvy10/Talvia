@@ -11,7 +11,12 @@ export type ActivityInput = {
   source?: ActivitySource;
   automationRunId?: string;
 };
-export type ActivityRecord = ActivityInput & { id: string; workspaceId: string; createdAt: string };
+export type ActivityRecord = ActivityInput & {
+  id: string;
+  workspaceId: string;
+  actorUserId: string;
+  createdAt: string;
+};
 
 export async function recordActivity(context: WorkspaceContext, input: ActivityInput, client?: PoolClient): Promise<ActivityRecord> {
   const executor = client ?? database;
@@ -21,7 +26,13 @@ export async function recordActivity(context: WorkspaceContext, input: ActivityI
     [context.workspaceId, context.userId, input.eventType, input.entityType, input.entityId, input.metadata ?? {}, input.source ?? "user", input.automationRunId ?? null],
   );
   const row = result.rows[0]!;
-  return { ...input, id: row.id, workspaceId: context.workspaceId, createdAt: row.created_at };
+  return {
+    ...input,
+    id: row.id,
+    workspaceId: context.workspaceId,
+    actorUserId: context.userId,
+    createdAt: row.created_at,
+  };
 }
 
 export async function processRecordedActivity(activity: ActivityRecord) {

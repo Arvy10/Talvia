@@ -73,7 +73,7 @@ describe("SandboxProvider", () => {
       .mockImplementationOnce(() => {
         throw new Error("storage unavailable once");
       })
-      .mockImplementation(function (key, value) {
+      .mockImplementation(function (this: Storage, key, value) {
         return originalSetItem.call(this, key, value);
       });
 

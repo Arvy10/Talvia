@@ -7,17 +7,26 @@ import { LuArrowLeft, LuBuilding2, LuEllipsis, LuFileUp, LuMail, LuMessageSquare
 import { Dialog } from "../components/Dialog";
 import { EmptyState, PageHeader } from "../components/ui";
 import { ChannelLogo } from "../connections/ChannelLogo";
-import { useSandbox } from "../state/SandboxProvider";
-import type { ChannelId, Contact } from "../state/types";
+import type { ChannelId, Contact, Opportunity, SandboxCampaign, SandboxConversation, SandboxMessage } from "../state/types";
 import { findDuplicateContact, parseContactsCsv, type CsvContact } from "./contact-utils";
 
 type ContactStatus = NonNullable<Contact["status"]>;
 const statusLabels: Record<ContactStatus, string> = { new: "Nouveau", follow_up: "À suivre", qualified: "Qualifié", client: "Client", inactive: "Inactif", prospect: "Nouveau", lead: "À suivre", other: "Inactif" };
 const channelLabels: Record<ChannelId, string> = { linkedin: "LinkedIn", whatsapp: "WhatsApp", gmail: "Email" };
 const emptyForm = { firstName: "", lastName: "", company: "", role: "", email: "", phone: "", linkedinUrl: "", website: "", status: "new" as ContactStatus, notes: "" };
+type ApiChannel = "linkedin" | "whatsapp" | "email";
+type RelatedConversation = { id: string; channel: ApiChannel; last_message_at: string | null };
+type RelatedOpportunity = { id: string; title: string; stage: string };
+type RelatedCampaign = { id: string; name: string; status: string; participant_status: string | null };
+type RelatedResponse = { conversations: RelatedConversation[]; opportunities: RelatedOpportunity[]; campaigns: RelatedCampaign[] };
+type RelatedData = { conversations: SandboxConversation[]; opportunities: Opportunity[]; campaigns: SandboxCampaign[] };
+const emptyRelated: RelatedData = { conversations: [], opportunities: [], campaigns: [] };
+const apiChannelToUi = (channel: ApiChannel): ChannelId => channel === "email" ? "gmail" : channel;
+// Kept only as a structural type for the legacy detail renderer below; no
+// Sandbox provider is read by this screen.
+declare const useSandbox: () => { state: { conversations?: SandboxConversation[]; campaigns?: SandboxCampaign[]; opportunities: Opportunity[]; messages?: SandboxMessage[] } };
 
 export function ContactsClient() {
-  const { state, dispatch } = useSandbox();
   const router = useRouter();
   const [search, setSearch] = useState("");
   const [channelFilter, setChannelFilter] = useState<ChannelId | "all">("all");
@@ -33,6 +42,7 @@ export function ContactsClient() {
   const [csvRows, setCsvRows] = useState<CsvContact[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
+  const [related, setRelated] = useState<RelatedData>(emptyRelated);
   const selected = contacts.find((contact) => contact.id === selectedId) ?? null;
 
   const refreshContacts = async () => {
@@ -42,17 +52,52 @@ export function ContactsClient() {
     setLoading(false);
   };
   useEffect(() => { void refreshContacts(); }, []);
+  useEffect(() => {
+    if (!selectedId) {
+      setRelated(emptyRelated);
+      return;
+    }
+    let active = true;
+    void fetch(`/api/contacts/${selectedId}/related`, { cache: "no-store" })
+      .then(async (response) => response.ok ? response.json() as Promise<RelatedResponse> : null)
+      .then((data) => {
+        if (!active || !data) return;
+        setRelated({
+          conversations: data.conversations.map((item) => ({ id: item.id, contactId: selectedId, channel: apiChannelToUi(item.channel), createdAt: item.last_message_at ?? "" })),
+          opportunities: data.opportunities.map((item) => ({ id: item.id, title: item.title, stage: item.stage as Opportunity["stage"], contactId: selectedId })),
+          campaigns: data.campaigns.map((item) => ({ id: item.id, name: item.name, objective: "prospecting", contactIds: [selectedId], channels: [], status: item.status === "active" || item.status === "paused" || item.status === "completed" ? item.status : "draft", sequence: [], participantStatuses: item.participant_status ? { [selectedId]: item.participant_status as "waiting" | "active" | "replied" | "completed" | "stopped" } : undefined })),
+        });
+      })
+      .catch(() => { if (active) setRelated(emptyRelated); });
+    return () => { active = false; };
+  }, [selectedId]);
 
   const visible = useMemo(() => contacts.filter((contact) => { const haystack = `${contact.name} ${contact.company ?? ""} ${contact.email ?? ""} ${contact.phone ?? ""}`.toLowerCase(); return haystack.includes(search.toLowerCase()) && (channelFilter === "all" || getChannels(contact).includes(channelFilter)) && (statusFilter === "all" || contact.status === statusFilter); }), [channelFilter, contacts, search, statusFilter]);
-  const conversations = selected ? (state.conversations ?? []).filter((item) => item.contactId === selected.id) : [];
-  const campaigns = selected ? (state.campaigns ?? []).filter((item) => item.contactIds.includes(selected.id)) : [];
-  const opportunities = selected ? state.opportunities.filter((item) => item.contactId === selected.id) : [];
-  const contactMessages = selected ? (state.messages ?? []).filter((item) => item.contactId === selected.id) : [];
+  const conversations = related.conversations;
+  const campaigns = related.campaigns;
+  const opportunities = related.opportunities;
+  // Conversation summaries are loaded from the related-resource API. The list
+  // intentionally has no local message cache: message history belongs to Inbox.
+  const contactMessages: SandboxMessage[] = [];
+  const state = { messages: contactMessages };
 
   const closeForm = () => { setFormOpen(false); setEditingId(null); setForm(emptyForm); setError(""); setDuplicateId(null); };
   const openEdit = (contact: Contact) => { const parts = contact.name.split(" "); setEditingId(contact.id); setForm({ firstName: parts[0] ?? "", lastName: parts.slice(1).join(" "), company: contact.company ?? "", role: contact.role ?? "", email: contact.email ?? "", phone: contact.phone ?? "", linkedinUrl: contact.linkedinUrl ?? "", website: contact.website ?? "", status: contact.status ?? "new", notes: contact.notes ?? "" }); setFormOpen(true); };
   const saveContact = async (event: FormEvent) => { event.preventDefault(); const name = `${form.firstName} ${form.lastName}`.trim(); if (!name || (!form.email && !form.phone && !form.linkedinUrl)) { setError(!name ? "Renseignez au moins un prénom ou un nom." : "Ajoutez au moins un moyen de contact."); return; } const candidate = { name, email: form.email || undefined, phone: form.phone || undefined, linkedinUrl: form.linkedinUrl || undefined, company: form.company || undefined, role: form.role || undefined, website: form.website || undefined, status: form.status, notes: form.notes || undefined }; const duplicate = findDuplicateContact(contacts, candidate, editingId ?? undefined); if (duplicate) { setDuplicateId(duplicate.id); setError("Un contact similaire existe déjà."); return; } const response = await fetch(editingId ? `/api/contacts/${editingId}` : "/api/contacts", { method: editingId ? "PATCH" : "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(candidate) }); const body = await response.json() as { contact?: Contact; error?: string }; if (!response.ok || !body.contact) { setError(body.error ?? "Impossible d’enregistrer le contact."); return; } setContacts((current) => editingId ? current.map((item) => item.id === body.contact!.id ? body.contact! : item) : [...current, body.contact!]); setSelectedId(body.contact.id); closeForm(); };
-  const startConversation = (channel: ChannelId) => { if (!selected) return; dispatch({ type: "CREATE_CONVERSATION", conversation: { id: crypto.randomUUID(), contactId: selected.id, channel, createdAt: new Date().toISOString() } }); router.push("/app/inbox"); };
+  const startConversation = async (channel: ChannelId) => {
+    if (!selected) return;
+    const response = await fetch("/api/inbox/conversations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ contactIds: [selected.id], channel: channel === "gmail" ? "email" : channel }),
+    });
+    const body = await response.json() as { conversation?: { id: string }; error?: string };
+    if (!response.ok || !body.conversation) {
+      setError(body.error ?? "Impossible de créer la conversation.");
+      return;
+    }
+    router.push(`/app/inbox?conversationId=${encodeURIComponent(body.conversation.id)}`);
+  };
   const deleteContact = async () => { if (!selected) return; const response = await fetch(`/api/contacts/${selected.id}`, { method: "DELETE" }); if (response.ok) { setContacts((current) => current.filter((item) => item.id !== selected.id)); setSelectedId(null); setDeleteOpen(false); } };
   const importRows = async () => { for (const row of csvRows.filter((item) => item.valid && !item.duplicate)) await fetch("/api/contacts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: `${row.firstName} ${row.lastName}`.trim(), email: row.email || undefined, phone: row.phone || undefined, linkedinUrl: row.linkedinUrl || undefined, company: row.company || undefined, role: row.role || undefined, status: "new" }) }); await refreshContacts(); setImportOpen(false); setCsvRows([]); };
   const saveNotes = async (notes: string) => { if (!selected) return; const response = await fetch(`/api/contacts/${selected.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...selected, notes }) }); const body = await response.json() as { contact?: Contact }; if (response.ok && body.contact) setContacts((current) => current.map((item) => item.id === body.contact!.id ? body.contact! : item)); };

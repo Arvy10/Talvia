@@ -1,6 +1,7 @@
 import type { PoolClient } from "pg";
 
 import { database } from "./database";
+import { dispatchCommittedActivity, recordActivity } from "./activities";
 import type { WorkspaceContext } from "./workspace-context";
 
 export type ContactStatus = "new" | "lead" | "prospect" | "follow_up" | "qualified" | "client" | "inactive" | "other";
@@ -127,9 +128,10 @@ export async function createContact(context: WorkspaceContext, rawInput: Contact
     );
     const contactId = result.rows[0]!.id;
     await replaceIdentities(client, context.workspaceId, contactId, input);
-    await client.query(`insert into activities (workspace_id, actor_type, actor_id, event_type, entity_type, entity_id, metadata) values ($1, 'user', $2, 'contact.created', 'contact', $3, jsonb_build_object('source', 'contacts_api'))`, [context.workspaceId, context.userId, contactId]);
+    const activity = await recordActivity(context, { eventType: "contact.created", entityType: "contact", entityId: contactId, metadata: { contactId } }, client);
     const contact = await findById(client, context.workspaceId, contactId);
     await client.query("commit");
+    await dispatchCommittedActivity(activity);
     return contact!;
   } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
 }
@@ -144,15 +146,19 @@ export async function updateContact(context: WorkspaceContext, contactId: string
     const companyId = await resolveCompany(client, context.workspaceId, input.company, input.website);
     await client.query(`update contacts set company_id = $1, display_name = $2, job_title = $3, status = $4, notes_summary = $5, updated_at = now() where workspace_id = $6 and id = $7`, [companyId, input.name, input.role ?? null, input.status, input.notes ?? null, context.workspaceId, contactId]);
     await replaceIdentities(client, context.workspaceId, contactId, input);
-    await client.query(`insert into activities (workspace_id, actor_type, actor_id, event_type, entity_type, entity_id, metadata) values ($1, 'user', $2, 'contact.updated', 'contact', $3, jsonb_build_object('source', 'contacts_api'))`, [context.workspaceId, context.userId, contactId]);
+    const activity = await recordActivity(context, { eventType: existing.status !== input.status ? "contact.status_changed" : "contact.updated", entityType: "contact", entityId: contactId, metadata: { contactId, status: input.status } }, client);
     const contact = await findById(client, context.workspaceId, contactId);
     await client.query("commit");
+    await dispatchCommittedActivity(activity);
     return contact!;
   } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
 }
 
 export async function archiveContact(context: WorkspaceContext, contactId: string) {
   const result = await database.query(`update contacts set archived_at = now(), updated_at = now() where workspace_id = $1 and id = $2 and archived_at is null returning id`, [context.workspaceId, contactId]);
-  if (result.rowCount) await database.query(`insert into activities (workspace_id, actor_type, actor_id, event_type, entity_type, entity_id, metadata) values ($1, 'user', $2, 'contact.archived', 'contact', $3, jsonb_build_object('source', 'contacts_api'))`, [context.workspaceId, context.userId, contactId]);
+  if (result.rowCount) {
+    const activity = await recordActivity(context, { eventType: "contact.archived", entityType: "contact", entityId: contactId, metadata: { contactId } });
+    await dispatchCommittedActivity(activity);
+  }
   return Boolean(result.rowCount);
 }

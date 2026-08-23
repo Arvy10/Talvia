@@ -18,8 +18,7 @@ import {
 import { Dialog } from "../components/Dialog";
 import { EmptyState } from "../components/ui";
 import { ChannelLogo } from "../connections/ChannelLogo";
-import { useSandbox } from "../state/SandboxProvider";
-import type { ChannelId, Contact } from "../state/types";
+import type { ChannelId, Contact, Opportunity } from "../state/types";
 import { apiChannelToUi, channelMap, uiChannelToApi } from "./inbox-model";
 import { generateReply, type ReplyMode } from "./talvia-ai";
 
@@ -46,9 +45,9 @@ type Thread = ApiConversation & { key: string; latest?: ApiMessage };
 
 export function InboxClient() {
   const router = useRouter();
-  const { state } = useSandbox();
   const [conversations, setConversations] = useState<ApiConversation[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
+  const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [newOpen, setNewOpen] = useState(false);
   const [aiOpen, setAiOpen] = useState(false);
   const [contactId, setContactId] = useState("");
@@ -62,11 +61,12 @@ export function InboxClient() {
   );
   const [error, setError] = useState("");
   const refresh = async (archived = false) => {
-    const [a, b] = await Promise.all([
+    const [a, b, c] = await Promise.all([
       fetch(`/api/inbox/conversations?archived=${archived}`),
       fetch("/api/contacts"),
+      fetch("/api/opportunities"),
     ]);
-    if (!a.ok || !b.ok) {
+    if (!a.ok || !b.ok || !c.ok) {
       setError("Impossible de charger l’Inbox.");
       return;
     }
@@ -74,6 +74,7 @@ export function InboxClient() {
       ((await a.json()) as { conversations: ApiConversation[] }).conversations,
     );
     setContacts(((await b.json()) as { contacts: Contact[] }).contacts);
+    setOpportunities(((await c.json()) as { opportunities: Opportunity[] }).opportunities);
   };
   useEffect(() => {
     void refresh();
@@ -108,7 +109,7 @@ export function InboxClient() {
   const availableChannels = contacts.find((contact) => contact.id === contactId)
     ? getContactChannels(contacts.find((contact) => contact.id === contactId)!)
     : [];
-  const opportunity = state.opportunities.find(
+  const opportunity = opportunities.find(
     (item) => item.contactId === activeContact?.id,
   );
 
@@ -260,7 +261,7 @@ export function InboxClient() {
           ) : (
             <div className="inbox-dense-threads">
               {threads.map((thread) => {
-                const contact = state.contacts.find(
+                const contact = contacts.find(
                   (item) => item.id === thread.contactId,
                 );
                 return (
@@ -574,7 +575,7 @@ export function InboxClient() {
               value={contactId}
             >
               <option value="">Choisir un contact</option>
-              {state.contacts.map((contact) => (
+              {contacts.map((contact) => (
                 <option key={contact.id} value={contact.id}>
                   {contact.name}
                 </option>

@@ -6,7 +6,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn() }),
@@ -19,6 +19,16 @@ import { ContactsClient } from "./ContactsClient";
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  vi.unstubAllGlobals();
+});
+
+beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn(async (input: string) => {
+    if (input === "/api/contacts") {
+      return { ok: true, json: async () => ({ contacts: [{ id: "contact-1", name: "Persona Synthétique", email: "persona@example.test", phone: "+000 000 000", channel: "linkedin" }] }) };
+    }
+    return { ok: true, json: async () => ({ conversations: [], opportunities: [], campaigns: [] }) };
+  }));
 });
 
 describe("Contacts mobile detail flow", () => {
@@ -57,7 +67,7 @@ describe("Contacts mobile detail flow", () => {
     const contactName = await screen.findByText("Persona Synthétique");
     const contact = contactName.closest("button");
     expect(contact).not.toBeNull();
-    fireEvent.click(contact!);
+    fireEvent.click(contact as HTMLElement);
 
     const detailHeading = screen.getByRole("heading", {
       level: 1,
@@ -65,9 +75,9 @@ describe("Contacts mobile detail flow", () => {
     });
     const detail = detailHeading.closest(".contact-record");
     expect(detail).not.toBeNull();
-    expect(within(detail!).getByText("persona@example.test")).toBeDefined();
-    expect(within(detail!).getByText("+000 000 000")).toBeDefined();
-    expect(within(detail!).getByText("LinkedIn")).toBeDefined();
+    expect(within(detail as HTMLElement).getByText("persona@example.test")).toBeDefined();
+    expect(within(detail as HTMLElement).getByText("+000 000 000")).toBeDefined();
+    expect(within(detail as HTMLElement).getByText("LinkedIn")).toBeDefined();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Retour aux contacts" }),

@@ -57,11 +57,11 @@ describe("sandboxReducer", () => {
   it("adds an opportunity without changing unrelated state", () => {
     const result = sandboxReducer(initialSandboxState, {
       type: "CREATE_OPPORTUNITY",
-      opportunity: { id: "opportunity-1", title: "Talvia rollout" },
+      opportunity: { id: "opportunity-1", title: "Talvia rollout", stage: "new" },
     });
 
     expect(result.opportunities).toEqual([
-      { id: "opportunity-1", title: "Talvia rollout" },
+      { id: "opportunity-1", title: "Talvia rollout", stage: "new" },
     ]);
     expect(result.contacts).toEqual([]);
     expect(result.automations).toEqual([]);
@@ -71,11 +71,11 @@ describe("sandboxReducer", () => {
   it("adds an automation without changing unrelated state", () => {
     const result = sandboxReducer(initialSandboxState, {
       type: "CREATE_AUTOMATION",
-      automation: { id: "automation-1", name: "Welcome sequence" },
+      automation: { id: "automation-1", name: "Welcome sequence", trigger: "message_received", channel: "gmail", action: "prepare_draft", enabled: true },
     });
 
     expect(result.automations).toEqual([
-      { id: "automation-1", name: "Welcome sequence" },
+      { id: "automation-1", name: "Welcome sequence", trigger: "message_received", channel: "gmail", action: "prepare_draft", enabled: true },
     ]);
     expect(result.contacts).toEqual([]);
     expect(result.opportunities).toEqual([]);
