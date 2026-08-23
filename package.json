@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint app",
     "test": "vitest run",
+    "test:inbox:validation": "node scripts/validate-inbox.mjs",
     "test:campaigns:validation": "node scripts/validate-campaigns.mjs",
     "test:opportunities:validation": "node scripts/validate-opportunities.mjs",
     "test:watch": "vitest"

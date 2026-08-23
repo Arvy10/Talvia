@@ -8,6 +8,10 @@ export const channelMap: Array<{ id: ChannelId; label: string }> = [
   { id: "gmail", label: "Gmail" },
 ];
 
+export type InboxApiChannel = "linkedin" | "whatsapp" | "email";
+export const apiChannelToUi = (channel: InboxApiChannel): ChannelId => channel === "email" ? "gmail" : channel;
+export const uiChannelToApi = (channel: ChannelId): InboxApiChannel => channel === "gmail" ? "email" : channel;
+
 function getAvailability(status: ConnectionStatus): InboxAvailability {
   if (status === "connected") {
     return "connected-empty";

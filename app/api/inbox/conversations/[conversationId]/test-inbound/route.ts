@@ -1,0 +1,5 @@
+import { NextResponse } from "next/server";
+import { createTestInbound } from "../../../../../lib/inbox";
+import { getCurrentWorkspace, UnauthorizedError } from "../../../../../lib/workspace-context";
+export const runtime="nodejs";type C={params:Promise<{conversationId:string}>};
+export async function POST(r:Request,{params}:C){if(process.env.NODE_ENV==="production")return NextResponse.json({error:"Introuvable."},{status:404});try{const b=await r.json() as {body?:string;providerMessageId?:string};if(!b.body?.trim())return NextResponse.json({error:"Message vide."},{status:400});const m=await createTestInbound(await getCurrentWorkspace(),(await params).conversationId,b.body,b.providerMessageId);return m?NextResponse.json({message:m},{status:m.duplicate?200:201}):NextResponse.json({error:"Conversation introuvable."},{status:404});}catch(e){return NextResponse.json({error:e instanceof UnauthorizedError?"Non authentifié.":e instanceof Error?e.message:"Erreur serveur."},{status:e instanceof UnauthorizedError?401:400});}}
