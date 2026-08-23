@@ -108,6 +108,7 @@ function isAutomation(value: unknown): value is Automation {
       "channel",
       "action",
       "enabled",
+      "event", "condition", "replyMode", "autoReplyConfirmed", "delayMinutes", "lastRunAt", "lastResult",
     ]) &&
     isNonEmptyString(value.id) &&
     isNonEmptyString(value.name) &&
@@ -115,6 +116,11 @@ function isAutomation(value: unknown): value is Automation {
     isChannelId(value.channel) &&
     typeof value.action === "string" &&
     typeof value.enabled === "boolean"
+    && (value.event === undefined || ["message_received", "campaign_reply", "opportunity_proposal", "opportunity_created", "contact_added"].includes(value.event as string))
+    && isOptionalString(value.condition) && (value.replyMode === undefined || value.replyMode === "draft" || value.replyMode === "auto")
+    && (value.autoReplyConfirmed === undefined || typeof value.autoReplyConfirmed === "boolean")
+    && (value.delayMinutes === undefined || typeof value.delayMinutes === "number") && isOptionalString(value.lastRunAt)
+    && (value.lastResult === undefined || ["success", "skipped", "failed"].includes(value.lastResult as string))
   );
 }
 

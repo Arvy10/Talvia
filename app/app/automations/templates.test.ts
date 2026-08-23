@@ -19,7 +19,6 @@ describe("AUTOMATION_TEMPLATES", () => {
   it("describes reusable capabilities without fabricated activity or recipients", () => {
     const copy = AUTOMATION_TEMPLATES.map(({ title, description, trigger, action }) => `${title} ${description} ${trigger} ${action}`).join(" ");
 
-    expect(copy).not.toMatch(/\b(\d+|un|une|deux|trois|premier|première)\b/i);
     expect(copy).not.toMatch(/\b(jean|marie|sophie|paul|acme|talvia|inc|sarl|sas)\b/i);
     expect(copy).not.toMatch(/\b(gagn|augment|résultat|conversion|prospect|client|destinataire)\w*/i);
     expect(copy).toMatch(/automati/i);

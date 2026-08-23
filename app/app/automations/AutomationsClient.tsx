@@ -1,154 +1,25 @@
 "use client";
-
-import { useState, type FormEvent } from "react";
-import { LuBolt, LuPlus, LuWorkflow } from "react-icons/lu";
-
+import { useMemo, useState, type FormEvent } from "react";
+import { LuBolt, LuCopy, LuPencil, LuPlay, LuPlus, LuPower, LuTrash2, LuWorkflow } from "react-icons/lu";
 import { Dialog } from "../components/Dialog";
-import { EmptyState, GlassCard, PageHeader } from "../components/ui";
+import { EmptyState, PageHeader } from "../components/ui";
 import { ChannelLogo } from "../connections/ChannelLogo";
 import { useSandbox } from "../state/SandboxProvider";
-import type { ChannelId } from "../state/types";
+import type { Automation, ChannelId } from "../state/types";
+import { describeAutomation, runAutomations, testEventFor } from "./automation-engine";
 import { AUTOMATION_TEMPLATES, type AutomationTemplate } from "./templates";
 
-const channels: Array<{ id: ChannelId; label: string }> = [
-  { id: "linkedin", label: "LinkedIn" },
-  { id: "whatsapp", label: "WhatsApp" },
-  { id: "gmail", label: "Gmail" },
-];
-
-type AutomationForm = {
-  name: string;
-  trigger: string;
-  channel: ChannelId;
-  action: string;
-  enabled: boolean;
-};
-
-const emptyForm: AutomationForm = {
-  name: "",
-  trigger: "",
-  channel: "linkedin",
-  action: "",
-  enabled: true,
-};
+const eventOptions = [{ id: "message_received", label: "Un nouveau message est reçu" }, { id: "campaign_reply", label: "Un contact répond à une campagne" }, { id: "opportunity_proposal", label: "Une opportunité passe à Proposition" }, { id: "opportunity_created", label: "Une opportunité est créée" }, { id: "contact_added", label: "Un contact est ajouté" }] as const;
+const actionOptions = [{ id: "stop_campaign", label: "Arrêter la séquence pour ce contact" }, { id: "create_follow_up", label: "Créer une prochaine action" }, { id: "mark_priority", label: "Marquer la conversation à traiter" }, { id: "prepare_draft", label: "Préparer un brouillon de réponse" }] as const;
+type Form = { name: string; event: Automation["event"]; action: string; channel: ChannelId; condition: string; enabled: boolean; replyMode: "draft" | "auto"; autoReplyConfirmed: boolean; delayMinutes: string };
+const blank: Form = { name: "", event: "message_received", action: "mark_priority", channel: "linkedin", condition: "", enabled: true, replyMode: "draft", autoReplyConfirmed: false, delayMinutes: "2" };
 
 export function AutomationsClient() {
-  const { dispatch, state } = useSandbox();
-  const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [form, setForm] = useState<AutomationForm>(emptyForm);
-  const [nameError, setNameError] = useState("");
-
-  const closeDialog = () => {
-    setIsDialogOpen(false);
-    setForm(emptyForm);
-    setNameError("");
-  };
-
-  const openBuilder = (template?: AutomationTemplate) => {
-    setForm(template ? {
-      name: template.title,
-      trigger: template.trigger,
-      channel: template.channel,
-      action: template.action,
-      enabled: true,
-    } : emptyForm);
-    setNameError("");
-    setIsDialogOpen(true);
-  };
-
-  const submitAutomation = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const name = form.name.trim();
-    if (!name) {
-      setNameError("Donnez un nom à cette automatisation avant de l’enregistrer.");
-      return;
-    }
-
-    dispatch({
-      type: "CREATE_AUTOMATION",
-      automation: {
-        id: crypto.randomUUID(),
-        name,
-        trigger: form.trigger.trim(),
-        channel: form.channel,
-        action: form.action.trim(),
-        enabled: form.enabled,
-      },
-    });
-    closeDialog();
-  };
-
-  return <div className="automations-page">
-    <PageHeader
-      eyebrow="Flux de travail"
-      title="Automatisations"
-      description="Créez des flux adaptés à vos essais. Rien n’est lancé ni rempli tant que vous ne le configurez pas."
-      actions={<button className="connection-button" onClick={() => openBuilder()} type="button"><LuPlus aria-hidden="true" />Nouvelle automatisation</button>}
-    />
-
-    <section aria-labelledby="your-automations-title" className="automations-region">
-      <div className="automations-region__heading">
-        <div><p>VOS CONFIGURATIONS</p><h2 id="your-automations-title">Vos automatisations</h2></div>
-        <span>{state.automations.length}</span>
-      </div>
-      {state.automations.length === 0 ? <EmptyState
-        className="automations-empty"
-        icon={<LuWorkflow />}
-        title="Aucune automatisation"
-        description="Vos flux apparaîtront ici après leur configuration dans le bac à sable."
-        action={<button className="connection-button connection-button--secondary" onClick={() => openBuilder()} type="button">Configurer un flux</button>}
-      /> : <div className="automations-list">
-        {state.automations.map((automation) => {
-          return <GlassCard className="automation-card" key={automation.id}>
-            <div className="automation-card__heading">
-              <ChannelLogo channel={automation.channel} />
-              <div><h3>{automation.name}</h3><span>{automation.enabled ? "Activée" : "Désactivée"}</span></div>
-            </div>
-            <dl>
-              <div><dt>Déclencheur</dt><dd>{automation.trigger || "À définir"}</dd></div>
-              <div><dt>Action</dt><dd>{automation.action || "À définir"}</dd></div>
-            </dl>
-          </GlassCard>;
-        })}
-      </div>}
-    </section>
-
-    <section aria-labelledby="template-library-title" className="automation-template-library">
-      <div className="automations-region__heading">
-        <div><p>BIBLIOTHÈQUE PRODUIT</p><h2 id="template-library-title">Modèles de capacités</h2></div>
-      </div>
-      <p className="automation-template-library__intro">Ces exemples décrivent des capacités de Talvia. Ils ne créent aucun flux, destinataire ou résultat.</p>
-      <div className="automation-template-grid">
-        {AUTOMATION_TEMPLATES.map((template) => <GlassCard className="automation-template-card" key={template.id}>
-          <div className="automation-card__heading"><ChannelLogo channel={template.channel} /><div><h3>{template.title}</h3><span>{channels.find(({ id }) => id === template.channel)?.label}</span></div></div>
-          <p>{template.description}</p>
-          <dl>
-            <div><dt>Déclencheur</dt><dd>{template.trigger}</dd></div>
-            <div><dt>Action</dt><dd>{template.action}</dd></div>
-          </dl>
-          <button className="connection-button connection-button--secondary" onClick={() => openBuilder(template)} type="button"><LuBolt aria-hidden="true" />Utiliser ce modèle</button>
-        </GlassCard>)}
-      </div>
-    </section>
-
-    <Dialog
-      description="Le flux restera local à votre bac à sable jusqu’à sa réinitialisation."
-      onClose={closeDialog}
-      open={isDialogOpen}
-      title="Configurer une automatisation"
-    >
-      <form className="workspace-form" onSubmit={submitAutomation}>
-        <label>
-          <span>Nom <em aria-hidden="true">*</em></span>
-          <input aria-describedby={nameError ? "automation-name-error" : undefined} autoFocus onChange={(event) => { setForm({ ...form, name: event.target.value }); setNameError(""); }} value={form.name} />
-          {nameError ? <small id="automation-name-error" role="alert">{nameError}</small> : null}
-        </label>
-        <label><span>Déclencheur</span><input onChange={(event) => setForm({ ...form, trigger: event.target.value })} placeholder="Ex. Message reçu" value={form.trigger} /></label>
-        <label><span>Canal</span><select onChange={(event) => setForm({ ...form, channel: event.target.value as ChannelId })} value={form.channel}>{channels.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}</select></label>
-        <label><span>Action</span><input onChange={(event) => setForm({ ...form, action: event.target.value })} placeholder="Ex. Préparer un brouillon" value={form.action} /></label>
-        <label className="automation-enabled"><input checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} type="checkbox" /><span>Activer cette automatisation</span></label>
-        <div className="workspace-form__actions"><button className="connection-button connection-button--secondary" onClick={closeDialog} type="button">Annuler</button><button className="connection-button" type="submit">Enregistrer</button></div>
-      </form>
-    </Dialog>
-  </div>;
+  const { state, dispatch } = useSandbox(); const [tab, setTab] = useState<"mine" | "templates">("mine"); const [formOpen, setFormOpen] = useState(false); const [editing, setEditing] = useState<string | null>(null); const [form, setForm] = useState<Form>(blank); const [error, setError] = useState(""); const [selected, setSelected] = useState<string | null>(null); const [deleting, setDeleting] = useState<string | null>(null); const [testResult, setTestResult] = useState("");
+  const current = state.automations.find((item) => item.id === selected) ?? null; const activities = useMemo(() => state.activities ?? [], [state.activities]);
+  const open = (template?: AutomationTemplate, automation?: Automation) => { const source = automation ?? template; setEditing(automation?.id ?? null); setForm(source ? { name: automation?.name ?? template!.title, event: automation?.event ?? eventOptions.find((item) => template?.trigger.toLowerCase().includes(item.label.toLowerCase()) )?.id ?? "message_received", action: automation?.action ?? template!.action, channel: source.channel, condition: automation?.condition ?? "", enabled: automation?.enabled ?? true, replyMode: automation?.replyMode ?? "draft", autoReplyConfirmed: automation?.autoReplyConfirmed ?? false, delayMinutes: String(automation?.delayMinutes ?? 2) } : blank); setError(""); setFormOpen(true); };
+  const save = (event: FormEvent) => { event.preventDefault(); if (!form.name.trim()) { setError("Donnez un nom à cette automatisation."); return; } if (form.replyMode === "auto" && !form.autoReplyConfirmed) { setError("Confirmez l’autorisation de simulation avant d’activer ce mode."); return; } const automation: Automation = { id: editing ?? crypto.randomUUID(), name: form.name.trim(), trigger: eventOptions.find((item) => item.id === form.event)?.label ?? "", event: form.event, channel: form.channel, condition: form.condition || undefined, action: form.action, enabled: form.enabled, replyMode: form.replyMode, autoReplyConfirmed: form.autoReplyConfirmed, delayMinutes: Number(form.delayMinutes) || 0 }; dispatch(editing ? { type: "UPDATE_AUTOMATION", automation } : { type: "CREATE_AUTOMATION", automation }); setFormOpen(false); };
+  const executeTest = (automation: Automation) => { const result = runAutomations(state, testEventFor(automation)); dispatch({ type: "RESTORE_SANDBOX_STATE", state: result }); setTestResult(automation.lastResult === "failed" ? "Test terminé avec échec." : "Test sandbox exécuté : résultat ajouté à l’historique."); };
+  return <div className="automations-page automations-page--v2"><PageHeader title="Automatisations" description="Automatisez les tâches répétitives et laissez Talvia gérer les actions simples à votre place." actions={<button className="connection-button" onClick={() => open()} type="button"><LuPlus />Nouvelle automatisation</button>} /><div className="automation-tabs"><button className={tab === "mine" ? "is-active" : ""} onClick={() => setTab("mine")} type="button">Mes automatisations <span>{state.automations.length}</span></button><button className={tab === "templates" ? "is-active" : ""} onClick={() => setTab("templates")} type="button">Templates</button></div>{tab === "mine" ? state.automations.length ? <div className="automation-rule-list">{state.automations.map((automation) => <article className="automation-rule" key={automation.id}><button className="automation-rule__body" onClick={() => setSelected(automation.id)} type="button"><ChannelLogo channel={automation.channel} /><div><strong>{automation.name}</strong><p><span>Quand</span>{automation.trigger || "Un événement arrive"}<i>→</i><span>Alors</span>{actionOptions.find((item) => item.id === automation.action)?.label ?? automation.action}</p></div><em className={automation.enabled ? "is-active" : ""}>{automation.enabled ? "Active" : "Inactive"}</em><small>{automation.lastRunAt ? `Exécutée le ${new Date(automation.lastRunAt).toLocaleDateString("fr")}` : "Jamais exécutée"}</small></button><div className="automation-rule__actions"><button aria-label="Activer ou désactiver" onClick={() => dispatch({ type: "UPDATE_AUTOMATION", automation: { ...automation, enabled: !automation.enabled } })} type="button"><LuPower /></button><button aria-label="Dupliquer" onClick={() => dispatch({ type: "CREATE_AUTOMATION", automation: { ...automation, id: crypto.randomUUID(), name: `${automation.name} (copie)`, enabled: false, lastRunAt: undefined, lastResult: undefined } })} type="button"><LuCopy /></button><button aria-label="Modifier" onClick={() => open(undefined, automation)} type="button"><LuPencil /></button><button aria-label="Supprimer" onClick={() => setDeleting(automation.id)} type="button"><LuTrash2 /></button></div></article>)}</div> : <EmptyState icon={<LuWorkflow />} title="Aucune automatisation active" description="Automatisez vos tâches commerciales répétitives pour gagner du temps et éviter les oublis." action={<div className="automation-empty-actions"><button className="connection-button" onClick={() => open()} type="button">Créer une automatisation</button><button className="connection-button connection-button--secondary" onClick={() => setTab("templates")} type="button">Découvrir les modèles</button></div>} /> : <div className="automation-template-grid">{AUTOMATION_TEMPLATES.map((template) => <article className="automation-template-card" key={template.id}><ChannelLogo channel={template.channel} /><h2>{template.title}</h2><p>{template.description}</p><dl><div><dt>Quand</dt><dd>{template.trigger}</dd></div><div><dt>Alors</dt><dd>{template.action}</dd></div></dl><button className="connection-button connection-button--secondary" onClick={() => open(template)} type="button"><LuBolt />Utiliser ce modèle</button></article>)}</div>}<AutomationDetail automation={current} activities={activities.filter((item) => item.label.startsWith(current?.name ?? "\0"))} onClose={() => { setSelected(null); setTestResult(""); }} onEdit={() => current && open(undefined, current)} onTest={() => current && executeTest(current)} result={testResult} /><Dialog description="Cette règle et ses réglages resteront uniquement dans le sandbox." onClose={() => setFormOpen(false)} open={formOpen} title={editing ? "Modifier l’automatisation" : "Nouvelle automatisation"}><form className="workspace-form automation-builder" onSubmit={save}><label><span>Nom *</span><input autoFocus onChange={(event) => setForm({ ...form, name: event.target.value })} value={form.name} /></label><label><span>Quand</span><select onChange={(event) => setForm({ ...form, event: event.target.value as Automation["event"] })} value={form.event}>{eventOptions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><label><span>Sur</span><select onChange={(event) => setForm({ ...form, channel: event.target.value as ChannelId })} value={form.channel}><option value="linkedin">LinkedIn</option><option value="whatsapp">WhatsApp</option><option value="gmail">Email</option></select></label><label><span>Si (facultatif)</span><select onChange={(event) => setForm({ ...form, condition: event.target.value })} value={form.condition}><option value="">Aucune condition</option><option value="campaign">La conversation appartient à une campagne</option><option value="qualified">Le contact est qualifié</option></select></label><label><span>Alors</span><select onChange={(event) => setForm({ ...form, action: event.target.value })} value={form.action}>{actionOptions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>{form.action === "prepare_draft" ? <fieldset><legend>Fonctionnalités prévues pour les connexions réelles</legend><label><span>Mode de réponse</span><select onChange={(event) => setForm({ ...form, replyMode: event.target.value as "draft" | "auto" })} value={form.replyMode}><option value="draft">Brouillon uniquement</option><option value="auto">Envoi automatique autorisé</option></select></label><label><span>Délai avant action (minutes)</span><input min="0" onChange={(event) => setForm({ ...form, delayMinutes: event.target.value })} type="number" value={form.delayMinutes} /></label>{form.replyMode === "auto" ? <label className="automation-enabled"><input checked={form.autoReplyConfirmed} onChange={(event) => setForm({ ...form, autoReplyConfirmed: event.target.checked })} type="checkbox" /><span>Autoriser Talvia à simuler l’envoi automatique pour cette règle.</span></label> : null}<p className="automation-simulation">Simulation uniquement — aucun message réel ne sera envoyé.</p></fieldset> : null}<label className="automation-enabled"><input checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} type="checkbox" /><span>Activer cette automatisation</span></label>{error ? <small role="alert">{error}</small> : null}<div className="workspace-form__actions"><button className="connection-button connection-button--secondary" onClick={() => setFormOpen(false)} type="button">Annuler</button><button className="connection-button" type="submit">Enregistrer</button></div></form></Dialog><Dialog description="L’historique global reste conservé comme trace." onClose={() => setDeleting(null)} open={!!deleting} title="Supprimer cette automatisation ?"><div className="workspace-form"><div className="workspace-form__actions"><button className="connection-button connection-button--secondary" onClick={() => setDeleting(null)} type="button">Annuler</button><button className="connection-button connection-button--danger" onClick={() => { if (deleting) dispatch({ type: "DELETE_AUTOMATION", id: deleting }); setDeleting(null); }} type="button">Supprimer</button></div></div></Dialog></div>;
 }
+function AutomationDetail({ automation, activities, onClose, onEdit, onTest, result }: { automation: Automation | null; activities: ReturnType<typeof useSandbox>["state"]["activities"]; onClose: () => void; onEdit: () => void; onTest: () => void; result: string }) { if (!automation) return null; return <div className="automation-detail-layer"><button aria-label="Fermer la fiche" onClick={onClose} type="button" /><aside><header><div><p>RÈGLE SANDBOX</p><h2>{automation.name}</h2><span>{describeAutomation(automation)}</span></div><button onClick={onClose} type="button">×</button></header><section><h3>Statut</h3><p>{automation.enabled ? "Active" : "Inactive"}</p><button className="connection-button connection-button--secondary" onClick={onEdit} type="button"><LuPencil />Modifier</button><button className="connection-button" onClick={onTest} type="button"><LuPlay />Exécuter un test</button>{result ? <small>{result}</small> : null}</section><section><h3>Historique</h3>{activities?.length ? activities.slice().reverse().map((item) => <p key={item.id}>{item.label}<small>{new Date(item.createdAt).toLocaleString("fr")}</small></p>) : <p>Aucune exécution enregistrée.</p>}</section></aside></div>; }

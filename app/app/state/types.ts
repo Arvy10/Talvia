@@ -116,6 +116,13 @@ export type Automation = {
   channel: ChannelId;
   action: string;
   enabled: boolean;
+  event?: "message_received" | "campaign_reply" | "opportunity_proposal" | "opportunity_created" | "contact_added";
+  condition?: string;
+  replyMode?: "draft" | "auto";
+  autoReplyConfirmed?: boolean;
+  delayMinutes?: number;
+  lastRunAt?: string;
+  lastResult?: "success" | "skipped" | "failed";
 };
 
 export type SandboxConnection = {
@@ -149,6 +156,8 @@ export type SandboxAction =
   | { type: "CREATE_OPPORTUNITY"; opportunity: Opportunity }
   | { type: "UPDATE_OPPORTUNITY"; opportunity: Opportunity }
   | { type: "CREATE_AUTOMATION"; automation: Automation }
+  | { type: "UPDATE_AUTOMATION"; automation: Automation }
+  | { type: "DELETE_AUTOMATION"; id: string }
   | { type: "CREATE_MESSAGE"; message: SandboxMessage }
   | { type: "CREATE_CONVERSATION"; conversation: SandboxConversation }
   | { type: "CREATE_CAMPAIGN"; campaign: SandboxCampaign }
