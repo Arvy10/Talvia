@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint app",
     "test": "vitest run",
+    "test:opportunities:validation": "node scripts/validate-opportunities.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
