@@ -14,15 +14,16 @@ export type ProductNavigationItem = {
   href: string;
   label: string;
   icon: IconType;
+  group: "Pilotage" | "Relation" | "Espace";
 };
 
 export const productNavigation: ProductNavigationItem[] = [
-  { href: "/app", label: "Aujourd’hui", icon: LuHouse },
-  { href: "/app/inbox", label: "Inbox", icon: LuInbox },
-  { href: "/app/campaigns", label: "Campagnes", icon: LuSend },
-  { href: "/app/opportunities", label: "Opportunités", icon: LuChartNoAxesColumnIncreasing },
-  { href: "/app/contacts", label: "Contacts", icon: LuUsers },
-  { href: "/app/automations", label: "Automatisations", icon: LuWorkflow },
-  { href: "/app/connections", label: "Connexions", icon: LuUnplug },
-  { href: "/app/settings", label: "Paramètres", icon: LuSettings },
+  { href: "/app", label: "Vue d’ensemble", icon: LuHouse, group: "Pilotage" },
+  { href: "/app/inbox", label: "Inbox", icon: LuInbox, group: "Pilotage" },
+  { href: "/app/campaigns", label: "Campagnes", icon: LuSend, group: "Pilotage" },
+  { href: "/app/opportunities", label: "Opportunités", icon: LuChartNoAxesColumnIncreasing, group: "Relation" },
+  { href: "/app/contacts", label: "Contacts", icon: LuUsers, group: "Relation" },
+  { href: "/app/automations", label: "Automatisations", icon: LuWorkflow, group: "Relation" },
+  { href: "/app/connections", label: "Connexions", icon: LuUnplug, group: "Espace" },
+  { href: "/app/settings", label: "Paramètres", icon: LuSettings, group: "Espace" },
 ];

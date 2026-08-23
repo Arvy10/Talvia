@@ -71,9 +71,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [drawerOpen]);
 
   return <div className={sidebarCollapsed ? "talvia-app is-sidebar-collapsed" : "talvia-app"}>
-    <Sidebar collapsed={sidebarCollapsed} onCollapse={toggleSidebar} pathname={pathname} />
+    <Sidebar collapsed={sidebarCollapsed} onToggle={toggleSidebar} pathname={pathname} />
     <div className="app-workspace">
-      <Topbar onMenuOpen={openDrawer} title={title} />
+      <Topbar onNavigationOpen={openDrawer} title={title} />
       <main className="app-main">{children}</main>
     </div>
     {drawerOpen ? <div className="app-drawer-backdrop" onMouseDown={(event) => {
@@ -83,7 +83,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     }}>
       <div aria-label="Navigation de l’application" aria-modal="true" className="app-drawer" ref={drawerRef} role="dialog">
         <IconButton className="app-drawer__close" label="Fermer la navigation" onClick={() => setDrawerOpen(false)}><LuX aria-hidden="true" /></IconButton>
-        <Sidebar drawer onNavigate={() => setDrawerOpen(false)} pathname={pathname} />
+        <Sidebar drawer onNavigate={() => setDrawerOpen(false)} onToggle={() => setDrawerOpen(false)} pathname={pathname} />
       </div>
     </div> : null}
   </div>;
