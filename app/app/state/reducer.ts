@@ -41,6 +41,8 @@ export function sandboxReducer(
         ...state,
         opportunities: [...state.opportunities, action.opportunity],
       };
+    case "UPDATE_OPPORTUNITY":
+      return { ...state, opportunities: state.opportunities.map((item) => item.id === action.opportunity.id ? action.opportunity : item) };
     case "CREATE_AUTOMATION":
       return { ...state, automations: [...state.automations, action.automation] };
     case "CREATE_MESSAGE":

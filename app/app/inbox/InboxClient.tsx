@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useMemo, useState, type FormEvent } from "react";
 import { LuArrowLeft, LuBot, LuEllipsis, LuInbox, LuMessageCircle, LuPlus, LuSearch, LuSend, LuSparkles, LuUserRound } from "react-icons/lu";
 import { Dialog } from "../components/Dialog";
@@ -14,6 +15,7 @@ import { generateReply, type ReplyMode } from "./talvia-ai";
 type Thread = SandboxConversation & { key: string; latest?: SandboxMessage };
 
 export function InboxClient() {
+  const router = useRouter();
   const { state, dispatch } = useSandbox();
   const messages = state.messages ?? [];
   const storedConversations = state.conversations ?? [];
@@ -49,7 +51,7 @@ export function InboxClient() {
   const simulateReply = (event: FormEvent) => { event.preventDefault(); if (!activeThread || !replyBody.trim()) return; const now = new Date().toISOString(); createMessage({ id: crypto.randomUUID(), contactId: activeThread.contactId, channel: activeThread.channel, body: replyBody.trim(), direction: "inbound", simulated: true, createdAt: now }, "Réponse reçue"); (state.campaigns ?? []).filter((campaign) => campaign.status === "active" && campaign.stopOnReply && campaign.contactIds.includes(activeThread.contactId)).forEach((campaign) => dispatch({ type: "UPDATE_CAMPAIGN", campaign: { ...campaign, participantStatuses: { ...campaign.participantStatuses, [activeThread.contactId]: "replied" } } })); setReplyBody(""); setReplyOpen(false); };
   const useAi = (mode: ReplyMode) => { setDraft(generateReply({ conversation: threadMessages, contact: activeContact, opportunity, currentDraft: draft }, mode)); setAiOpen(false); };
   const saveNote = (value: string) => activeContact && dispatch({ type: "UPDATE_CONTACT", contact: { ...activeContact, notes: value } });
-  const createOpportunity = () => { if (!activeContact || !activeThread) return; dispatch({ type: "CREATE_OPPORTUNITY", opportunity: { id: crypto.randomUUID(), title: `Opportunité — ${activeContact.name}`, stage: "new", organization: activeContact.company, contactId: activeContact.id, sourceChannel: activeThread.channel } }); };
+  const createOpportunity = () => { if (!activeContact || !activeThread) return; router.push(`/app/opportunities?contactId=${encodeURIComponent(activeContact.id)}&conversationId=${encodeURIComponent(activeThread.id)}`); };
 
   return <div className={`inbox-page inbox-page--center mobile-view-${mobileView}`}>
     <header className="inbox-compact-header"><div><h1>Inbox</h1><p>Gérez toutes vos conversations commerciales depuis un seul endroit.</p></div><button className="connection-button" onClick={() => setNewOpen(true)} type="button"><LuPlus />Nouvelle conversation</button></header>

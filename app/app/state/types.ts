@@ -14,7 +14,10 @@ export type OpportunityStage =
   | "qualified"
   | "proposal"
   | "negotiation"
-  | "won";
+  | "won"
+  | "lost";
+
+export type OpportunityCurrency = "USD" | "EUR" | "XAF";
 
 export type Contact = {
   id: string;
@@ -69,6 +72,9 @@ export type SandboxActivity = {
   id: string;
   label: string;
   createdAt: string;
+  opportunityId?: string;
+  contactId?: string;
+  kind?: "created" | "stage_changed" | "note_added" | "action_completed" | "message" | "closed";
 };
 
 export type SandboxProfile = {
@@ -88,6 +94,19 @@ export type Opportunity = {
   organization?: string;
   contactId?: string;
   sourceChannel?: ChannelId;
+  conversationId?: string;
+  campaignId?: string;
+  value?: number;
+  currency?: OpportunityCurrency;
+  nextAction?: string;
+  nextActionAt?: string;
+  nextActionCompletedAt?: string;
+  notes?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  closedAt?: string;
+  finalValue?: number;
+  lostReason?: "price" | "no_need" | "not_now" | "competitor" | "no_response" | "other";
 };
 
 export type Automation = {
@@ -128,6 +147,7 @@ export type SandboxAction =
     }
   | { type: "CREATE_CONTACT"; contact: Contact }
   | { type: "CREATE_OPPORTUNITY"; opportunity: Opportunity }
+  | { type: "UPDATE_OPPORTUNITY"; opportunity: Opportunity }
   | { type: "CREATE_AUTOMATION"; automation: Automation }
   | { type: "CREATE_MESSAGE"; message: SandboxMessage }
   | { type: "CREATE_CONVERSATION"; conversation: SandboxConversation }

@@ -1,124 +1,52 @@
 "use client";
-
-import { useState, type FormEvent } from "react";
-import { LuColumns3, LuList, LuPlus, LuSparkles } from "react-icons/lu";
-
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useState, type DragEvent, type FormEvent } from "react";
+import { LuArrowRight, LuCalendar, LuCheck, LuChevronRight, LuCircleDollarSign, LuColumns3, LuList, LuPencil, LuPlus, LuSearch, LuX } from "react-icons/lu";
 import { Dialog } from "../components/Dialog";
 import { EmptyState, PageHeader } from "../components/ui";
+import { ChannelLogo } from "../connections/ChannelLogo";
 import { useSandbox } from "../state/SandboxProvider";
-import { PIPELINE_STAGES, type PipelineStage } from "./pipeline";
+import type { ChannelId, Contact, Opportunity, OpportunityCurrency, OpportunityStage, SandboxActivity } from "../state/types";
+import { formatOpportunityValue, getOpportunityLastActivity, isOpportunityOverdue, isOpportunityStale, OPEN_STAGES } from "./opportunity-model";
+import { PIPELINE_STAGES } from "./pipeline";
+
+type StateFilter = "open" | "won" | "lost" | "all";
+const stageLabels: Record<OpportunityStage, string> = { new: "Nouveau", qualified: "Qualifié", proposal: "Proposition", negotiation: "Négociation", won: "Gagné", lost: "Perdu" };
+const channelLabels: Record<ChannelId, string> = { linkedin: "LinkedIn", whatsapp: "WhatsApp", gmail: "Email" };
+const lostReasonLabels: Record<NonNullable<Opportunity["lostReason"]>, string> = { price: "Prix", no_need: "Pas de besoin", not_now: "Pas maintenant", competitor: "Concurrent", no_response: "Pas de réponse", other: "Autre" };
+const blankForm = { title: "", contactId: "", stage: "new" as OpportunityStage, value: "", currency: "EUR" as OpportunityCurrency, nextAction: "", nextActionAt: "", notes: "", conversationId: "", campaignId: "", sourceChannel: "" as ChannelId | "" };
 
 export function OpportunitiesClient() {
-  const { dispatch, state } = useSandbox();
-  const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [title, setTitle] = useState("");
-  const [organization, setOrganization] = useState("");
-  const [stage, setStage] = useState<PipelineStage>("new");
-  const [titleError, setTitleError] = useState("");
-
-  const closeDialog = () => {
-    setIsDialogOpen(false);
-    setTitle("");
-    setOrganization("");
-    setStage("new");
-    setTitleError("");
-  };
-
-  const submitOpportunity = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const trimmedTitle = title.trim();
-
-    if (!trimmedTitle) {
-      setTitleError("Saisissez un titre pour créer l’opportunité.");
-      return;
-    }
-
-    const trimmedOrganization = organization.trim();
-    dispatch({
-      type: "CREATE_OPPORTUNITY",
-      opportunity: {
-        id: crypto.randomUUID(),
-        title: trimmedTitle,
-        stage,
-        ...(trimmedOrganization ? { organization: trimmedOrganization } : {}),
-      },
-    });
-    closeDialog();
-  };
-
-  return <div className="opportunities-page">
-    <PageHeader
-      eyebrow="Suivi commercial"
-      title="Opportunités"
-      description="Organisez les pistes réelles que vous choisissez de créer. Votre pipeline est vide tant que vous ne lui ajoutez rien."
-      actions={<>
-        <div aria-label="Affichage des opportunités" className="workspace-view-toggle">
-          <button aria-pressed={state.pipelineView === "pipeline"} className={state.pipelineView === "pipeline" ? "is-active" : undefined} onClick={() => dispatch({ type: "SET_PIPELINE_VIEW", view: "pipeline" })} type="button"><LuColumns3 aria-hidden="true" />Pipeline</button>
-          <button aria-pressed={state.pipelineView === "list"} className={state.pipelineView === "list" ? "is-active" : undefined} onClick={() => dispatch({ type: "SET_PIPELINE_VIEW", view: "list" })} type="button"><LuList aria-hidden="true" />Liste</button>
-        </div>
-        <button className="connection-button" onClick={() => setIsDialogOpen(true)} type="button"><LuPlus aria-hidden="true" />Nouvelle opportunité</button>
-      </>}
-    />
-
-    {state.pipelineView === "pipeline" ? <section aria-label="Pipeline des opportunités" className="opportunities-pipeline">
-      {PIPELINE_STAGES.map(([stageId, stageLabel]) => {
-        const opportunities = state.opportunities.filter((opportunity) => opportunity.stage === stageId);
-
-        return <section className="pipeline-column" key={stageId}>
-          <header><h2>{stageLabel}</h2></header>
-          {opportunities.length === 0 ? <EmptyState
-            className="pipeline-column__empty"
-            icon={<LuSparkles />}
-            title="Aucune opportunité"
-            description="Les opportunités que vous créerez dans cette étape apparaîtront ici."
-          /> : <div className="opportunity-cards">
-            {opportunities.map((opportunity) => <article className="opportunity-card" key={opportunity.id}>
-              <strong>{opportunity.title}</strong>
-              {opportunity.organization ? <span>{opportunity.organization}</span> : null}
-            </article>)}
-          </div>}
-        </section>;
-      })}
-    </section> : <section aria-label="Liste des opportunités" className="opportunity-list">
-      {state.opportunities.length === 0 ? <EmptyState
-        icon={<LuSparkles />}
-        title="Aucune opportunité à afficher"
-        description="Créez votre première opportunité lorsque vous aurez une piste à suivre."
-      /> : <div className="opportunity-cards">
-        {state.opportunities.map((opportunity) => <article className="opportunity-card" key={opportunity.id}>
-          <strong>{opportunity.title}</strong>
-          {opportunity.organization ? <span>{opportunity.organization}</span> : null}
-        </article>)}
-      </div>}
-    </section>}
-
-    <Dialog
-      description="Ajoutez uniquement une opportunité que vous souhaitez réellement suivre dans ce bac à sable."
-      onClose={closeDialog}
-      open={isDialogOpen}
-      title="Nouvelle opportunité"
-    >
-      <form className="workspace-form" onSubmit={submitOpportunity}>
-        <label>
-          <span>Titre <em aria-hidden="true">*</em></span>
-          <input aria-describedby={titleError ? "opportunity-title-error" : undefined} autoFocus onChange={(event) => { setTitle(event.target.value); setTitleError(""); }} value={title} />
-          {titleError ? <small id="opportunity-title-error" role="alert">{titleError}</small> : null}
-        </label>
-        <label>
-          <span>Organisation <i>(facultatif)</i></span>
-          <input onChange={(event) => setOrganization(event.target.value)} value={organization} />
-        </label>
-        <label>
-          <span>Étape</span>
-          <select onChange={(event) => setStage(event.target.value as PipelineStage)} value={stage}>
-            {PIPELINE_STAGES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
-          </select>
-        </label>
-        <div className="workspace-form__actions">
-          <button className="connection-button connection-button--secondary" onClick={closeDialog} type="button">Annuler</button>
-          <button className="connection-button" type="submit">Créer l’opportunité</button>
-        </div>
-      </form>
-    </Dialog>
+  const { dispatch, state } = useSandbox(); const router = useRouter();
+  const [formOpen, setFormOpen] = useState(false); const [form, setForm] = useState(blankForm); const [editingId, setEditingId] = useState<string | null>(null); const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [search, setSearch] = useState(""); const [channelFilter, setChannelFilter] = useState<ChannelId | "all">("all"); const [stateFilter, setStateFilter] = useState<StateFilter>("open"); const [mobileStage, setMobileStage] = useState<OpportunityStage>("new"); const [error, setError] = useState("");
+  const [closeTarget, setCloseTarget] = useState<{ id: string; stage: "won" | "lost" } | null>(null); const [lostReason, setLostReason] = useState<NonNullable<Opportunity["lostReason"]>>("not_now"); const [finalValue, setFinalValue] = useState("");
+  useEffect(() => { const timer = window.setTimeout(() => { const params = new URLSearchParams(window.location.search); const contactId = params.get("contactId") ?? ""; const conversationId = params.get("conversationId") ?? ""; const campaignId = params.get("campaignId") ?? ""; if (!contactId || !state.contacts.some((item) => item.id === contactId)) return; const conversation = (state.conversations ?? []).find((item) => item.id === conversationId); setForm((current) => ({ ...current, contactId, conversationId: conversation?.id ?? "", campaignId: (state.campaigns ?? []).some((item) => item.id === campaignId) ? campaignId : "", sourceChannel: conversation?.channel ?? current.sourceChannel })); setFormOpen(true); }, 0); return () => window.clearTimeout(timer); }, [state.contacts, state.conversations, state.campaigns]);
+  const selected = state.opportunities.find((item) => item.id === selectedId) ?? null; const activities = state.activities ?? []; const contactsById = useMemo(() => new Map(state.contacts.map((item) => [item.id, item])), [state.contacts]);
+  const visible = useMemo(() => state.opportunities.filter((item) => { const contact = item.contactId ? contactsById.get(item.contactId) : undefined; const text = `${item.title} ${contact?.name ?? ""} ${contact?.company ?? item.organization ?? ""}`.toLowerCase(); const stateMatch = stateFilter === "all" || (stateFilter === "open" ? OPEN_STAGES.includes(item.stage) : item.stage === stateFilter); return text.includes(search.toLowerCase()) && stateMatch && (channelFilter === "all" || item.sourceChannel === channelFilter); }), [state.opportunities, contactsById, search, stateFilter, channelFilter]);
+  const addActivity = (opportunityId: string, label: string, kind: SandboxActivity["kind"] = "stage_changed") => dispatch({ type: "ADD_ACTIVITY", activity: { id: crypto.randomUUID(), opportunityId, label, kind, createdAt: new Date().toISOString() } });
+  const updateOpportunity = (opportunity: Opportunity, activity?: string) => { dispatch({ type: "UPDATE_OPPORTUNITY", opportunity: { ...opportunity, updatedAt: new Date().toISOString() } }); if (activity) addActivity(opportunity.id, activity); };
+  const requestStage = (item: Opportunity, stage: OpportunityStage) => { if (stage === "won" || stage === "lost") { setCloseTarget({ id: item.id, stage }); setFinalValue(item.value?.toString() ?? ""); return; } updateOpportunity({ ...item, stage, closedAt: undefined, lostReason: undefined }, `Étape modifiée : ${stageLabels[stage]}`); };
+  const changeStage = (id: string, stage: OpportunityStage) => { const item = state.opportunities.find((entry) => entry.id === id); if (item && item.stage !== stage) requestStage(item, stage); };
+  const openCreate = () => { setEditingId(null); setForm(blankForm); setError(""); setFormOpen(true); };
+  const openEdit = (item: Opportunity) => { setEditingId(item.id); setForm({ title: item.title, contactId: item.contactId ?? "", stage: item.stage, value: item.value?.toString() ?? "", currency: item.currency ?? "EUR", nextAction: item.nextAction ?? "", nextActionAt: item.nextActionAt?.slice(0, 10) ?? "", notes: item.notes ?? "", conversationId: item.conversationId ?? "", campaignId: item.campaignId ?? "", sourceChannel: item.sourceChannel ?? "" }); setFormOpen(true); };
+  const save = (event: FormEvent) => { event.preventDefault(); if (!form.title.trim() || !form.contactId) { setError("Renseignez un nom et sélectionnez un contact existant."); return; } const contact = contactsById.get(form.contactId)!; const previous = editingId ? state.opportunities.find((item) => item.id === editingId) : undefined; const now = new Date().toISOString(); const opportunity: Opportunity = { ...previous, id: editingId ?? crypto.randomUUID(), title: form.title.trim(), stage: form.stage, contactId: contact.id, organization: contact.company, value: form.value ? Number(form.value) : undefined, currency: form.value ? form.currency : undefined, nextAction: form.nextAction.trim() || undefined, nextActionAt: form.nextActionAt ? new Date(`${form.nextActionAt}T12:00:00`).toISOString() : undefined, notes: form.notes.trim() || undefined, conversationId: form.conversationId || undefined, campaignId: form.campaignId || undefined, sourceChannel: form.sourceChannel || contact.channel, createdAt: previous?.createdAt ?? now, updatedAt: now }; dispatch(editingId ? { type: "UPDATE_OPPORTUNITY", opportunity } : { type: "CREATE_OPPORTUNITY", opportunity }); addActivity(opportunity.id, editingId ? "Opportunité modifiée" : "Opportunité créée", editingId ? "stage_changed" : "created"); setFormOpen(false); setSelectedId(opportunity.id); setEditingId(null); router.replace("/app/opportunities"); };
+  const duplicate = !editingId && form.contactId ? state.opportunities.find((item) => item.contactId === form.contactId && OPEN_STAGES.includes(item.stage)) : undefined;
+  const finishClose = () => { if (!closeTarget) return; const item = state.opportunities.find((entry) => entry.id === closeTarget.id); if (!item) return; updateOpportunity({ ...item, stage: closeTarget.stage, closedAt: new Date().toISOString(), finalValue: closeTarget.stage === "won" && finalValue ? Number(finalValue) : item.finalValue, lostReason: closeTarget.stage === "lost" ? lostReason : undefined }, closeTarget.stage === "won" ? "Opportunité gagnée" : `Opportunité perdue : ${lostReasonLabels[lostReason]}`); setCloseTarget(null); };
+  return <div className="opportunities-page opportunities-page--crm">
+    <PageHeader title="Opportunités" description="Suivez vos prospects jusqu’à leur conversion en clients." actions={<><div aria-label="Affichage des opportunités" className="workspace-view-toggle"><button aria-pressed={state.pipelineView === "pipeline"} className={state.pipelineView === "pipeline" ? "is-active" : undefined} onClick={() => dispatch({ type: "SET_PIPELINE_VIEW", view: "pipeline" })} type="button"><LuColumns3 />Pipeline</button><button aria-pressed={state.pipelineView === "list"} className={state.pipelineView === "list" ? "is-active" : undefined} onClick={() => dispatch({ type: "SET_PIPELINE_VIEW", view: "list" })} type="button"><LuList />Liste</button></div><button className="connection-button" onClick={openCreate} type="button"><LuPlus />Nouvelle opportunité</button></>} />
+    <div className="opportunities-toolbar"><label><LuSearch /><input onChange={(event) => setSearch(event.target.value)} placeholder="Rechercher une opportunité, un contact ou une entreprise..." value={search} /></label><select aria-label="Filtrer par canal" onChange={(event) => setChannelFilter(event.target.value as ChannelId | "all")} value={channelFilter}><option value="all">Tous les canaux</option><option value="linkedin">LinkedIn</option><option value="whatsapp">WhatsApp</option><option value="gmail">Email</option></select><select aria-label="Filtrer par état" onChange={(event) => setStateFilter(event.target.value as StateFilter)} value={stateFilter}><option value="open">Ouvertes</option><option value="all">Toutes</option><option value="won">Gagnées</option><option value="lost">Perdues</option></select></div>
+    {visible.length === 0 ? <EmptyState icon={<LuCircleDollarSign />} title="Aucune opportunité pour le moment" description="Transformez vos conversations intéressantes en opportunités commerciales et suivez leur progression." action={<button className="connection-button" onClick={openCreate} type="button">Créer une opportunité</button>} /> : state.pipelineView === "pipeline" ? <><select aria-label="Étape affichée sur mobile" className="opportunities-mobile-stage" onChange={(event) => setMobileStage(event.target.value as OpportunityStage)} value={mobileStage}>{PIPELINE_STAGES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select><section className="opportunities-kanban">{PIPELINE_STAGES.map(([stageId, stageLabel]) => <PipelineColumn activities={activities} contacts={contactsById} key={stageId} onDrop={(id) => changeStage(id, stageId)} onOpen={setSelectedId} opportunities={visible.filter((item) => item.stage === stageId)} stage={stageId} title={stageLabel} mobileStage={mobileStage} />)}</section></> : <OpportunityList activities={activities} contacts={contactsById} onOpen={setSelectedId} opportunities={visible} />}
+    <OpportunityDrawer activities={activities.filter((item) => item.opportunityId === selected?.id)} campaigns={state.campaigns ?? []} contact={selected?.contactId ? contactsById.get(selected.contactId) : undefined} conversations={(state.conversations ?? []).filter((item) => item.contactId === selected?.contactId)} messages={state.messages ?? []} onClose={() => setSelectedId(null)} onEdit={() => selected && openEdit(selected)} onMessage={(channel) => { const conversation = (state.conversations ?? []).find((item) => item.contactId === selected?.contactId && item.channel === channel); router.push(`/app/inbox${conversation ? `?conversationId=${conversation.id}` : ""}`); }} onStage={(stage) => selected && requestStage(selected, stage)} onUpdate={updateOpportunity} opportunity={selected} />
+    <OpportunityForm contacts={state.contacts} duplicate={duplicate} error={error} form={form} onChange={setForm} onClose={() => setFormOpen(false)} onDuplicate={() => { if (duplicate) { setSelectedId(duplicate.id); setFormOpen(false); } }} onSubmit={save} open={formOpen} editing={!!editingId} />
+    <Dialog description={closeTarget?.stage === "won" ? "Cette vente restera visible dans la colonne Gagné." : "Cette opportunité restera disponible dans le filtre Perdu."} onClose={() => setCloseTarget(null)} open={!!closeTarget} title={closeTarget?.stage === "won" ? "Opportunité gagnée" : "Marquer comme perdue"}><div className="workspace-form">{closeTarget?.stage === "won" ? <label><span>Valeur finale (facultatif)</span><input min="0" onChange={(event) => setFinalValue(event.target.value)} type="number" value={finalValue} /></label> : <label><span>Raison (facultatif)</span><select onChange={(event) => setLostReason(event.target.value as NonNullable<Opportunity["lostReason"]>)} value={lostReason}>{Object.entries(lostReasonLabels).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>}<div className="workspace-form__actions"><button className="connection-button connection-button--secondary" onClick={() => setCloseTarget(null)} type="button">Annuler</button><button className="connection-button" onClick={finishClose} type="button">Confirmer</button></div></div></Dialog>
   </div>;
 }
+
+type FormState = typeof blankForm;
+function OpportunityForm({ open, editing, form, contacts, duplicate, error, onChange, onClose, onDuplicate, onSubmit }: { open: boolean; editing: boolean; form: FormState; contacts: Contact[]; duplicate?: Opportunity; error: string; onChange: (form: FormState) => void; onClose: () => void; onDuplicate: () => void; onSubmit: (event: FormEvent) => void }) { return <Dialog description="Reliez cette vente potentielle à un contact existant." onClose={onClose} open={open} title={editing ? "Modifier l’opportunité" : "Nouvelle opportunité"}><form className="workspace-form opportunity-form" onSubmit={onSubmit}><label><span>Nom de l’opportunité *</span><input autoFocus onChange={(event) => onChange({ ...form, title: event.target.value })} placeholder="Ex. Refonte site web" value={form.title} /></label><label><span>Contact *</span><select onChange={(event) => onChange({ ...form, contactId: event.target.value })} value={form.contactId}><option value="">Sélectionner un contact</option>{contacts.map((contact) => <option key={contact.id} value={contact.id}>{contact.name}{contact.company ? ` — ${contact.company}` : ""}</option>)}</select></label>{contacts.length === 0 ? <p className="opportunity-form__notice">Créez d’abord un contact dans <Link href="/app/contacts">Contacts</Link>.</p> : null}{duplicate ? <div className="opportunity-duplicate"><span>Une opportunité ouverte existe déjà pour ce contact.</span><button onClick={onDuplicate} type="button">Voir l’opportunité</button></div> : null}<div className="opportunity-form__row"><label><span>Étape</span><select onChange={(event) => onChange({ ...form, stage: event.target.value as OpportunityStage })} value={form.stage}>{PIPELINE_STAGES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label><label><span>Valeur potentielle</span><input min="0" onChange={(event) => onChange({ ...form, value: event.target.value })} type="number" value={form.value} /></label><label><span>Devise</span><select onChange={(event) => onChange({ ...form, currency: event.target.value as OpportunityCurrency })} value={form.currency}><option>EUR</option><option>USD</option><option>XAF</option></select></label></div><div className="opportunity-form__row"><label><span>Prochaine action</span><input onChange={(event) => onChange({ ...form, nextAction: event.target.value })} placeholder="Envoyer le devis" value={form.nextAction} /></label><label><span>Date</span><input onChange={(event) => onChange({ ...form, nextActionAt: event.target.value })} type="date" value={form.nextActionAt} /></label></div><label><span>Notes</span><textarea onChange={(event) => onChange({ ...form, notes: event.target.value })} rows={4} value={form.notes} /></label>{error ? <small role="alert">{error}</small> : null}<div className="workspace-form__actions"><button className="connection-button connection-button--secondary" onClick={onClose} type="button">Annuler</button><button className="connection-button" type="submit">{editing ? "Enregistrer" : "Créer l’opportunité"}</button></div></form></Dialog>; }
+function PipelineColumn({ stage, title, opportunities, contacts, activities, onOpen, onDrop, mobileStage }: { stage: OpportunityStage; title: string; opportunities: Opportunity[]; contacts: Map<string, Contact>; activities: SandboxActivity[]; onOpen: (id: string) => void; onDrop: (id: string) => void; mobileStage: OpportunityStage }) { const total = opportunities.reduce((sum, item) => sum + (item.value ?? 0), 0); return <section className={`opportunity-column${mobileStage === stage ? " is-mobile-active" : ""}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => onDrop(event.dataTransfer.getData("text/opportunity-id"))}><header><div><h2>{title}</h2><span>{opportunities.length}</span></div>{total > 0 ? <small>{new Intl.NumberFormat("fr-FR").format(total)}</small> : null}</header><div className="opportunity-column__cards">{opportunities.map((item) => <OpportunityCard activities={activities} contact={item.contactId ? contacts.get(item.contactId) : undefined} key={item.id} onOpen={onOpen} opportunity={item} />)}</div></section>; }
+function OpportunityCard({ opportunity, contact, activities, onOpen }: { opportunity: Opportunity; contact?: Contact; activities: SandboxActivity[]; onOpen: (id: string) => void }) { const latest = getOpportunityLastActivity(opportunity, activities); return <button className="opportunity-card opportunity-card--crm" draggable onClick={() => onOpen(opportunity.id)} onDragStart={(event: DragEvent<HTMLButtonElement>) => event.dataTransfer.setData("text/opportunity-id", opportunity.id)} type="button"><span className="opportunity-card__top"><strong>{opportunity.title}</strong><LuChevronRight /></span><span className="opportunity-card__contact"><i>{contact?.name.slice(0, 2).toUpperCase() ?? "?"}</i><span>{contact?.name ?? "Contact indisponible"}<small>{contact?.company ?? opportunity.organization ?? ""}</small></span></span><span className="opportunity-card__meta">{opportunity.sourceChannel ? <ChannelLogo channel={opportunity.sourceChannel} /> : null}{formatOpportunityValue(opportunity) ? <b>{formatOpportunityValue(opportunity)}</b> : null}</span>{opportunity.nextAction ? <span className={`opportunity-card__action${isOpportunityOverdue(opportunity) ? " is-overdue" : ""}`}><LuCalendar />{opportunity.nextAction}<small>{opportunity.nextActionAt ? new Date(opportunity.nextActionAt).toLocaleDateString("fr") : ""}</small></span> : null}<span className="opportunity-card__activity">{isOpportunityStale(opportunity, activities) ? "À relancer" : latest ? `Activité ${new Date(latest).toLocaleDateString("fr")}` : "Aucune activité"}</span></button>; }
+function OpportunityList({ opportunities, contacts, activities, onOpen }: { opportunities: Opportunity[]; contacts: Map<string, Contact>; activities: SandboxActivity[]; onOpen: (id: string) => void }) { return <div className="opportunity-table"><div className="opportunity-table__head"><span>Opportunité</span><span>Contact</span><span>Étape</span><span>Valeur</span><span>Prochaine action</span><span>Activité</span></div>{opportunities.map((item) => { const contact = item.contactId ? contacts.get(item.contactId) : undefined; const latest = getOpportunityLastActivity(item, activities); return <button key={item.id} onClick={() => onOpen(item.id)} type="button"><strong>{item.title}</strong><span>{contact?.name ?? "—"}<small>{contact?.company ?? item.organization ?? ""}</small></span><em>{stageLabels[item.stage]}</em><span>{formatOpportunityValue(item) ?? "—"}</span><span>{item.nextAction ?? "—"}</span><span>{latest ? new Date(latest).toLocaleDateString("fr") : "—"}</span></button>; })}</div>; }
+function OpportunityDrawer({ opportunity, contact, conversations, messages, campaigns, activities, onClose, onEdit, onStage, onUpdate, onMessage }: { opportunity: Opportunity | null; contact?: Contact; conversations: NonNullable<ReturnType<typeof useSandbox>["state"]["conversations"]>; messages: NonNullable<ReturnType<typeof useSandbox>["state"]["messages"]>; campaigns: NonNullable<ReturnType<typeof useSandbox>["state"]["campaigns"]>; activities: SandboxActivity[]; onClose: () => void; onEdit: () => void; onStage: (stage: OpportunityStage) => void; onUpdate: (opportunity: Opportunity, activity?: string) => void; onMessage: (channel: ChannelId) => void }) { if (!opportunity) return null; const campaign = campaigns.find((item) => item.id === opportunity.campaignId); const channels = ([contact?.linkedinUrl ? "linkedin" : null, contact?.phone ? "whatsapp" : null, contact?.email ? "gmail" : null] as (ChannelId | null)[]).filter(Boolean) as ChannelId[]; return <div className="opportunity-drawer-layer"><button aria-label="Fermer la fiche" className="opportunity-drawer-backdrop" onClick={onClose} type="button" /><aside aria-label={`Fiche ${opportunity.title}`} className="opportunity-drawer"><header><div><span className="opportunity-drawer__eyebrow">Fiche opportunité</span><h2>{opportunity.title}</h2><p>{contact?.name ?? "Contact indisponible"}{contact?.company ? ` · ${contact.company}` : ""}</p></div><div><button className="connection-button connection-button--secondary" onClick={onEdit} type="button"><LuPencil />Modifier</button><button aria-label="Fermer" className="connection-button connection-button--quiet" onClick={onClose} type="button"><LuX /></button></div></header><section className="opportunity-drawer__summary"><label><span>Étape</span><select onChange={(event) => onStage(event.target.value as OpportunityStage)} value={opportunity.stage}>{PIPELINE_STAGES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}<option value="lost">Perdu</option></select></label><div><span>Valeur</span><strong>{formatOpportunityValue(opportunity) ?? "Non renseignée"}</strong></div><div><span>Source</span><strong>{campaign ? `Campagne · ${campaign.name}` : opportunity.sourceChannel ? channelLabels[opportunity.sourceChannel] : "Non renseignée"}</strong></div></section><div className="opportunity-drawer__grid"><section><h3>Contact</h3>{contact ? <div className="opportunity-contact"><i>{contact.name.slice(0, 2).toUpperCase()}</i><span><strong>{contact.name}</strong><small>{contact.role ?? "Fonction non renseignée"}<br />{contact.company ?? "Entreprise non renseignée"}</small></span><Link href="/app/contacts"><LuArrowRight /></Link></div> : <p>Le contact lié n’est plus disponible.</p>}<div className="opportunity-channel-actions">{channels.map((channel) => <button key={channel} onClick={() => onMessage(channel)} type="button"><ChannelLogo channel={channel} />{channelLabels[channel]}</button>)}</div></section><section><h3>Prochaine action</h3>{opportunity.nextAction && !opportunity.nextActionCompletedAt ? <div className="opportunity-next-action"><strong>{opportunity.nextAction}</strong><span>{opportunity.nextActionAt ? new Date(opportunity.nextActionAt).toLocaleDateString("fr", { dateStyle: "long" }) : "Sans date"}</span><button onClick={() => onUpdate({ ...opportunity, nextActionCompletedAt: new Date().toISOString() }, `Action terminée : ${opportunity.nextAction}`)} type="button"><LuCheck />Marquer comme terminée</button></div> : <p>Aucune prochaine action active.</p>}</section><section><h3>Conversations</h3>{conversations.length ? conversations.map((conversation) => { const latest = messages.filter((item) => item.contactId === contact?.id && item.channel === conversation.channel).at(-1); return <button className="opportunity-conversation" key={conversation.id} onClick={() => onMessage(conversation.channel)} type="button"><ChannelLogo channel={conversation.channel} /><span><strong>{channelLabels[conversation.channel]}</strong><small>{latest ? new Date(latest.createdAt).toLocaleString("fr") : "Aucun message"}</small></span><LuChevronRight /></button>; }) : <p>Aucune conversation associée.</p>}</section><section><h3>Notes</h3><textarea onBlur={(event) => { if (event.target.value !== (opportunity.notes ?? "")) onUpdate({ ...opportunity, notes: event.target.value }, "Note ajoutée"); }} defaultValue={opportunity.notes ?? ""} placeholder="Ajoutez un contexte commercial..." rows={6} /></section><section className="opportunity-activity"><h3>Activité</h3>{activities.length ? [...activities].reverse().map((item) => <div key={item.id}><i /><span><strong>{item.label}</strong><small>{new Date(item.createdAt).toLocaleString("fr")}</small></span></div>) : <p>Aucune activité enregistrée.</p>}</section></div></aside></div>; }

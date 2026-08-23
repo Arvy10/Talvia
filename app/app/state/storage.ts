@@ -59,7 +59,8 @@ function isOpportunityStage(value: unknown): value is OpportunityStage {
     value === "qualified" ||
     value === "proposal" ||
     value === "negotiation" ||
-    value === "won"
+    value === "won" ||
+    value === "lost"
   );
 }
 
@@ -82,11 +83,18 @@ function isContact(value: unknown): value is Contact {
 function isOpportunity(value: unknown): value is Opportunity {
   return (
     isRecord(value) &&
-    hasOnlyFields(value, ["id", "title", "stage", "organization", "contactId", "sourceChannel"]) &&
+    hasOnlyFields(value, ["id", "title", "stage", "organization", "contactId", "sourceChannel", "conversationId", "campaignId", "value", "currency", "nextAction", "nextActionAt", "nextActionCompletedAt", "notes", "createdAt", "updatedAt", "closedAt", "finalValue", "lostReason"]) &&
     isNonEmptyString(value.id) &&
     isNonEmptyString(value.title) &&
     isOpportunityStage(value.stage) &&
-    isOptionalString(value.organization) && isOptionalString(value.contactId) && isOptionalChannelId(value.sourceChannel)
+    isOptionalString(value.organization) && isOptionalString(value.contactId) && isOptionalChannelId(value.sourceChannel) &&
+    isOptionalString(value.conversationId) && isOptionalString(value.campaignId) &&
+    (value.value === undefined || (typeof value.value === "number" && Number.isFinite(value.value))) &&
+    (value.finalValue === undefined || (typeof value.finalValue === "number" && Number.isFinite(value.finalValue))) &&
+    (value.currency === undefined || ["USD", "EUR", "XAF"].includes(value.currency as string)) &&
+    isOptionalString(value.nextAction) && isOptionalString(value.nextActionAt) && isOptionalString(value.nextActionCompletedAt) &&
+    isOptionalString(value.notes) && isOptionalString(value.createdAt) && isOptionalString(value.updatedAt) && isOptionalString(value.closedAt) &&
+    (value.lostReason === undefined || ["price", "no_need", "not_now", "competitor", "no_response", "other"].includes(value.lostReason as string))
   );
 }
 
