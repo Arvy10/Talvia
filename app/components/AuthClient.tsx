@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { FormEvent, useState } from 'react';
 
 import { authClient } from '../lib/auth-client';
+import { AuthSwitch } from './ui/auth-switch';
 
 export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
   const router = useRouter();
@@ -75,6 +76,7 @@ export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
             talvia
           </Link>
           <span className="form-kicker">{signup ? 'NOUVEL ESPACE' : 'CONNEXION'}</span>
+          <AuthSwitch mode={mode} />
           <h2>{signup ? 'Créez votre espace Talvia' : 'Bon retour parmi nous'}</h2>
           <p>{signup ? 'Quelques informations suffisent pour commencer.' : 'Entrez vos informations pour retrouver votre espace.'}</p>
 
