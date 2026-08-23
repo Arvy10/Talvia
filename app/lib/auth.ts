@@ -15,5 +15,5 @@ export const auth = betterAuth({
       generateId: "uuid",
     },
   },
-  trustedOrigins: [baseURL],
+  trustedOrigins: [baseURL, "http://127.0.0.1:3000"],
 });
