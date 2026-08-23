@@ -4,23 +4,44 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { FormEvent, useState } from 'react';
 
-import { activateSandboxSession } from '../app/state/session';
-import { loadSandboxState } from '../app/state/storage';
+import { authClient } from '../lib/auth-client';
 
 export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
   const router = useRouter();
   const signup = mode === 'signup';
   const [show, setShow] = useState(false);
   const [status, setStatus] = useState<'idle' | 'loading' | 'done'>('idle');
+  const [error, setError] = useState('');
 
-  function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setStatus('loading');
+    setError('');
+    const form = new FormData(event.currentTarget);
+    const email = String(form.get('email') ?? '');
+    const password = String(form.get('password') ?? '');
+    const name = String(form.get('name') ?? '');
+    const result = signup
+      ? await authClient.signUp.email({ email, password, name })
+      : await authClient.signIn.email({ email, password });
+    if (result.error) {
+      setError(result.error.message ?? "Impossible de vous connecter.");
+      setStatus('idle');
+      return;
+    }
+    if (signup) {
+      const provision = await fetch('/api/workspace/provision', { method: 'POST' });
+      if (!provision.ok) {
+        setError("Votre compte a été créé, mais la préparation de l’espace a échoué. Réessayez de vous connecter.");
+        setStatus('idle');
+        return;
+      }
+    }
+    setStatus('done');
     window.setTimeout(() => {
-      activateSandboxSession(loadSandboxState());
       setStatus('done');
       router.push('/app');
-    }, 650);
+    }, 250);
   }
 
   return (
@@ -60,18 +81,19 @@ export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
           {status === 'done' ? (
             <div className="mock-success" role="status">
               <span>✓</span>
-              <h3>{signup ? 'Votre espace de démonstration est prêt.' : 'Connexion de démonstration validée.'}</h3>
-              <p>Aucun compte réel n’a été créé ou connecté à cette étape.</p>
-              <Link className="button" href="/">Retourner à l’accueil →</Link>
+              <h3>{signup ? 'Votre espace Talvia est prêt.' : 'Connexion validée.'}</h3>
+              <p>Votre session et vos données Contacts sont désormais persistées de façon sécurisée.</p>
+              <Link className="button" href="/app">Ouvrir Talvia →</Link>
             </div>
           ) : (
             <form onSubmit={submit}>
-              <div className="demo-note"><span>i</span><p><b>Mode démonstration</b><small>Ce formulaire ne transmet aucune donnée.</small></p></div>
+              <div className="demo-note"><span>i</span><p><b>Compte Talvia</b><small>Vos identifiants restent chiffrés et vos données sont isolées dans votre espace.</small></p></div>
               {signup && <label>Nom complet<input name="name" autoComplete="name" required placeholder="Votre nom" /></label>}
               <label>Email professionnel<input type="email" name="email" autoComplete="email" required placeholder="vous@entreprise.com" /></label>
               <label>Mot de passe<div className="password-field"><input type={show ? 'text' : 'password'} name="password" autoComplete={signup ? 'new-password' : 'current-password'} required minLength={8} placeholder="8 caractères minimum" /><button type="button" onClick={() => setShow(!show)} aria-label={show ? 'Masquer le mot de passe' : 'Afficher le mot de passe'}>{show ? 'Masquer' : 'Afficher'}</button></div></label>
               {!signup && <div className="form-options"><label><input type="checkbox" /> Se souvenir de moi</label><a href="#">Mot de passe oublié ?</a></div>}
               <button className="button submit" disabled={status === 'loading'}>{status === 'loading' ? 'Préparation…' : signup ? 'Créer mon espace' : 'Se connecter'}<span>→</span></button>
+              {error ? <p className="form-error" role="alert">{error}</p> : null}
               <p className="form-switch">{signup ? 'Vous avez déjà un compte ?' : 'Pas encore de compte ?'} <Link href={signup ? '/login' : '/signup'}>{signup ? 'Se connecter' : 'Créer un compte'}</Link></p>
               {signup && <small className="terms">En continuant, vous acceptez nos conditions d’utilisation et notre politique de confidentialité.</small>}
             </form>

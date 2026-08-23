@@ -2,6 +2,7 @@ import Link from "next/link";
 import { LuChevronUp } from "react-icons/lu";
 
 import { productNavigation } from "./navigation";
+import { SignOutButton } from "./SignOutButton";
 
 type SidebarProps = {
   pathname: string;
@@ -37,7 +38,7 @@ export function Sidebar({ pathname, drawer = false, onNavigate, collapsed = fals
       <span aria-hidden="true">TS</span>
       <details className="app-user-menu">
         <summary><div><strong>Sandbox Talvia</strong><small>Mode démonstration</small></div><LuChevronUp aria-hidden="true" /></summary>
-        <div className="app-user-menu__panel"><Link href="/app/profile" onClick={onNavigate}>Mon profil</Link><Link href="/app/settings" onClick={onNavigate}>Mon workspace</Link><Link href="/app/settings#subscription" onClick={onNavigate}>Abonnement</Link><Link href="/app/settings" onClick={onNavigate}>Paramètres</Link><Link className="app-user-menu__logout" href="/login" onClick={onNavigate}>Se déconnecter</Link></div>
+        <div className="app-user-menu__panel"><Link href="/app/profile" onClick={onNavigate}>Mon profil</Link><Link href="/app/settings" onClick={onNavigate}>Mon workspace</Link><Link href="/app/settings#subscription" onClick={onNavigate}>Abonnement</Link><Link href="/app/settings" onClick={onNavigate}>Paramètres</Link><SignOutButton className="app-user-menu__logout" onComplete={onNavigate} /></div>
       </details>
     </footer>
   </aside>;
