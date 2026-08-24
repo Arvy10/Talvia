@@ -23,22 +23,15 @@ export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
     const password = String(form.get('password') ?? '');
     const name = String(form.get('name') ?? '');
     const result = signup
-      ? await authClient.signUp.email({ email, password, name })
+      ? await authClient.signUp.email({ email, password, name, callbackURL: '/app' })
       : await authClient.signIn.email({ email, password });
     if (result.error) {
       setError(result.error.message ?? "Impossible de vous connecter.");
       setStatus('idle');
       return;
     }
-    if (signup) {
-      const provision = await fetch('/api/workspace/provision', { method: 'POST' });
-      if (!provision.ok) {
-        setError("Votre compte a été créé, mais la préparation de l’espace a échoué. Réessayez de vous connecter.");
-        setStatus('idle');
-        return;
-      }
-    }
     setStatus('done');
+    if (signup) return;
     window.setTimeout(() => {
       setStatus('done');
       router.push('/app');
@@ -83,9 +76,9 @@ export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
           {status === 'done' ? (
             <div className="mock-success" role="status">
               <span>✓</span>
-              <h3>{signup ? 'Votre espace Talvia est prêt.' : 'Connexion validée.'}</h3>
-              <p>Votre session et vos données Contacts sont désormais persistées de façon sécurisée.</p>
-              <Link className="button" href="/app">Ouvrir Talvia →</Link>
+              <h3>{signup ? 'Vérifiez votre adresse e-mail.' : 'Connexion validée.'}</h3>
+              <p>{signup ? 'Nous venons de vous envoyer un lien de confirmation. Après validation, votre espace Talvia sera prêt.' : 'Votre session et vos données Contacts sont désormais persistées de façon sécurisée.'}</p>
+              {!signup && <Link className="button" href="/app">Ouvrir Talvia →</Link>}
             </div>
           ) : (
             <form onSubmit={submit}>

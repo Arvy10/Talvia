@@ -195,7 +195,7 @@ export function InboxClient() {
         <div>
           <h1>Inbox</h1>
           <p>
-            Gérez toutes vos conversations commerciales depuis un seul endroit.
+            Retrouvez le contexte, le contact et la prochaine action derrière chaque conversation.
           </p>
         </div>
         <button
@@ -247,7 +247,7 @@ export function InboxClient() {
               className="inbox-dense-empty"
               icon={<LuInbox />}
               title="Aucune conversation pour le moment"
-              description="Commencez une conversation avec un contact ou attendez les premières réponses à vos campagnes."
+              description="Démarrez une conversation avec un contact ou retrouvez ici les réponses issues de votre suivi commercial."
               action={
                 <button
                   className="connection-button connection-button--secondary"

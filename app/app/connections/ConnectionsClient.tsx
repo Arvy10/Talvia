@@ -8,9 +8,9 @@ import type { ChannelId, ConnectionStatus } from "../state/types";
 import { ChannelLogo } from "./ChannelLogo";
 
 const channels: Array<{ id: ChannelId; name: string; description: string }> = [
-  { id: "linkedin", name: "LinkedIn", description: "Centralisez les échanges professionnels qui font avancer vos opportunités." },
-  { id: "whatsapp", name: "WhatsApp", description: "Gardez le contexte de vos conversations rapides dans votre espace commercial." },
-  { id: "gmail", name: "Gmail", description: "Retrouvez vos emails commerciaux avec le reste de votre suivi prospect." },
+  { id: "linkedin", name: "LinkedIn", description: "Préparez ce canal pour l’intégrer à votre suivi commercial dès sa disponibilité." },
+  { id: "whatsapp", name: "WhatsApp", description: "Préparez ce canal pour conserver le contexte de vos conversations commerciales." },
+  { id: "gmail", name: "Gmail", description: "Préparez ce canal pour réunir vos emails avec le reste de votre suivi prospect." },
 ];
 const empty: Record<ChannelId, ConnectionStatus> = { linkedin: "disconnected", whatsapp: "disconnected", gmail: "disconnected" };
 const apiChannel = (channel: ChannelId) => channel === "gmail" ? "email" : channel;
