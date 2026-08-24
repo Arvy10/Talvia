@@ -1,8 +1,10 @@
 import type { Metadata, Viewport } from 'next';
 import '@fontsource/instrument-serif';
 import '@fontsource-variable/instrument-sans';
+import RefreshOnBfcache from './components/RefreshOnBfcache';
 import './globals.css';
 import './typography.css';
+import './auth-motion.css';
 
 const title = 'Talvia — Votre suivi commercial multicanal';
 const description = 'Talvia rassemble votre suivi commercial autour de LinkedIn, WhatsApp et Gmail pour vous aider à suivre vos prospects, relancer au bon moment et faire avancer les bonnes opportunités.';
@@ -28,5 +30,5 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  return <html lang="fr"><body>{children}</body></html>;
+  return <html lang="fr"><body><RefreshOnBfcache />{children}</body></html>;
 }

@@ -1,0 +1,6 @@
+import { NextResponse } from "next/server";
+import { createDraft,getConversation } from "../../../../../lib/inbox";
+import { getCurrentWorkspace,UnauthorizedError } from "../../../../../lib/workspace-context";
+export const runtime="nodejs";type C={params:Promise<{conversationId:string}>};const fail=(e:unknown)=>NextResponse.json({error:e instanceof UnauthorizedError?"Non authentifié.":e instanceof Error?e.message:"Erreur serveur."},{status:e instanceof UnauthorizedError?401:400});
+export async function GET(_:Request,{params}:C){try{const v=await getConversation(await getCurrentWorkspace(),(await params).conversationId);return v?NextResponse.json({messages:v.messages}):NextResponse.json({error:"Conversation introuvable."},{status:404});}catch(e){return fail(e);}}
+export async function POST(r:Request,{params}:C){try{const body=await r.json() as {body?:string};if(!body.body?.trim())return NextResponse.json({error:"Le brouillon est vide."},{status:400});const m=await createDraft(await getCurrentWorkspace(),(await params).conversationId,body.body);return m?NextResponse.json({message:m},{status:201}):NextResponse.json({error:"Conversation introuvable."},{status:404});}catch(e){return fail(e);}}
