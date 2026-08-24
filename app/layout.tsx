@@ -4,8 +4,8 @@ import '@fontsource-variable/instrument-sans';
 import './globals.css';
 import './typography.css';
 
-const title = 'Talvia — Toutes vos conversations commerciales au même endroit';
-const description = 'Centralisez LinkedIn, WhatsApp, Instagram et vos emails dans une inbox commerciale conçue pour vous aider à répondre, relancer et convertir vos prospects.';
+const title = 'Talvia — Votre suivi commercial multicanal';
+const description = 'Talvia rassemble votre suivi commercial autour de LinkedIn, WhatsApp et Gmail pour vous aider à suivre vos prospects, relancer au bon moment et faire avancer les bonnes opportunités.';
 
 export const viewport: Viewport = { themeColor: '#0D0B10' };
 
@@ -16,12 +16,12 @@ export const metadata: Metadata = {
   applicationName: 'Talvia',
   icons: { icon: '/favicon.svg' },
   openGraph: {
-    title: 'Talvia — Toutes vos conversations commerciales. Un seul espace.',
+    title: 'Talvia — Vos conversations commerciales sont partout. Votre suivi ne devrait pas l’être.',
     description,
     type: 'website',
     locale: 'fr_FR',
     siteName: 'Talvia',
-    images: [{ url: '/og.png', width: 1792, height: 1024, alt: 'Talvia — Toutes vos conversations commerciales. Un seul espace.' }],
+    images: [{ url: '/og.png', width: 1792, height: 1024, alt: 'Talvia — suivi commercial multicanal' }],
   },
   twitter: { card: 'summary_large_image', title, description, images: ['/og.png'] },
   robots: { index: true, follow: true },
