@@ -13,6 +13,15 @@ export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
   const [show, setShow] = useState(false);
   const [status, setStatus] = useState<'idle' | 'loading' | 'done'>('idle');
   const [error, setError] = useState('');
+  const [transitionTarget, setTransitionTarget] = useState<'login' | 'signup' | null>(null);
+
+  function navigateMode(target: 'login' | 'signup') {
+    if (target === mode || transitionTarget) return;
+    const destination = target === 'login' ? '/login' : '/signup';
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { router.push(destination); return; }
+    setTransitionTarget(target);
+    window.setTimeout(() => router.push(destination), 420);
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -39,7 +48,7 @@ export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
   }
 
   return (
-    <main className="auth-page">
+    <main className={`auth-page auth-page--${mode}${transitionTarget ? ` is-transitioning-to-${transitionTarget}` : ''}`}>
       <section className="auth-brand">
         <Link href="/" className="brand">
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /></span>
@@ -55,6 +64,7 @@ export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
             <article><i>MD</i><div><b>Marc Dupont</b><small>Proposition envoyée il y a 5 jours</small></div><em>Relancer</em></article>
             <footer><span>✦</span>Talvia garde le fil pour vous.</footer>
           </div>
+          <button className="auth-panel-action" onClick={() => navigateMode(signup ? 'login' : 'signup')} type="button">{signup ? 'Se connecter' : 'Créer mon espace'} <span>→</span></button>
         </div>
         <small className="auth-quote">Automatisez le travail. Pas la relation.</small>
       </section>
@@ -69,7 +79,7 @@ export default function AuthClient({ mode }: { mode: 'login' | 'signup' }) {
             talvia
           </Link>
           <span className="form-kicker">{signup ? 'NOUVEL ESPACE' : 'CONNEXION'}</span>
-          <AuthSwitch mode={mode} />
+          <AuthSwitch mode={mode} onNavigate={navigateMode} />
           <h2>{signup ? 'Créez votre espace Talvia' : 'Bon retour parmi nous'}</h2>
           <p>{signup ? 'Quelques informations suffisent pour commencer.' : 'Entrez vos informations pour retrouver votre espace.'}</p>
 
