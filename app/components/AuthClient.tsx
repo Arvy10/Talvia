@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { FormEvent, useEffect, useState } from 'react';
+import { FormEvent, useState } from 'react';
 import { authClient } from '../lib/auth-client';
 import { AuthSwitch } from './ui/auth-switch';
 
@@ -23,17 +23,6 @@ export default function AuthClient({ mode: initialMode }: AuthClientProps) {
   const [error, setError] = useState('');
   const isSignup = mode === 'signup';
 
-  useEffect(() => {
-    const handlePopState = () => {
-      setMode(window.location.pathname === '/signup' ? 'signup' : 'login');
-      setStatus('idle');
-      setError('');
-    };
-
-    window.addEventListener('popstate', handlePopState);
-    return () => window.removeEventListener('popstate', handlePopState);
-  }, []);
-
   function changeMode(nextMode: AuthMode) {
     if (nextMode === mode || isTransitioning) return;
 
@@ -41,7 +30,6 @@ export default function AuthClient({ mode: initialMode }: AuthClientProps) {
     setMode(nextMode);
     setStatus('idle');
     setError('');
-    window.history.pushState({}, '', nextMode === 'signup' ? '/signup' : '/login');
     window.setTimeout(() => setIsTransitioning(false), 560);
   }
 
