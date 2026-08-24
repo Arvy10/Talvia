@@ -1,4 +1,5 @@
 'use client';
+
 import Link from 'next/link';
 import { FormEvent, useEffect, useState } from 'react';
 import { authClient } from '../lib/auth-client';
@@ -6,37 +7,51 @@ import { AuthSwitch } from './ui/auth-switch';
 
 type AuthMode = 'login' | 'signup';
 
-export default function AuthClient({ mode: initialMode }: { mode: AuthMode }) {
+type AuthClientProps = {
+  mode: AuthMode;
+};
+
+function TalviaMark() {
+  return <span className="talvia-auth__mark" aria-hidden="true"><i /><i /><i /><i /></span>;
+}
+
+export default function AuthClient({ mode: initialMode }: AuthClientProps) {
   const [mode, setMode] = useState<AuthMode>(initialMode);
   const [showPassword, setShowPassword] = useState(false);
   const [status, setStatus] = useState<'idle' | 'loading' | 'done'>('idle');
   const [error, setError] = useState('');
-  const signup = mode === 'signup';
+  const isSignup = mode === 'signup';
 
   useEffect(() => {
-    const syncWithHistory = () => setMode(window.location.pathname === '/signup' ? 'signup' : 'login');
-    window.addEventListener('popstate', syncWithHistory);
-    return () => window.removeEventListener('popstate', syncWithHistory);
+    const handlePopState = () => {
+      setMode(window.location.pathname === '/signup' ? 'signup' : 'login');
+      setStatus('idle');
+      setError('');
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  function go(nextMode: AuthMode) {
+  function changeMode(nextMode: AuthMode) {
     if (nextMode === mode) return;
+
+    setMode(nextMode);
     setStatus('idle');
     setError('');
-    setMode(nextMode);
     window.history.pushState({}, '', nextMode === 'signup' ? '/signup' : '/login');
   }
 
-  async function submit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setStatus('loading');
     setError('');
 
-    const data = new FormData(event.currentTarget);
-    const email = String(data.get('email') ?? '');
-    const password = String(data.get('password') ?? '');
-    const name = String(data.get('name') ?? '');
-    const result = signup
+    const form = new FormData(event.currentTarget);
+    const email = String(form.get('email') ?? '');
+    const password = String(form.get('password') ?? '');
+    const name = String(form.get('name') ?? '');
+    const result = isSignup
       ? await authClient.signUp.email({ email, password, name, callbackURL: '/app' })
       : await authClient.signIn.email({ email, password });
 
@@ -47,34 +62,57 @@ export default function AuthClient({ mode: initialMode }: { mode: AuthMode }) {
     }
 
     setStatus('done');
-    if (!signup) window.setTimeout(() => window.location.assign('/app'), 250);
+    if (!isSignup) window.setTimeout(() => window.location.assign('/app'), 250);
   }
 
-  return <main className={`auth-page auth-page--${mode}`}>
-    <section className="auth-card" data-mode={mode}>
-      <section className="auth-card__form">
-        <Link href="/" className="auth-back">← Retour à l’accueil</Link>
-        <div className="auth-form-wrap">
-          <span className="form-kicker">{signup ? 'NOUVEL ESPACE' : 'CONNEXION'}</span>
-          <AuthSwitch mode={mode} onNavigate={go} />
-          <h1>{signup ? 'Créez votre espace Talvia' : 'Bon retour parmi nous'}</h1>
-          <p>{signup ? 'Quelques informations suffisent pour commencer.' : 'Entrez vos informations pour retrouver votre espace.'}</p>
-          {status === 'done' ? <div className="mock-success"><span>✓</span><h2>{signup ? 'Vérifiez votre adresse e-mail.' : 'Connexion validée.'}</h2><p>{signup ? 'Nous venons de vous envoyer un lien de confirmation.' : 'Votre session est prête.'}</p></div> : <form onSubmit={submit}>
-            <div className="demo-note"><span>i</span><p><b>Compte Talvia</b><small>Vos identifiants restent chiffrés et vos données sont isolées dans votre espace.</small></p></div>
-            {signup && <label>Nom complet<input name="name" required placeholder="Votre nom" /></label>}
-            <label>Email professionnel<input name="email" type="email" required placeholder="vous@entreprise.com" /></label>
-            <label>Mot de passe<div className="password-field"><input name="password" type={showPassword ? 'text' : 'password'} required minLength={8} placeholder="8 caractères minimum" /><button type="button" onClick={() => setShowPassword(!showPassword)}>{showPassword ? 'Masquer' : 'Afficher'}</button></div></label>
-            {!signup && <div className="form-options"><label><input type="checkbox" /> Se souvenir de moi</label><a href="#">Mot de passe oublié ?</a></div>}
-            <button className="button submit" disabled={status === 'loading'}>{status === 'loading' ? 'Préparation…' : signup ? 'Créer mon espace' : 'Se connecter'} <span>→</span></button>
-            {error && <p className="form-error">{error}</p>}
-            <p className="form-switch">{signup ? 'Vous avez déjà un compte ?' : 'Pas encore de compte ?'} <button onClick={() => go(signup ? 'login' : 'signup')} type="button">{signup ? 'Se connecter' : 'Créer un compte'}</button></p>
-          </form>}
-        </div>
+  return (
+    <main className="talvia-auth">
+      <section className="talvia-auth__card" data-mode={mode}>
+        <aside className="talvia-auth__panel" aria-label="Présentation Talvia">
+          <Link className="talvia-auth__brand" href="/" aria-label="Retour à l’accueil Talvia">
+            <TalviaMark />
+            <span>talvia</span>
+          </Link>
+
+          <div className="talvia-auth__panel-content">
+            <span className="talvia-auth__eyebrow">●—●—● Votre espace commercial</span>
+            <h2>{isSignup ? 'Déjà parmi nous ?' : 'Nouveau ici ?'}</h2>
+            <p>{isSignup ? 'Retrouvez vos conversations et vos relances dans un même espace.' : 'Créez votre espace Talvia et gardez le fil de chaque opportunité.'}</p>
+            <button className="talvia-auth__secondary-action" onClick={() => changeMode(isSignup ? 'login' : 'signup')} type="button">
+              {isSignup ? 'Se connecter' : 'Créer mon espace'} <span aria-hidden="true">→</span>
+            </button>
+          </div>
+        </aside>
+
+        <section className="talvia-auth__form-shell">
+          <Link className="talvia-auth__back" href="/">← Retour à l’accueil</Link>
+          <div className="talvia-auth__form-content">
+            <span className="talvia-auth__kicker">{isSignup ? 'NOUVEL ESPACE' : 'CONNEXION'}</span>
+            <AuthSwitch mode={mode} onNavigate={changeMode} />
+            <h1>{isSignup ? 'Créez votre espace Talvia' : 'Bon retour parmi nous'}</h1>
+            <p className="talvia-auth__intro">{isSignup ? 'Quelques informations suffisent pour commencer.' : 'Entrez vos informations pour retrouver votre espace.'}</p>
+
+            {status === 'done' ? (
+              <div className="talvia-auth__success" role="status">
+                <span aria-hidden="true">✓</span>
+                <h2>{isSignup ? 'Vérifiez votre adresse e-mail.' : 'Connexion validée.'}</h2>
+                <p>{isSignup ? 'Nous venons de vous envoyer un lien de confirmation.' : 'Votre session est prête.'}</p>
+              </div>
+            ) : (
+              <form className="talvia-auth__form" onSubmit={handleSubmit}>
+                <div className="talvia-auth__notice"><span aria-hidden="true">i</span><p><b>Compte Talvia</b><small>Vos identifiants restent chiffrés et vos données sont isolées dans votre espace.</small></p></div>
+                {isSignup && <label>Nom complet<input name="name" required placeholder="Votre nom" /></label>}
+                <label>Email professionnel<input name="email" type="email" required placeholder="vous@entreprise.com" /></label>
+                <label>Mot de passe<div className="talvia-auth__password"><input name="password" type={showPassword ? 'text' : 'password'} required minLength={8} placeholder="8 caractères minimum" /><button onClick={() => setShowPassword(!showPassword)} type="button">{showPassword ? 'Masquer' : 'Afficher'}</button></div></label>
+                {!isSignup && <div className="talvia-auth__options"><label><input type="checkbox" /> Se souvenir de moi</label><a href="#">Mot de passe oublié ?</a></div>}
+                <button className="talvia-auth__submit" disabled={status === 'loading'} type="submit">{status === 'loading' ? 'Préparation…' : isSignup ? 'Créer mon espace' : 'Se connecter'} <span aria-hidden="true">→</span></button>
+                {error && <p className="talvia-auth__error" role="alert">{error}</p>}
+                <p className="talvia-auth__switch-copy">{isSignup ? 'Vous avez déjà un compte ?' : 'Pas encore de compte ?'} <button onClick={() => changeMode(isSignup ? 'login' : 'signup')} type="button">{isSignup ? 'Se connecter' : 'Créer un compte'}</button></p>
+              </form>
+            )}
+          </div>
+        </section>
       </section>
-      <aside className="auth-card__panel">
-        <Link href="/" className="brand"><span className="brand-mark"><i /><i /><i /><i /></span>talvia</Link>
-        <div className="auth-panel-copy"><span className="eyebrow">●—●—● Votre espace commercial</span><h2>{signup ? 'Déjà parmi nous ?' : 'Nouveau ici ?'}</h2><p>{signup ? 'Retrouvez vos conversations et vos relances dans un même espace.' : 'Créez votre espace Talvia et gardez le fil de chaque opportunité.'}</p><button className="auth-panel-action" type="button" onClick={() => go(signup ? 'login' : 'signup')}>{signup ? 'Se connecter' : 'Créer mon espace'} →</button></div>
-      </aside>
-    </section>
-  </main>;
+    </main>
+  );
 }
