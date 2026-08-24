@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
-import { database } from "../../../../../lib/database";
-import { getCurrentWorkspace, UnauthorizedError } from "../../../../../lib/workspace-context";
+import { database } from "../../../../lib/database";
+import { getCurrentWorkspace, UnauthorizedError } from "../../../../lib/workspace-context";
 
 export const runtime = "nodejs";
 

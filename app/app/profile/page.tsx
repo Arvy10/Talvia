@@ -1,14 +1,18 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { PageHeader, GlassCard } from "../components/ui";
-import { useSandbox } from "../state/SandboxProvider";
-import type { SandboxProfile } from "../state/types";
+
+type Workspace = { name: string; default_locale: string; default_timezone: string; first_name: string; last_name: string; email: string };
 
 export default function ProfilePage() {
+  const [profile, setProfile] = useState<Workspace | null>(null);
   const [saved, setSaved] = useState(false);
-  const { state, dispatch } = useSandbox();
-  const profile: SandboxProfile = state.profile ?? { firstName: "Test", lastName: "Sandbox", email: "sandbox@talvia.local", language: "Français", timezone: "Africa/Brazzaville" };
-  const save = (form: HTMLFormElement) => { const data = new FormData(form); dispatch({ type: "UPDATE_PROFILE", profile: { firstName: String(data.get("firstName") ?? ""), lastName: String(data.get("lastName") ?? ""), email: String(data.get("email") ?? ""), company: String(data.get("company") ?? ""), role: String(data.get("role") ?? ""), language: "Français", timezone: "Africa/Brazzaville" } }); setSaved(true); };
-  return <div className="profile-page"><PageHeader eyebrow="Compte Talvia" title="Mon profil" description="Votre profil Talvia est indépendant des canaux connectés et reste local au sandbox." /><GlassCard className="settings-card"><form className="workspace-form" onSubmit={(event) => { event.preventDefault(); save(event.currentTarget); }}><label><span>Prénom</span><input defaultValue={profile.firstName} name="firstName" /></label><label><span>Nom</span><input defaultValue={profile.lastName} name="lastName" /></label><label><span>Email</span><input defaultValue={profile.email} name="email" type="email" /></label><label><span>Entreprise</span><input defaultValue={profile.company} name="company" placeholder="Votre organisation" /></label><label><span>Rôle</span><input defaultValue={profile.role} name="role" placeholder="Votre rôle" /></label><label><span>Langue</span><select defaultValue={profile.language} disabled><option>Français</option></select></label><label><span>Fuseau horaire</span><select defaultValue={profile.timezone} disabled><option>Africa/Brazzaville</option></select></label><button className="connection-button" type="submit">{saved ? "Profil enregistré" : "Enregistrer le profil"}</button></form></GlassCard></div>;
+  useEffect(() => { void fetch("/api/workspace").then(async (r) => r.ok ? r.json() : null).then((data) => setProfile(data?.workspace ?? null)); }, []);
+  const save = async (form: HTMLFormElement) => {
+    const data = new FormData(form);
+    const response = await fetch("/api/workspace", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ firstName: String(data.get("firstName") ?? ""), lastName: String(data.get("lastName") ?? "") }) });
+    if (response.ok) { const body = await response.json() as { workspace: Workspace }; setProfile(body.workspace); setSaved(true); }
+  };
+  return <div className="profile-page"><PageHeader eyebrow="Compte Talvia" title="Mon profil" description="Votre profil est enregistré dans votre workspace Talvia." /><GlassCard className="settings-card"><form className="workspace-form" onSubmit={(event) => { event.preventDefault(); void save(event.currentTarget); }}><label><span>Prénom</span><input defaultValue={profile?.first_name ?? ""} name="firstName" /></label><label><span>Nom</span><input defaultValue={profile?.last_name ?? ""} name="lastName" /></label><label><span>Email</span><input defaultValue={profile?.email ?? ""} disabled type="email" /></label><label><span>Langue</span><input defaultValue={profile?.default_locale ?? "fr"} disabled /></label><label><span>Fuseau horaire</span><input defaultValue={profile?.default_timezone ?? "Africa/Brazzaville"} disabled /></label><button className="connection-button" type="submit">{saved ? "Profil enregistré" : "Enregistrer le profil"}</button></form></GlassCard></div>;
 }
