@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import '@fontsource/instrument-serif';
 import '@fontsource-variable/instrument-sans';
+import RefreshOnBfcache from './components/RefreshOnBfcache';
 import './globals.css';
 import './typography.css';
 import './auth-motion.css';
@@ -29,5 +30,5 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  return <html lang="fr"><body>{children}</body></html>;
+  return <html lang="fr"><body><RefreshOnBfcache />{children}</body></html>;
 }
