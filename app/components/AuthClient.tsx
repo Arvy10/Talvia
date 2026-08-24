@@ -17,6 +17,7 @@ function TalviaMark() {
 
 export default function AuthClient({ mode: initialMode }: AuthClientProps) {
   const [mode, setMode] = useState<AuthMode>(initialMode);
+  const [isTransitioning, setIsTransitioning] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [status, setStatus] = useState<'idle' | 'loading' | 'done'>('idle');
   const [error, setError] = useState('');
@@ -34,12 +35,14 @@ export default function AuthClient({ mode: initialMode }: AuthClientProps) {
   }, []);
 
   function changeMode(nextMode: AuthMode) {
-    if (nextMode === mode) return;
+    if (nextMode === mode || isTransitioning) return;
 
+    setIsTransitioning(true);
     setMode(nextMode);
     setStatus('idle');
     setError('');
     window.history.pushState({}, '', nextMode === 'signup' ? '/signup' : '/login');
+    window.setTimeout(() => setIsTransitioning(false), 560);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -66,7 +69,7 @@ export default function AuthClient({ mode: initialMode }: AuthClientProps) {
   }
 
   return (
-    <main className="talvia-auth">
+    <main className={`talvia-auth${isTransitioning ? ' talvia-auth--transitioning' : ''}`}>
       <section className="talvia-auth__card" data-mode={mode}>
         <aside className="talvia-auth__panel" aria-label="Présentation Talvia">
           <Link className="talvia-auth__brand" href="/" aria-label="Retour à l’accueil Talvia">

@@ -50,6 +50,7 @@
   font-size: 21px;
   font-weight: 720;
   letter-spacing: -.04em;
+  transition: opacity 140ms ease;
 }
 
 .talvia-auth__mark {
@@ -90,6 +91,12 @@
   left: 14%;
   width: 52%;
   transform: translateY(-42%);
+  transition: opacity 140ms ease;
+}
+
+.talvia-auth--transitioning .talvia-auth__brand,
+.talvia-auth--transitioning .talvia-auth__panel-content {
+  opacity: 0;
 }
 
 .talvia-auth__card[data-mode='signup'] .talvia-auth__brand {
@@ -285,6 +292,8 @@
 @media (prefers-reduced-motion: reduce) {
   .talvia-auth__panel,
   .talvia-auth__form-shell,
+  .talvia-auth__brand,
+  .talvia-auth__panel-content,
   .talvia-auth__secondary-action,
   .talvia-auth__submit { transition: none; }
 }
