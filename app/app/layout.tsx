@@ -4,6 +4,7 @@ import "./app.css";
 import "./v2.css";
 import "./navigation-refinement.css";
 import "./onboarding.css";
+import "./dashboard.css";
 import { AppShell } from "./components/AppShell";
 import { SandboxProvider } from "./state/SandboxProvider";
 

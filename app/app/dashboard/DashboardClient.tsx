@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { LuArrowRight, LuInbox, LuMessageCircle, LuSend, LuSparkles, LuSquareActivity, LuUnplug, LuWorkflow } from "react-icons/lu";
 
 import { ChannelLogo } from "../connections/ChannelLogo";
-import { EmptyState, GlassCard, PageHeader, StatusBadge } from "../components/ui";
+import { EmptyState, GlassCard, StatusBadge } from "../components/ui";
 import MailIcon from "../components/icons/MailIcon";
+import PlugConnectedIcon from "../components/icons/PlugConnectedIcon";
 import UsersGroupIcon from "../components/icons/UsersGroupIcon";
 import { useSandbox } from "../state/SandboxProvider";
 import { channelMap, getConnectedChannelCount } from "../inbox/inbox-model";
@@ -17,9 +18,24 @@ const shortcuts = [
   { href: "/app/automations", label: "Automatisations", description: "Préparez vos prochains flux, à votre rythme.", icon: LuWorkflow },
 ];
 
+function greeting(hour: number): string {
+  if (hour < 5) return "Bonsoir";
+  if (hour < 12) return "Bonjour";
+  if (hour < 18) return "Bon après-midi";
+  return "Bonsoir";
+}
+
+function formatTime(date: Date): string {
+  return date.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+}
+
 export function DashboardClient() {
   const { state } = useSandbox();
   const [businessContextReady, setBusinessContextReady] = useState<boolean | null>(null);
+  const [firstName, setFirstName] = useState("");
+  const [timezone, setTimezone] = useState("");
+  const [now, setNow] = useState<Date | null>(null);
+
   const connectedCount = getConnectedChannelCount(state);
   const remainingCount = channelMap.length - connectedCount;
   const messages = state.messages ?? [];
@@ -28,24 +44,60 @@ export function DashboardClient() {
   const activeCampaigns = (state.campaigns ?? []).filter((campaign) => campaign.status === "active").length;
 
   useEffect(() => {
+    setNow(new Date());
     void fetch("/api/business-context").then((response) => (response.ok ? response.json() : null)).then((data: { businessContext: { status: string } | null } | null) => {
       setBusinessContextReady(data?.businessContext?.status === "ready");
     });
+    void fetch("/api/workspace").then((response) => (response.ok ? response.json() : null)).then((data: { workspace: { first_name: string; default_timezone: string } } | null) => {
+      if (!data) return;
+      setFirstName(data.workspace.first_name ?? "");
+      setTimezone(data.workspace.default_timezone ?? "");
+    });
   }, []);
 
+  const dateLabel = useMemo(() => (now ? now.toLocaleDateString("fr-FR", { day: "numeric", month: "long", year: "numeric" }) : ""), [now]);
+  const updatedAtLabel = now ? `Actualisé à ${formatTime(now)}` : "";
+  const locationLabel = timezone ? timezone.replace(/_/g, " ").split("/").reverse().join(" — ") : "";
+
   return <div className="dashboard-page">
-    <PageHeader
-      eyebrow="VUE D’ENSEMBLE"
-      title="Votre suivi commercial, en un coup d’œil."
-      description="Retrouvez les conversations à traiter, les prospects à relancer et les actions commerciales à poursuivre."
-      actions={<Link className="connection-button" href="/app/connections"><LuUnplug aria-hidden="true" />Connexions</Link>}
-    />
+    <header className="dashboard-brief">
+      {locationLabel ? <p className="dashboard-brief__eyebrow">Brief quotidien — {locationLabel}</p> : <p className="dashboard-brief__eyebrow">Brief quotidien</p>}
+      <div className="dashboard-brief__head">
+        <h1>{greeting(now?.getHours() ?? 12)}{firstName ? `, ${firstName}` : ""}. {dateLabel ? <span>Nous sommes le {dateLabel}.</span> : null}</h1>
+        <Link className="connection-button" href="/app/connections"><LuUnplug aria-hidden="true" />Connexions</Link>
+      </div>
+      <p className="dashboard-brief__tagline">Votre suivi commercial, en un coup d’œil.</p>
+      <p className="dashboard-brief__description">Retrouvez les conversations à traiter, les prospects à relancer et les actions commerciales à poursuivre.</p>
+    </header>
 
     {businessContextReady === false ? <GlassCard className="dashboard-bc-banner">
       <span className="dashboard-bc-banner__icon" aria-hidden="true"><LuSparkles /></span>
       <div><h2>Configurez le profil de votre entreprise</h2><p>Talvia peut analyser votre site web pour préparer un profil utile à vos échanges commerciaux.</p></div>
       <Link className="connection-button" href="/app/onboarding">Configurer<LuArrowRight aria-hidden="true" /></Link>
     </GlassCard> : null}
+
+    <section aria-label="Indicateurs du jour" className="dashboard-stats-grid">
+      <GlassCard className="dashboard-stat-card">
+        <div className="dashboard-stat-card__head"><span className="dashboard-stat-card__icon dashboard-stat-card__icon--violet" aria-hidden="true"><PlugConnectedIcon size={15} /></span><span>Canaux connectés</span></div>
+        <strong>{connectedCount}<small>/{channelMap.length}</small></strong>
+        <p>{updatedAtLabel}</p>
+      </GlassCard>
+      <GlassCard className="dashboard-stat-card">
+        <div className="dashboard-stat-card__head"><span className="dashboard-stat-card__icon dashboard-stat-card__icon--coral" aria-hidden="true"><LuMessageCircle /></span><span>À répondre</span></div>
+        <strong>{inbound}</strong>
+        <p>{updatedAtLabel}</p>
+      </GlassCard>
+      <GlassCard className="dashboard-stat-card">
+        <div className="dashboard-stat-card__head"><span className="dashboard-stat-card__icon dashboard-stat-card__icon--violet" aria-hidden="true"><LuSend /></span><span>Campagnes actives</span></div>
+        <strong>{activeCampaigns}</strong>
+        <p>{updatedAtLabel}</p>
+      </GlassCard>
+      <GlassCard className="dashboard-stat-card">
+        <div className="dashboard-stat-card__head"><span className="dashboard-stat-card__icon dashboard-stat-card__icon--green" aria-hidden="true"><LuSquareActivity /></span><span>Activité récente</span></div>
+        <strong>{activities.length}</strong>
+        <p>{updatedAtLabel}</p>
+      </GlassCard>
+    </section>
 
     <GlassCard className="dashboard-setup">
       <div className="dashboard-setup__intro">
@@ -66,6 +118,17 @@ export function DashboardClient() {
       </div>
     </GlassCard>
 
+    <div className="dashboard-secondary-grid">
+      <GlassCard className="dashboard-secondary-card">
+        <div className="dashboard-secondary-card__head"><h2>Conversations à traiter</h2><Link href="/app/inbox">Inbox<LuArrowRight aria-hidden="true" /></Link></div>
+        {inbound === 0 ? <EmptyState className="dashboard-secondary-card__empty" icon={<LuInbox />} title="Rien à traiter" description="Les conversations entrantes de vos canaux connectés apparaîtront ici." /> : <p className="dashboard-secondary-card__count">{inbound} conversation{inbound > 1 ? "s" : ""} en attente de réponse.</p>}
+      </GlassCard>
+      <GlassCard className="dashboard-secondary-card">
+        <div className="dashboard-secondary-card__head"><h2>Activité récente</h2></div>
+        {activities.length === 0 ? <EmptyState className="dashboard-secondary-card__empty" icon={<LuSquareActivity />} title="Vos priorités apparaîtront ici" description="Ajoutez un contact, créez une campagne ou démarrez une conversation pour construire votre suivi." /> : <ul className="dashboard-secondary-card__list">{activities.slice(-6).reverse().map((activity) => <li key={activity.id}><span>{activity.label}</span><small>Enregistrée</small></li>)}</ul>}
+      </GlassCard>
+    </div>
+
     <section aria-label="Vos prochains espaces" className="dashboard-shortcuts">
       {shortcuts.map(({ href, label, description, icon: Icon }) => <Link className="dashboard-shortcut" href={href} key={href}>
         <span className="dashboard-shortcut__icon"><Icon aria-hidden="true" /></span>
@@ -73,12 +136,5 @@ export function DashboardClient() {
         <LuArrowRight aria-hidden="true" className="dashboard-shortcut__arrow" />
       </Link>)}
     </section>
-
-    <section className="dashboard-priority-grid">
-      <GlassCard className="dashboard-priority-card dashboard-priority-card--coral"><span className="dashboard-priority-card__icon" aria-hidden="true"><LuMessageCircle /></span><span>À répondre</span><strong>{inbound}</strong><p>Conversations entrantes à traiter</p></GlassCard>
-      <GlassCard className="dashboard-priority-card dashboard-priority-card--violet"><span className="dashboard-priority-card__icon" aria-hidden="true"><LuSend /></span><span>Campagnes actives</span><strong>{activeCampaigns}</strong><p>Campagnes actuellement en cours</p></GlassCard>
-      <GlassCard className="dashboard-priority-card dashboard-priority-card--green"><span className="dashboard-priority-card__icon" aria-hidden="true"><LuSquareActivity /></span><span>Activité récente</span><strong>{activities.length}</strong><p>Actions enregistrées dans votre espace</p></GlassCard>
-    </section>
-    {activities.length === 0 ? <EmptyState className="dashboard-summary-empty" icon={<LuInbox />} title="Vos priorités apparaîtront ici" description="Ajoutez un contact, créez une campagne ou démarrez une conversation pour construire votre suivi commercial." /> : <GlassCard className="dashboard-activity"><p className="dashboard-kicker">ACTIVITÉ RÉCENTE</p>{activities.slice(-6).reverse().map((activity) => <div key={activity.id}><span>{activity.label}</span><small>Enregistrée</small></div>)}</GlassCard>}
   </div>;
 }
