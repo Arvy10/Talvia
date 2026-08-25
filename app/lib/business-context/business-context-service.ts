@@ -1,7 +1,7 @@
 import { database } from "../database";
 import type { WorkspaceContext } from "../workspace-context";
 import { analyzeBusinessFromWebsite } from "./business-analyzer";
-import type { BusinessAnalysisResult, ScoredField } from "./types";
+import type { BusinessAnalysisResult, CustomerType, ScoredField } from "./types";
 
 const ANALYSIS_VERSION = "1";
 const MIN_REANALYSIS_INTERVAL_MS = 60_000;
@@ -17,6 +17,7 @@ export type BusinessContextRecord = {
   industry: ScoredField<string> | null;
   businessDescription: string | null;
   valueProposition: ScoredField<string> | null;
+  customerType: ScoredField<CustomerType> | null;
   services: string[];
   products: string[];
   targetCustomers: ScoredField<string[]> | null;
@@ -46,6 +47,7 @@ type Row = {
   industry: ScoredField<string> | null;
   business_description: string | null;
   value_proposition: ScoredField<string> | null;
+  customer_type: ScoredField<CustomerType> | null;
   services: string[];
   products: string[];
   target_customers: ScoredField<string[]> | null;
@@ -76,6 +78,7 @@ function map(row: Row): BusinessContextRecord {
     industry: row.industry,
     businessDescription: row.business_description,
     valueProposition: row.value_proposition,
+    customerType: row.customer_type,
     services: row.services,
     products: row.products,
     targetCustomers: row.target_customers,
@@ -98,7 +101,7 @@ function map(row: Row): BusinessContextRecord {
 }
 
 const SELECT = `select id,status,error_reason,website,company_name,industry,business_description,value_proposition,
-  services,products,target_customers,target_industries,target_company_sizes,target_roles,geographies,keywords,
+  customer_type,services,products,target_customers,target_industries,target_company_sizes,target_roles,geographies,keywords,
   pain_points,sales_angles,primary_language,source,analysis_version,source_pages,manually_edited_fields,ai_model,
   created_at,updated_at from business_contexts`;
 
@@ -134,10 +137,10 @@ async function replaceActiveContext(
     const inserted = await client.query<Row>(
       `insert into business_contexts (
         workspace_id, is_active, status, error_reason, website, company_name, industry, business_description,
-        value_proposition, services, products, target_customers, target_industries, target_company_sizes,
+        value_proposition, customer_type, services, products, target_customers, target_industries, target_company_sizes,
         target_roles, geographies, keywords, pain_points, sales_angles, primary_language, source,
         analysis_version, source_pages, manually_edited_fields, ai_model
-      ) values ($1,true,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+      ) values ($1,true,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
       returning *`,
       [
         context.workspaceId,
@@ -148,6 +151,7 @@ async function replaceActiveContext(
         values.industry ? JSON.stringify(values.industry) : null,
         values.business_description ?? null,
         values.value_proposition ? JSON.stringify(values.value_proposition) : null,
+        values.customer_type ? JSON.stringify(values.customer_type) : null,
         JSON.stringify(values.services ?? []),
         JSON.stringify(values.products ?? []),
         values.target_customers ? JSON.stringify(values.target_customers) : null,
@@ -209,6 +213,7 @@ function toRowFields(result: BusinessAnalysisResult): Partial<Row> {
     industry: result.industry,
     business_description: result.businessDescription,
     value_proposition: result.valueProposition,
+    customer_type: result.customerType,
     services: result.services,
     products: result.products,
     target_customers: result.targetCustomers,
@@ -238,6 +243,7 @@ export type BusinessContextEditInput = {
   primaryLanguage?: string;
   industry?: string;
   valueProposition?: string;
+  customerType?: CustomerType;
   targetCustomers?: string[];
   targetIndustries?: string[];
   targetCompanySizes?: string[];
@@ -247,7 +253,7 @@ export type BusinessContextEditInput = {
   salesAngles?: string[];
 };
 
-const SCORED_STRING_FIELDS = ["industry", "valueProposition"] as const;
+const SCORED_STRING_FIELDS = ["industry", "valueProposition", "customerType"] as const;
 const SCORED_ARRAY_FIELDS = ["targetCustomers", "targetIndustries", "targetCompanySizes", "targetRoles", "geographies", "painPoints", "salesAngles"] as const;
 const PLAIN_FIELDS = ["companyName", "businessDescription", "services", "products", "keywords", "primaryLanguage"] as const;
 
@@ -260,6 +266,7 @@ const COLUMN_BY_FIELD: Record<string, string> = {
   primaryLanguage: "primary_language",
   industry: "industry",
   valueProposition: "value_proposition",
+  customerType: "customer_type",
   targetCustomers: "target_customers",
   targetIndustries: "target_industries",
   targetCompanySizes: "target_company_sizes",

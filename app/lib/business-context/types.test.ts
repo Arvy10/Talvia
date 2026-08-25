@@ -10,6 +10,7 @@ const validResult = {
   language: "fr",
   industry: { value: "Logiciel", provenance: "fact", confidence: 0.9 },
   valueProposition: { value: "Facturer plus vite", provenance: "inference", confidence: 0.6 },
+  customerType: { value: "b2b", provenance: "inference", confidence: 0.8 },
   targetCustomers: { value: ["PME"], provenance: "fact", confidence: 0.8 },
   targetIndustries: { value: [], provenance: "inference", confidence: 0.3 },
   targetCompanySizes: { value: ["10-50"], provenance: "inference", confidence: 0.5 },
@@ -45,6 +46,15 @@ describe("validateBusinessAnalysisResult", () => {
   it("rejects an AI-generated result claiming user_provided provenance (that provenance is reserved for human edits)", () => {
     expect(
       validateBusinessAnalysisResult({ ...validResult, industry: { value: "Logiciel", provenance: "user_provided", confidence: 1 } }),
+    ).toBeNull();
+  });
+  it("rejects a missing customerType", () => {
+    const { customerType, ...rest } = validResult;
+    expect(validateBusinessAnalysisResult(rest)).toBeNull();
+  });
+  it("rejects a customerType value outside b2b/b2c/both", () => {
+    expect(
+      validateBusinessAnalysisResult({ ...validResult, customerType: { value: "enterprise", provenance: "inference", confidence: 0.8 } }),
     ).toBeNull();
   });
   it("rejects a scored array field whose value is not a string array", () => {

@@ -4,11 +4,11 @@ import { useEffect, useRef, useState } from "react";
 import { LuArrowRight, LuGlobe, LuTriangleAlert } from "react-icons/lu";
 
 import type { BusinessContextRecord } from "../../lib/business-context/business-context-service";
-import { countryName, guessCountryFromBrowserTimezone } from "./countries";
-import { CountryMultiSelect } from "./CountryMultiSelect";
-import { IndustrySelect } from "./IndustrySelect";
+import { businessContextToSummaryData, manualEntryToEditInput } from "./onboarding/mapping";
+import { ManualEntryFlow } from "./onboarding/ManualEntryFlow";
+import { SummaryCard } from "./onboarding/SummaryCard";
 
-type SubStep = "choice" | "url-input" | "analyzing" | "url-failed" | "manual-1" | "manual-2" | "manual-3" | "saving";
+type SubStep = "choice" | "url-input" | "analyzing" | "url-failed" | "url-summary" | "manual" | "saving";
 
 const PROGRESS_STAGES = [
   "Lecture de votre site",
@@ -16,8 +16,6 @@ const PROGRESS_STAGES = [
   "Identification de votre contexte commercial",
   "Préparation de votre espace",
 ];
-
-const MANUAL_STEP_ORDER: SubStep[] = ["manual-1", "manual-2", "manual-3"];
 
 // Bounds the whole request (page fetches + AI call) so the UI always
 // resolves to a clear result instead of spinning indefinitely if
@@ -41,26 +39,12 @@ export function OnboardingOverlay({
   const [website, setWebsite] = useState(existingRecord?.website ?? "");
   const [progressStage, setProgressStage] = useState(0);
   const [failureReason, setFailureReason] = useState("");
-  const [companyName, setCompanyName] = useState(existingRecord?.companyName ?? "");
-  const [businessDescription, setBusinessDescription] = useState(existingRecord?.businessDescription ?? "");
-  const [industry, setIndustry] = useState(existingRecord?.industry?.value ?? "");
-  const [geographies, setGeographies] = useState<string[]>(existingRecord?.geographies?.value ?? []);
-  const [geographiesSeeded, setGeographiesSeeded] = useState(false);
+  const [analyzedRecord, setAnalyzedRecord] = useState<BusinessContextRecord | null>(null);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => () => {
     if (progressTimer.current) clearInterval(progressTimer.current);
   }, []);
-
-  useEffect(() => {
-    if (step === "manual-3" && !geographiesSeeded) {
-      const guess = guessCountryFromBrowserTimezone();
-      if (guess) {
-        setGeographies((current) => (current.length === 0 ? [countryName(guess)] : current));
-      }
-      setGeographiesSeeded(true);
-    }
-  }, [step, geographiesSeeded]);
 
   const ensureManualContext = async () => {
     if (existingRecord) return;
@@ -73,7 +57,7 @@ export function OnboardingOverlay({
 
   const startManualFlow = async () => {
     await ensureManualContext();
-    setStep("manual-1");
+    setStep("manual");
   };
 
   const runAnalysis = async () => {
@@ -107,29 +91,23 @@ export function OnboardingOverlay({
 
     const { businessContext } = await readJson<{ businessContext: BusinessContextRecord }>(response);
     if (businessContext.status === "ready") {
-      onComplete();
+      setAnalyzedRecord(businessContext);
+      setStep("url-summary");
       return;
     }
     setFailureReason(businessContext.errorReason ?? "L'analyse n'a pas abouti.");
     setStep("url-failed");
   };
 
-  const finishManualFlow = async () => {
+  const finishManualFlow = async (values: Parameters<typeof manualEntryToEditInput>[0]) => {
     setStep("saving");
     await fetch("/api/business-context", {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        companyName: companyName.trim(),
-        businessDescription: businessDescription.trim(),
-        industry: industry.trim(),
-        geographies,
-      }),
+      body: JSON.stringify(manualEntryToEditInput(values)),
     });
     onComplete();
   };
-
-  const manualStepIndex = MANUAL_STEP_ORDER.indexOf(step);
 
   return <div className="onboarding-overlay-backdrop">
     <div aria-label="Configurer le profil de votre entreprise" aria-modal="true" className="onboarding-overlay" role="dialog">
@@ -169,28 +147,22 @@ export function OnboardingOverlay({
         </div>
       </div> : null}
 
-      {manualStepIndex >= 0 ? <div className="onboarding-overlay__panel">
-        <p className="onboarding-overlay__step-count">Étape {manualStepIndex + 1} sur {MANUAL_STEP_ORDER.length}</p>
-        {step === "manual-1" ? <>
-          <h2>Comment s'appelle votre entreprise, et que faites-vous ?</h2>
-          <label className="onboarding-overlay__field"><span>Nom de l'entreprise</span><input onChange={(event) => setCompanyName(event.target.value)} value={companyName} /></label>
-          <label className="onboarding-overlay__field"><span>Ce que vous faites</span><textarea onChange={(event) => setBusinessDescription(event.target.value)} rows={3} value={businessDescription} /></label>
-        </> : null}
-        {step === "manual-2" ? <>
-          <h2>Quel est votre secteur ?</h2>
-          <IndustrySelect onChange={setIndustry} value={industry} />
-        </> : null}
-        {step === "manual-3" ? <>
-          <h2>Où sont vos clients ?</h2>
-          <CountryMultiSelect onChange={setGeographies} value={geographies} />
-        </> : null}
-        <div className="onboarding-overlay__nav">
-          {manualStepIndex > 0 ? <button className="connection-button connection-button--secondary" onClick={() => setStep(MANUAL_STEP_ORDER[manualStepIndex - 1]!)} type="button">Retour</button> : <span />}
-          {manualStepIndex < MANUAL_STEP_ORDER.length - 1
-            ? <button className="connection-button" onClick={() => setStep(MANUAL_STEP_ORDER[manualStepIndex + 1]!)} type="button">Continuer<LuArrowRight aria-hidden="true" /></button>
-            : <button className="connection-button" onClick={() => void finishManualFlow()} type="button">Terminer</button>}
-        </div>
+      {step === "url-summary" && analyzedRecord ? <div className="onboarding-overlay__panel">
+        <SummaryCard
+          actions={<>
+            <a className="connection-button connection-button--secondary" href="/app/settings">Voir les détails</a>
+            <button className="connection-button" onClick={onComplete} type="button">Tout est correct</button>
+          </>}
+          data={businessContextToSummaryData(analyzedRecord)}
+        />
       </div> : null}
+
+      {step === "manual" ? <ManualEntryFlow
+        cancelLabel="Retour"
+        initial={{ companyName: existingRecord?.companyName ?? "", businessDescription: existingRecord?.businessDescription ?? "" }}
+        onCancel={() => setStep("choice")}
+        onSubmit={(values) => void finishManualFlow(values)}
+      /> : null}
 
       {step === "saving" ? <div className="onboarding-overlay__panel"><p className="onboarding-loading">Enregistrement…</p></div> : null}
     </div>

@@ -8,7 +8,7 @@ import type { BusinessAnalysisResult } from "./types";
 // analysis-runs rate-limit lookup entirely — rate limiting isn't what this
 // file tests, and a real clock would make sequential calls flaky.
 const JSON_COLUMNS = new Set([
-  "services", "products", "keywords", "industry", "value_proposition",
+  "services", "products", "keywords", "industry", "value_proposition", "customer_type",
   "target_customers", "target_industries", "target_company_sizes", "target_roles",
   "geographies", "pain_points", "sales_angles", "manually_edited_fields", "source_pages",
 ]);
@@ -39,7 +39,7 @@ function createFakeDatabase() {
     if (text.startsWith("insert into business_contexts")) {
       const [
         workspaceId, status, errorReason, website, companyName, industry, businessDescription,
-        valueProposition, services, products, targetCustomers, targetIndustries, targetCompanySizes,
+        valueProposition, customerType, services, products, targetCustomers, targetIndustries, targetCompanySizes,
         targetRoles, geographies, keywords, painPoints, salesAngles, primaryLanguage, source,
         analysisVersion, sourcePages, manuallyEditedFields, aiModel,
       ] = params as string[];
@@ -54,6 +54,7 @@ function createFakeDatabase() {
         industry: industry ? JSON.parse(industry) : null,
         business_description: businessDescription ?? null,
         value_proposition: valueProposition ? JSON.parse(valueProposition) : null,
+        customer_type: customerType ? JSON.parse(customerType) : null,
         services: JSON.parse(services),
         products: JSON.parse(products),
         target_customers: targetCustomers ? JSON.parse(targetCustomers) : null,
@@ -140,6 +141,7 @@ function analysisResult(overrides: Partial<BusinessAnalysisResult> = {}): Busine
     language: "fr",
     industry: { value: "Logiciel", provenance: "fact", confidence: 0.9 },
     valueProposition: { value: "Facturer plus vite", provenance: "inference", confidence: 0.6 },
+    customerType: { value: "b2b", provenance: "inference", confidence: 0.7 },
     targetCustomers: { value: ["PME"], provenance: "fact", confidence: 0.8 },
     targetIndustries: { value: [], provenance: "inference", confidence: 0.3 },
     targetCompanySizes: { value: [], provenance: "inference", confidence: 0.3 },
@@ -171,6 +173,13 @@ describe("business context service", () => {
     expect(record?.targetCustomers?.provenance).toBe("user_provided");
     expect(record?.targetCustomers?.confidence).toBe(1);
     expect(record?.targetCustomers?.value).toEqual(["Cabinets médicaux"]);
+  });
+
+  it("stores the manual onboarding's customerType as user_provided", async () => {
+    await startManualBusinessContext(context);
+    const record = await updateActiveBusinessContext(context, { customerType: "b2b" });
+    expect(record?.customerType?.value).toBe("b2b");
+    expect(record?.customerType?.provenance).toBe("user_provided");
   });
 
   it("persists a human correction across a re-fetch (settings round trip)", async () => {

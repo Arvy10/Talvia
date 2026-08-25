@@ -5,10 +5,13 @@ import { useRouter } from "next/navigation";
 import { LuArrowRight, LuGlobe, LuTriangleAlert } from "react-icons/lu";
 
 import { GlassCard, PageHeader } from "../components/ui";
+import { businessContextToSummaryData, manualEntryToEditInput } from "../components/onboarding/mapping";
+import { ManualEntryFlow } from "../components/onboarding/ManualEntryFlow";
+import { SummaryCard } from "../components/onboarding/SummaryCard";
 import type { BusinessContextRecord } from "../../lib/business-context/business-context-service";
 import { BUSINESS_CONTEXT_SECTION_TITLES, BusinessContextForm, toEditable, toEditInput, type EditableBusinessContext } from "./BusinessContextForm";
 
-type Step = "loading" | "url" | "analyzing" | "review" | "failed";
+type Step = "loading" | "url" | "analyzing" | "manual" | "summary" | "review" | "failed";
 
 // Cosmetic microcopy only — Talvia makes a single request-response call to
 // the backend, so there is no real per-step server confirmation to display.
@@ -48,6 +51,9 @@ export function OnboardingClient() {
     void fetch("/api/business-context").then((response) => (response.ok ? readJson<{ businessContext: BusinessContextRecord | null }>(response) : null)).then((data) => {
       const existing = data?.businessContext ?? null;
       if (existing && existing.status === "ready") {
+        // Reached from Settings → Entreprise → Modifier: the detailed
+        // editor is intentional here, onboarding's simplicity doesn't
+        // apply once a profile already exists (see brief §28).
         setRecord(existing);
         setEditable(toEditable(existing));
         setActiveSection(0);
@@ -110,8 +116,7 @@ export function OnboardingClient() {
     if (businessContext.status === "ready") {
       setRecord(businessContext);
       setEditable(toEditable(businessContext));
-      setActiveSection(0);
-      setStep("review");
+      setStep("summary");
     } else {
       setFailureReason(businessContext.errorReason ?? "L'analyse n'a pas abouti.");
       setStep("failed");
@@ -129,11 +134,19 @@ export function OnboardingClient() {
       setNotice(body.error ?? "Impossible de démarrer le profil manuel pour le moment.");
       return;
     }
-    const { businessContext } = await readJson<{ businessContext: BusinessContextRecord }>(response);
-    setRecord(businessContext);
-    setEditable(toEditable(businessContext));
-    setActiveSection(0);
-    setStep("review");
+    setStep("manual");
+  };
+
+  const finishManual = async (values: Parameters<typeof manualEntryToEditInput>[0]) => {
+    setSaving(true);
+    const response = await fetch("/api/business-context", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(manualEntryToEditInput(values)),
+    });
+    setSaving(false);
+    if (!response.ok) { setNotice("Impossible d'enregistrer ce profil pour le moment."); return; }
+    router.push("/app/settings");
   };
 
   const save = async () => {
@@ -200,6 +213,25 @@ export function OnboardingClient() {
           <button className="connection-button" onClick={() => void startManual()} type="button">Continuer manuellement</button>
         </div>
       </div>
+    </GlassCard> : null}
+
+    {step === "manual" ? <GlassCard className="onboarding-card">
+      <ManualEntryFlow
+        cancelLabel="Analyser un autre site"
+        onCancel={() => setStep("url")}
+        onSubmit={(values) => void finishManual(values)}
+        submitting={saving}
+      />
+    </GlassCard> : null}
+
+    {step === "summary" && record ? <GlassCard className="onboarding-card">
+      <SummaryCard
+        actions={<>
+          <button className="connection-button connection-button--secondary" onClick={() => setStep("review")} type="button">Voir les détails</button>
+          <button className="connection-button" onClick={() => router.push("/app/settings")} type="button">Tout est correct</button>
+        </>}
+        data={businessContextToSummaryData(record)}
+      />
     </GlassCard> : null}
 
     {step === "review" ? <div className="onboarding-review">

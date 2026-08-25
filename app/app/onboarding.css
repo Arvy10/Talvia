@@ -115,6 +115,40 @@
 .onboarding-overlay__nav { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
 .onboarding-overlay .industry-select, .onboarding-overlay .country-picker { width: 100%; }
 
+.onboarding-stepper { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 4px; }
+.onboarding-stepper__item { display: inline-flex; align-items: center; gap: 6px; color: #857d89; font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.onboarding-stepper__item.is-active { color: var(--app-coral); }
+.onboarding-stepper__item svg { width: 11px; height: 11px; color: #4a4450; }
+
+.choice-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.choice-chip { min-height: 40px; padding: 9px 15px; border: 1px solid #ffffff20; border-radius: 999px; background: #ffffff06; color: var(--app-muted); font-size: 13px; font-weight: 600; cursor: pointer; transition: border-color 0.18s, background 0.18s, color 0.18s; }
+.choice-chip:hover { border-color: #ffffff3a; color: var(--app-text); }
+.choice-chip.is-selected { border-color: #ff6b4a6b; background: #ff6b4a1e; color: var(--app-text); }
+
+.tag-input { width: 100%; display: grid; gap: 10px; }
+.tag-input__chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag-input__chip { padding: 6px 6px 6px 12px; border: 1px solid #ffffff20; border-radius: 999px; background: #ffffff08; color: var(--app-text); display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.tag-input__chip button { width: 18px; height: 18px; padding: 0; border: 0; border-radius: 999px; background: #ffffff10; color: var(--app-muted); display: grid; place-items: center; cursor: pointer; }
+.tag-input__chip button:hover { background: #ff6b4a30; color: #ffab97; }
+.tag-input__chip button svg { width: 11px; height: 11px; }
+.tag-input__row { display: flex; gap: 8px; }
+.tag-input__row input { flex: 1; min-height: 42px; padding: 0 13px; border: 1px solid #ffffff20; border-radius: 10px; background: #0f0c12; color: var(--app-text); font-size: 13px; outline: 0; }
+.tag-input__row input:focus { border-color: #ff6b4a86; }
+.tag-input__row .connection-button { flex: 0 0 auto; }
+.tag-input__limit { margin: 0; color: #857d89; font-size: 11px; }
+
+.geography-picker { width: 100%; display: grid; gap: 12px; }
+
+.onboarding-summary { display: grid; justify-items: start; gap: 12px; }
+.onboarding-summary h2 { margin: 0; font-family: "Instrument Serif", Georgia, serif; font-size: 27px; font-weight: 400; }
+.onboarding-summary__industry { margin: 0; color: var(--app-coral); font-size: 12px; font-weight: 650; }
+.onboarding-summary__offers { margin: 0; color: var(--app-text); font-size: 13px; }
+.onboarding-summary__row { width: 100%; padding: 10px 0; border-top: 1px solid var(--app-border); display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.onboarding-summary__row span { color: var(--app-muted); font-size: 11px; }
+.onboarding-summary__row strong { color: var(--app-text); font-size: 13px; font-weight: 600; text-align: right; }
+.onboarding-summary__actions { width: 100%; display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px; }
+.onboarding-summary__actions a.connection-button { text-decoration: none; }
+
 .dashboard-bc-banner { margin-bottom: 20px; padding: 18px 20px; display: flex; align-items: center; gap: 16px; border-color: #8b5cf63e; background: linear-gradient(120deg, #8b5cf60f, #ffffff02), var(--app-surface); }
 .dashboard-bc-banner__icon { width: 38px; height: 38px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid #8b5cf64c; border-radius: 11px; background: #8b5cf618; color: #c6abff; }
 .dashboard-bc-banner > div { flex: 1; min-width: 0; }
@@ -135,4 +169,10 @@
   .onboarding-overlay__choices .connection-button { width: 100%; }
   .onboarding-overlay__nav { flex-direction: column-reverse; }
   .onboarding-overlay__nav .connection-button { width: 100%; justify-content: center; }
+  .tag-input__row { flex-direction: column; }
+  .tag-input__row .connection-button { width: 100%; justify-content: center; }
+  .onboarding-summary__row { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .onboarding-summary__row strong { text-align: left; }
+  .onboarding-summary__actions { flex-direction: column-reverse; }
+  .onboarding-summary__actions .connection-button { width: 100%; justify-content: center; }
 }

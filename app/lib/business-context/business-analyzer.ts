@@ -76,6 +76,7 @@ Règles strictes :
 - N'invente jamais d'information absente du contenu fourni.
 - "companyName", "businessDescription", "services", "products", "keywords" doivent venir directement du texte (des faits observés), pas de suppositions.
 - Pour chaque champ noté "provenance", utilise "fact" uniquement si le texte l'affirme explicitement, "inference" si tu le déduis raisonnablement du contexte, "suggestion" si c'est une recommandation commerciale que tu proposes (ex: painPoints, salesAngles) plutôt qu'un constat.
+- "customerType" ("b2b", "b2c" ou "both") est presque toujours une déduction ("inference") à partir du ton, du vocabulaire et de l'offre du site — un site rarement l'affirme explicitement.
 - "confidence" doit refléter honnêtement ton incertitude (0 à 1).
 - Si le contenu fourni est trop pauvre, contradictoire, ou ressemble à une page vide/JS non rendue, mets "insufficientContent" à true et reste minimal sur les autres champs plutôt que d'halluciner.
 - Réponds uniquement selon le schéma demandé.`;

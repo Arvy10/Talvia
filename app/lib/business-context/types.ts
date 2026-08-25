@@ -14,6 +14,9 @@ export type ScoredField<T> = {
   confidence: number; // 0..1
 };
 
+export type CustomerType = "b2b" | "b2c" | "both";
+const CUSTOMER_TYPES: CustomerType[] = ["b2b", "b2c", "both"];
+
 export type BusinessAnalysisResult = {
   companyName: string;
   businessDescription: string;
@@ -23,6 +26,7 @@ export type BusinessAnalysisResult = {
   language: string;
   industry: ScoredField<string>;
   valueProposition: ScoredField<string>;
+  customerType: ScoredField<CustomerType>;
   targetCustomers: ScoredField<string[]>;
   targetIndustries: ScoredField<string[]>;
   targetCompanySizes: ScoredField<string[]>;
@@ -62,6 +66,7 @@ export const businessAnalysisSchema: JSONSchema = {
     language: { type: "string", description: "ISO 639-1 code, e.g. 'fr' or 'en'" },
     industry: scoredFieldSchema({ type: "string" }, ["fact", "inference"]),
     valueProposition: scoredFieldSchema({ type: "string" }, ["fact", "inference"]),
+    customerType: scoredFieldSchema({ type: "string", enum: CUSTOMER_TYPES }, ["inference"]),
     targetCustomers: scoredFieldSchema(stringArray, ["fact", "inference"]),
     targetIndustries: scoredFieldSchema(stringArray, ["fact", "inference"]),
     targetCompanySizes: scoredFieldSchema(stringArray, ["inference"]),
@@ -73,7 +78,7 @@ export const businessAnalysisSchema: JSONSchema = {
   },
   required: [
     "companyName", "businessDescription", "services", "products", "keywords", "language",
-    "industry", "valueProposition", "targetCustomers", "targetIndustries", "targetCompanySizes",
+    "industry", "valueProposition", "customerType", "targetCustomers", "targetIndustries", "targetCompanySizes",
     "targetRoles", "geographies", "painPoints", "salesAngles", "insufficientContent",
   ],
   additionalProperties: false,
@@ -114,6 +119,9 @@ export function validateBusinessAnalysisResult(candidate: unknown): BusinessAnal
     const field = c[key];
     if (!isScoredField(field) || typeof field.value !== "string") return null;
   }
+
+  const customerTypeField = c.customerType;
+  if (!isScoredField(customerTypeField) || !CUSTOMER_TYPES.includes(customerTypeField.value as CustomerType)) return null;
 
   const scoredArrayFields = [
     "targetCustomers", "targetIndustries", "targetCompanySizes",
