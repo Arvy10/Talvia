@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import ScrollReveal from './ScrollReveal';
+import { ChannelIcon } from './ChannelIcon';
 
 const conversations = [
   ['SM', 'Sarah M.', 'LinkedIn', 'Oui, une démo cette semaine serait parfaite.', '2 min'],
@@ -10,19 +11,21 @@ const conversations = [
 function Brand() { return <span className="brand"><span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /></span>talvia</span>; }
 function Head({ kicker, title, copy }: { kicker: string; title: string; copy: string }) { return <header className="section-head"><span>{kicker}</span><h2>{title}</h2><p>{copy}</p></header>; }
 
-function Flow() { return <div className="flow-stage"><div className="flow-channels"><span><b>in</b><i>LinkedIn</i><small>3 conversations</small></span><span><b>wa</b><i>WhatsApp</i><small>5 messages</small></span><span><b>@</b><i>Gmail</i><small>1 proposition</small></span></div><div className="flow-lines" aria-hidden="true"><i /><i /><i /><b>●</b></div><div className="flow-center"><Brand /><small>Tout le contexte. Une seule vue.</small></div></div>; }
+function Flow() { return <div className="flow-stage"><div className="flow-channels"><span><ChannelIcon channel="linkedin" size={16} /><i>LinkedIn</i><small>3 conversations</small></span><span><ChannelIcon channel="whatsapp" size={16} /><i>WhatsApp</i><small>5 messages</small></span><span><ChannelIcon channel="gmail" size={16} /><i>Gmail</i><small>1 proposition</small></span></div><div className="flow-lines" aria-hidden="true"><i /><i /><i /><b>●</b></div><div className="flow-center"><Brand /><small>Tout le contexte. Une seule vue.</small></div></div>; }
 
 function Sequence() { const steps: [string, string, string, string][] = [['①', 'Invitation LinkedIn', 'Message personnalisé au premier contact', 'Envoyé'], ['②', 'Relance J+4', 'Rappel court si aucune réponse', 'Programmé'], ['③', 'Réponse reçue', 'La séquence s’arrête automatiquement', 'Stop']]; return <div className="follow-card"><header><div><small>SÉQUENCE LINKEDIN</small><h3>Prospect Nova Studio</h3></div><span>3 étapes</span></header>{steps.map((x) => <article key={x[1]}><i>{x[0]}</i><div><h4>{x[1]}</h4><p>{x[2]}</p></div><button>{x[3]}</button></article>)}<footer><span>✦</span><p><b>Une réponse coupe la séquence.</b><br />L’Inbox prend le relais, pas l’automatisation.</p></footer></div>; }
 
-function Crm() { return <div className="crm-card"><header><i>SM</i><div><h3>Sarah Mensah</h3><p>Head of Growth · Nova Studio</p></div><span>Proposition</span></header><div className="crm-channels"><b>in</b><b>wa</b><small>2 canaux</small></div><dl><div><dt>Besoin identifié</dt><dd>Suivi commercial multicanal</dd></div><div><dt>Dernière interaction</dt><dd>Aujourd’hui, 09:47</dd></div><div><dt>Prochaine action</dt><dd>Planifier une démonstration</dd></div></dl><section><small>✦ RÉSUMÉ TALVIA</small><p>Sarah cherche à centraliser les prospects de Nova Studio entre LinkedIn et WhatsApp. Intérêt confirmé pour une démo cette semaine.</p></section><footer><span>Contact enrichi depuis la conversation</span><b>Mis à jour à l’instant</b></footer></div>; }
+function Crm() { return <div className="crm-card"><header><i>SM</i><div><h3>Sarah Mensah</h3><p>Head of Growth · Nova Studio</p></div><span>Proposition</span></header><div className="crm-channels"><ChannelIcon channel="linkedin" size={11} /><ChannelIcon channel="whatsapp" size={11} /><small>2 canaux</small></div><dl><div><dt>Besoin identifié</dt><dd>Suivi commercial multicanal</dd></div><div><dt>Dernière interaction</dt><dd>Aujourd’hui, 09:47</dd></div><div><dt>Prochaine action</dt><dd>Planifier une démonstration</dd></div></dl><section><small>✦ RÉSUMÉ TALVIA</small><p>Sarah cherche à centraliser les prospects de Nova Studio entre LinkedIn et WhatsApp. Intérêt confirmé pour une démo cette semaine.</p></section><footer><span>Contact enrichi depuis la conversation</span><b>Mis à jour à l’instant</b></footer></div>; }
 
 function Workflow({ items, humanIndex }: { items: [string, string, string, string][]; humanIndex?: number }) { return <div className="workflow">{items.map((x, i) => <div className={humanIndex === i ? 'human' : ''} key={x[0]}><span>{x[0]}</span><i>{x[1]}</i><b>{x[2]}</b><small>{x[3]}</small></div>)}</div>; }
 
 const organisationSteps: [string, string, string, string][] = [
-  ['01', '◈', 'Conversation', 'Un message arrive, quel que soit le canal'],
-  ['02', '○', 'Contact', 'La conversation retrouve son historique'],
-  ['03', '▥', 'Campagne', 'Vous approchez et relancez au bon moment'],
-  ['04', '◇', 'Opportunité', 'Un vrai signal commercial fait avancer le suivi'],
+  ['01', '⌁', 'Prospecter', 'Vous approchez sur LinkedIn, WhatsApp ou Gmail'],
+  ['02', '◈', 'Échanger', 'La conversation arrive dans un espace unique'],
+  ['03', '○', 'Suivre', 'Contact et historique restent accessibles'],
+  ['04', '↻', 'Relancer', 'La bonne conversation revient au bon moment'],
+  ['05', '◇', 'Qualifier', 'Un vrai signal commercial est identifié'],
+  ['06', '✓', 'Convertir', 'L’opportunité avance dans votre pipeline'],
 ];
 
 const automationSteps: [string, string, string, string][] = [
@@ -36,7 +39,7 @@ const automationSteps: [string, string, string, string][] = [
 export function LandingSections() { return <>
   <section className="problem section" id="fonctionnalites"><div className="section-wrap"><ScrollReveal><Head kicker="LE PROBLÈME" title="Un prospect sur LinkedIn. Un autre sur WhatsApp. Un devis dans Gmail." copy="Une relance oubliée quelque part au milieu. Une opportunité perdue parce que personne n’a recroisé les trois." /></ScrollReveal><ScrollReveal><Flow /></ScrollReveal></div></section>
 
-  <section className="feature section"><div className="section-wrap"><ScrollReveal><Head kicker="ORGANISATION TALVIA" title="Conversations → Contacts → Campagnes → Opportunités" copy="Chaque conversation retrouve son contexte. Chaque contact garde son historique. Et lorsqu’un véritable signal commercial apparaît, Talvia vous aide à le faire avancer." /></ScrollReveal><ScrollReveal><Workflow items={organisationSteps} /></ScrollReveal></div></section>
+  <section className="feature section"><div className="section-wrap"><ScrollReveal><Head kicker="ORGANISATION TALVIA" title="Prospecter → Échanger → Suivre → Relancer → Qualifier → Convertir" copy="Toute votre chaîne commerciale, de la première approche jusqu’à la conversion, structurée dans un seul espace." /></ScrollReveal><ScrollReveal><Workflow items={organisationSteps} /></ScrollReveal></div></section>
 
   <section className="feature section"><div className="section-wrap split"><ScrollReveal><Head kicker="INBOX UNIFIÉE" title="Une inbox pour toutes vos conversations." copy="Passez d’un prospect à l’autre, pas d’une application à l’autre. Chaque échange reste lisible, quel que soit le canal." /><ul className="benefits"><li><b>Une vue claire</b><span>Filtrez par canal, non-lus ou relances.</span></li><li><b>Tout le contexte</b><span>Retrouvez l’historique avant de répondre.</span></li><li><b>Une seule routine</b><span>Traitez vos conversations depuis le même espace.</span></li></ul></ScrollReveal><ScrollReveal className="mini-inbox"><header><span>Inbox</span><b>8 non lus</b></header><nav>Tout&nbsp;&nbsp;&nbsp; LinkedIn&nbsp;&nbsp;&nbsp; WhatsApp</nav>{conversations.map((c, i) => <article key={c[1]} className={i === 0 ? 'selected' : ''}><i>{c[0]}</i><div><b>{c[1]}</b><small>{c[2]}</small><p>{c[3]}</p></div><time>{c[4]}</time></article>)}</ScrollReveal></div></section>
 
