@@ -107,7 +107,11 @@ export function OnboardingClient() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ manual: true }),
     });
-    if (!response.ok) return;
+    if (!response.ok) {
+      const body = await readJson<{ error?: string }>(response).catch(() => ({ error: undefined }));
+      setNotice(body.error ?? "Impossible de démarrer le profil manuel pour le moment.");
+      return;
+    }
     const { businessContext } = await readJson<{ businessContext: BusinessContextRecord }>(response);
     setRecord(businessContext);
     setEditable(toEditable(businessContext));
@@ -133,7 +137,7 @@ export function OnboardingClient() {
       eyebrow="Contexte d'entreprise"
       title="Parlez-nous de votre activité"
     />
-    <p aria-live="polite" className="sr-only">{notice}</p>
+    {notice ? <p aria-live="polite" className="onboarding-notice" role="status">{notice}</p> : null}
 
     {step === "loading" ? <GlassCard className="onboarding-card"><p className="onboarding-loading">Chargement…</p></GlassCard> : null}
 

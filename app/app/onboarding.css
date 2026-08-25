@@ -2,6 +2,8 @@
 
 .onboarding-card { padding: clamp(24px, 4vw, 40px); }
 
+.onboarding-notice { margin: 0 0 16px; padding: 11px 15px; border: 1px solid #ff6b4a42; border-radius: 11px; background: #ff6b4a12; color: #ffab97; font-size: 12px; line-height: 1.5; }
+
 .onboarding-loading { margin: 0; color: var(--app-muted); font-size: 13px; }
 
 .onboarding-url { display: grid; justify-items: start; gap: 14px; }
