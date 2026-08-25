@@ -30,35 +30,36 @@ function toAbsolute(baseUrl: string, path: string): string {
   return new URL(path, baseUrl).toString();
 }
 
+// The homepage is fetched first and is required (its failure aborts the
+// whole analysis with a specific reason). The remaining candidate pages
+// are then fetched CONCURRENTLY rather than one after another — with 5
+// candidate paths and an 8s per-request timeout, a sequential crawl could
+// take up to ~40s even on a healthy site; in parallel it's bounded by the
+// single slowest request instead.
 async function collectPages(website: string): Promise<{ pages: { url: string; text: string }[]; pagesFetched: number }> {
+  const targets = Array.from(new Set(CANDIDATE_PATHS.map((path) => toAbsolute(website, path))));
+  const [homepageTarget, ...secondaryTargets] = targets;
+
+  const homepage = await fetchPageSafely(homepageTarget!);
+  let pagesFetched = 1;
   const pages: { url: string; text: string }[] = [];
-  let pagesFetched = 0;
   let totalChars = 0;
-  const seen = new Set<string>();
 
-  for (const path of CANDIDATE_PATHS) {
+  const homepageExtracted = extractPage(homepage.url, homepage.html);
+  if (homepageExtracted.text.length >= 40) {
+    pages.push(homepageExtracted);
+    totalChars += homepageExtracted.text.length;
+  }
+
+  const secondaryResults = await Promise.allSettled(secondaryTargets.map((target) => fetchPageSafely(target)));
+  for (const result of secondaryResults) {
     if (pages.length >= MAX_PAGES || totalChars >= MAX_TOTAL_CHARS) break;
-    const target = toAbsolute(website, path);
-    if (seen.has(target)) continue;
-    seen.add(target);
-
-    try {
-      const fetched = await fetchPageSafely(target);
-      pagesFetched += 1;
-      const extracted = extractPage(fetched.url, fetched.html);
-      if (extracted.text.length < 40) continue;
-      pages.push(extracted);
-      totalChars += extracted.text.length;
-    } catch (error) {
-      if (path === "") {
-        // Homepage is required — surface the real reason (blocked, timed
-        // out, wrong content-type…) instead of swallowing it into a vague
-        // "insufficient content" further down; that made every homepage
-        // failure indistinguishable from a genuinely thin site.
-        throw error;
-      }
-      // Secondary pages are best-effort — a missing /pricing page shouldn't fail the whole analysis.
-    }
+    if (result.status !== "fulfilled") continue; // secondary pages are best-effort
+    pagesFetched += 1;
+    const extracted = extractPage(result.value.url, result.value.html);
+    if (extracted.text.length < 40) continue;
+    pages.push(extracted);
+    totalChars += extracted.text.length;
   }
 
   return { pages, pagesFetched };

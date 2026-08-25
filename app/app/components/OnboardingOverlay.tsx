@@ -5,9 +5,8 @@ import { LuArrowRight, LuGlobe, LuTriangleAlert } from "react-icons/lu";
 
 import type { BusinessContextRecord } from "../../lib/business-context/business-context-service";
 import { countryName, guessCountryFromBrowserTimezone } from "./countries";
-import { ChipBand } from "./ChipBand";
 import { CountryMultiSelect } from "./CountryMultiSelect";
-import { INDUSTRY_OPTIONS } from "./industries";
+import { IndustrySelect } from "./IndustrySelect";
 
 type SubStep = "choice" | "url-input" | "analyzing" | "url-failed" | "manual-1" | "manual-2" | "manual-3" | "saving";
 
@@ -165,7 +164,7 @@ export function OnboardingOverlay({
         </> : null}
         {step === "manual-2" ? <>
           <h2>Quel est votre secteur ?</h2>
-          <ChipBand onChange={setIndustry} options={INDUSTRY_OPTIONS} value={industry} />
+          <IndustrySelect onChange={setIndustry} value={industry} />
         </> : null}
         {step === "manual-3" ? <>
           <h2>Où sont vos clients ?</h2>

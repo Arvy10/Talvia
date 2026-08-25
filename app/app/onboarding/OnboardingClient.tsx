@@ -6,7 +6,7 @@ import { LuArrowRight, LuGlobe, LuTriangleAlert } from "react-icons/lu";
 
 import { GlassCard, PageHeader } from "../components/ui";
 import type { BusinessContextRecord } from "../../lib/business-context/business-context-service";
-import { BusinessContextForm, toEditable, toEditInput, type EditableBusinessContext } from "./BusinessContextForm";
+import { BUSINESS_CONTEXT_SECTION_TITLES, BusinessContextForm, toEditable, toEditInput, type EditableBusinessContext } from "./BusinessContextForm";
 
 type Step = "loading" | "url" | "analyzing" | "review" | "failed";
 
@@ -36,6 +36,7 @@ export function OnboardingClient() {
   const [progressStage, setProgressStage] = useState(0);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState("");
+  const [activeSection, setActiveSection] = useState(0);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -44,6 +45,7 @@ export function OnboardingClient() {
       if (existing && existing.status === "ready") {
         setRecord(existing);
         setEditable(toEditable(existing));
+        setActiveSection(0);
         setStep("review");
         return;
       }
@@ -94,6 +96,7 @@ export function OnboardingClient() {
     if (businessContext.status === "ready") {
       setRecord(businessContext);
       setEditable(toEditable(businessContext));
+      setActiveSection(0);
       setStep("review");
     } else {
       setFailureReason(businessContext.errorReason ?? "L'analyse n'a pas abouti.");
@@ -115,6 +118,7 @@ export function OnboardingClient() {
     const { businessContext } = await readJson<{ businessContext: BusinessContextRecord }>(response);
     setRecord(businessContext);
     setEditable(toEditable(businessContext));
+    setActiveSection(0);
     setStep("review");
   };
 
@@ -185,14 +189,20 @@ export function OnboardingClient() {
     </GlassCard> : null}
 
     {step === "review" ? <div className="onboarding-review">
-      <GlassCard className="onboarding-review__intro">
-        <p>Vérifiez et corrigez ces informations si besoin — Talvia distingue ce qui est constaté sur votre site, ce qui est déduit, et ce qui est une suggestion à valider.</p>
+      <GlassCard className="onboarding-review__card">
+        <div className="onboarding-review__card-head">
+          <p className="onboarding-overlay__step-count">Étape {activeSection + 1} sur {BUSINESS_CONTEXT_SECTION_TITLES.length}</p>
+          <button className="connection-button connection-button--quiet" onClick={() => setStep("url")} type="button">Analyser un autre site</button>
+        </div>
+        <p className="onboarding-review__intro-text">Vérifiez et corrigez ces informations si besoin — Talvia distingue ce qui est constaté sur votre site, ce qui est déduit, et ce qui est une suggestion à valider.</p>
+        <BusinessContextForm activeSection={activeSection} onChange={setEditable} record={record} value={editable} />
+        <div className="onboarding-review__actions">
+          {activeSection > 0 ? <button className="connection-button connection-button--secondary" onClick={() => setActiveSection((current) => current - 1)} type="button">Précédent</button> : <span />}
+          {activeSection < BUSINESS_CONTEXT_SECTION_TITLES.length - 1
+            ? <button className="connection-button" onClick={() => setActiveSection((current) => current + 1)} type="button">Continuer<LuArrowRight aria-hidden="true" /></button>
+            : <button className="connection-button" disabled={saving} onClick={() => void save()} type="button">{saving ? "Enregistrement…" : "Valider ce profil"}</button>}
+        </div>
       </GlassCard>
-      <BusinessContextForm onChange={setEditable} record={record} value={editable} />
-      <div className="onboarding-review__actions">
-        <button className="connection-button connection-button--secondary" onClick={() => setStep("url")} type="button">Analyser un autre site</button>
-        <button className="connection-button" disabled={saving} onClick={() => void save()} type="button">{saving ? "Enregistrement…" : "Valider ce profil"}</button>
-      </div>
     </div> : null}
   </div>;
 }

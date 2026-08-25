@@ -2,9 +2,8 @@
 
 import type { BusinessContextEditInput, BusinessContextRecord } from "../../lib/business-context/business-context-service";
 import type { Provenance } from "../../lib/business-context/types";
-import { ChipBand } from "../components/ChipBand";
 import { CountryMultiSelect } from "../components/CountryMultiSelect";
-import { INDUSTRY_OPTIONS } from "../components/industries";
+import { IndustrySelect } from "../components/IndustrySelect";
 
 const provenanceLabels: Record<Provenance, string> = { fact: "Constaté", inference: "Déduit", suggestion: "Suggestion", user_provided: "Renseigné par vous" };
 
@@ -115,37 +114,45 @@ function FieldRow({
   </label>;
 }
 
+// One section = one card in the review flow — OnboardingClient shows a
+// single section at a time with Précédent/Suivant instead of one long
+// scrolling page, so revisiting an existing profile feels the same as
+// first-time onboarding.
+export const BUSINESS_CONTEXT_SECTION_TITLES = ["Identité", "Offre", "Cible", "Angle commercial"] as const;
+
 export function BusinessContextForm({
   value,
   record,
   onChange,
+  activeSection,
 }: {
   value: EditableBusinessContext;
   record: BusinessContextRecord | null;
   onChange: (next: EditableBusinessContext) => void;
+  activeSection: number;
 }) {
   const set = <K extends keyof EditableBusinessContext>(key: K) => (fieldValue: string) => onChange({ ...value, [key]: fieldValue });
 
   return <div className="bc-form">
-    <section className="bc-form__section">
+    {activeSection === 0 ? <section className="bc-form__section">
       <h3>Identité</h3>
       <FieldRow field={{ key: "companyName", label: "Nom de l'entreprise" }} onChange={set("companyName")} value={value.companyName} />
       <FieldRow field={{ key: "businessDescription", label: "Description de l'activité", multiline: true }} onChange={set("businessDescription")} value={value.businessDescription} />
       <div className="bc-field">
         <FieldLabel badge={record?.industry ?? null} label="Secteur" />
-        <ChipBand onChange={set("industry")} options={INDUSTRY_OPTIONS} value={value.industry} />
+        <IndustrySelect onChange={set("industry")} value={value.industry} />
       </div>
       <FieldRow field={{ key: "valueProposition", label: "Proposition de valeur", multiline: true }} badge={record?.valueProposition ?? null} onChange={set("valueProposition")} value={value.valueProposition} />
-    </section>
+    </section> : null}
 
-    <section className="bc-form__section">
+    {activeSection === 1 ? <section className="bc-form__section">
       <h3>Offre</h3>
       <FieldRow field={{ key: "services", label: "Services", list: true }} onChange={set("services")} value={value.services} />
       <FieldRow field={{ key: "products", label: "Produits", list: true }} onChange={set("products")} value={value.products} />
       <FieldRow field={{ key: "keywords", label: "Mots-clés", list: true }} onChange={set("keywords")} value={value.keywords} />
-    </section>
+    </section> : null}
 
-    <section className="bc-form__section">
+    {activeSection === 2 ? <section className="bc-form__section">
       <h3>Cible</h3>
       <FieldRow field={{ key: "targetCustomers", label: "Types de clients", list: true }} badge={record?.targetCustomers ?? null} onChange={set("targetCustomers")} value={value.targetCustomers} />
       <FieldRow field={{ key: "targetIndustries", label: "Secteurs visés", list: true }} badge={record?.targetIndustries ?? null} onChange={set("targetIndustries")} value={value.targetIndustries} />
@@ -155,12 +162,12 @@ export function BusinessContextForm({
         <FieldLabel badge={record?.geographies ?? null} label="Zones géographiques" />
         <CountryMultiSelect onChange={(names) => set("geographies")(names.join("\n"))} value={linesToList(value.geographies)} />
       </div>
-    </section>
+    </section> : null}
 
-    <section className="bc-form__section">
+    {activeSection === 3 ? <section className="bc-form__section">
       <h3>Angle commercial <span className="bc-form__section-note">Recommandations à valider, pas des constats</span></h3>
       <FieldRow field={{ key: "painPoints", label: "Problèmes résolus", list: true }} badge={record?.painPoints ?? null} onChange={set("painPoints")} value={value.painPoints} />
       <FieldRow field={{ key: "salesAngles", label: "Angles d'approche suggérés", list: true }} badge={record?.salesAngles ?? null} onChange={set("salesAngles")} value={value.salesAngles} />
-    </section>
+    </section> : null}
   </div>;
 }
