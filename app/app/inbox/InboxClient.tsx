@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   LuArrowLeft,
+  LuArrowRight,
   LuBot,
   LuEllipsis,
   LuInbox,
@@ -21,6 +22,8 @@ import { ChannelLogo } from "../connections/ChannelLogo";
 import type { ChannelId, Contact, Opportunity } from "../state/types";
 import { apiChannelToUi, channelMap, uiChannelToApi } from "./inbox-model";
 import { generateReply, type ReplyMode } from "./talvia-ai";
+
+type ApiConnection = { channel_type: "linkedin" | "whatsapp" | "email"; status: string };
 
 type ApiMessage = {
   id: string;
@@ -60,6 +63,7 @@ export function InboxClient() {
     "list",
   );
   const [error, setError] = useState("");
+  const [connectedChannels, setConnectedChannels] = useState<Set<ChannelId> | null>(null);
   const refresh = async (archived = false) => {
     const [a, b, c] = await Promise.all([
       fetch(`/api/inbox/conversations?archived=${archived}`),
@@ -78,6 +82,10 @@ export function InboxClient() {
   };
   useEffect(() => {
     void refresh();
+    void fetch("/api/connections").then((response) => (response.ok ? response.json() : null)).then((data: { connections: ApiConnection[] } | null) => {
+      const connected = (data?.connections ?? []).filter((item) => item.status === "connected").map((item) => apiChannelToUi(item.channel_type));
+      setConnectedChannels(new Set(connected));
+    });
   }, []);
 
   const threads = useMemo(
@@ -106,9 +114,13 @@ export function InboxClient() {
   const activeContact = contacts.find(
     (contact) => contact.id === activeThread?.contactId,
   );
-  const availableChannels = contacts.find((contact) => contact.id === contactId)
+  // A conversation can only start on a channel Talvia is actually connected
+  // to — otherwise nothing would ever be sent, even though the contact
+  // happens to have a phone number or email on file.
+  const availableChannels = (contacts.find((contact) => contact.id === contactId)
     ? getContactChannels(contacts.find((contact) => contact.id === contactId)!)
-    : [];
+    : []
+  ).filter((item) => connectedChannels?.has(item));
   const opportunity = opportunities.find(
     (item) => item.contactId === activeContact?.id,
   );
@@ -188,6 +200,27 @@ export function InboxClient() {
       `/app/opportunities?contactId=${encodeURIComponent(activeContact.id)}&conversationId=${encodeURIComponent(activeThread.id)}`,
     );
   };
+
+  if (connectedChannels && connectedChannels.size === 0) {
+    return (
+      <div className="inbox-page inbox-page--center">
+        <div className="inbox-no-channels">
+          <h1>Boîte de réception.</h1>
+          <p>Connectez un canal pour voir vos conversations ici.</p>
+          <ul>
+            <li>Gérez vos e-mails Gmail directement depuis Talvia</li>
+            <li>Envoyez et recevez des messages LinkedIn et WhatsApp</li>
+            <li>Retrouvez le contexte de chaque contact à côté de la conversation</li>
+          </ul>
+          <div className="inbox-no-channels__brands">
+            <span>Fonctionne avec</span>
+            {channelMap.map((item) => <ChannelLogo channel={item.id} key={item.id} />)}
+          </div>
+          <Link className="connection-button" href="/app/connections">Connecter un canal<LuArrowRight aria-hidden="true" /></Link>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={`inbox-page inbox-page--center mobile-view-${mobileView}`}>

@@ -1,0 +1,67 @@
+.inbox-no-channels {
+  width: min(560px, 100%);
+  margin: 40px auto;
+  padding: clamp(28px, 4vw, 44px);
+  border: 1px solid var(--app-border);
+  border-radius: 18px;
+  background: linear-gradient(145deg, #ffffff05, #ffffff01), var(--app-surface);
+  box-shadow: 0 22px 54px #0000002e;
+  display: grid;
+  justify-items: start;
+  gap: 14px;
+}
+.inbox-no-channels h1 {
+  margin: 0;
+  font-family: "Instrument Serif", Georgia, serif;
+  font-size: clamp(26px, 3vw, 32px);
+  font-weight: 400;
+}
+.inbox-no-channels > p {
+  margin: 0;
+  color: var(--app-muted);
+  font-size: 13px;
+}
+.inbox-no-channels ul {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 9px;
+}
+.inbox-no-channels li {
+  padding-left: 16px;
+  position: relative;
+  color: #c9c2cc;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.inbox-no-channels li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 7px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--app-coral);
+}
+.inbox-no-channels__brands {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--app-muted);
+  font-size: 11px;
+}
+.inbox-no-channels__brands .channel-logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+@media (max-width: 620px) {
+  .inbox-no-channels {
+    margin: 20px auto;
+  }
+}
