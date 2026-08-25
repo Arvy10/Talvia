@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { LuArrowRight, LuCheck, LuGlobe, LuTriangleAlert } from "react-icons/lu";
+import { LuArrowRight, LuGlobe, LuTriangleAlert } from "react-icons/lu";
 
 import { GlassCard, PageHeader } from "../components/ui";
 import type { BusinessContextRecord } from "../../lib/business-context/business-context-service";
@@ -10,7 +10,17 @@ import { BusinessContextForm, toEditable, toEditInput, type EditableBusinessCont
 
 type Step = "loading" | "url" | "analyzing" | "review" | "failed";
 
-const progressStages = ["Ouverture du site…", "Lecture des pages clés…", "Analyse du profil par l'IA…"];
+// Cosmetic microcopy only — Talvia makes a single request-response call to
+// the backend, so there is no real per-step server confirmation to display.
+// This cycles indefinitely (never marks a stage "done") until the actual
+// response arrives, so it never implies progress the frontend hasn't
+// actually confirmed.
+const progressStages = [
+  "Lecture de votre site",
+  "Compréhension de votre activité",
+  "Identification de votre contexte commercial",
+  "Préparation de votre espace",
+];
 
 async function readJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
@@ -54,8 +64,8 @@ export function OnboardingClient() {
   const startProgressAnimation = () => {
     setProgressStage(0);
     progressTimer.current = setInterval(() => {
-      setProgressStage((current) => Math.min(current + 1, progressStages.length - 1));
-    }, 1400);
+      setProgressStage((current) => (current + 1) % progressStages.length);
+    }, 1800);
   };
 
   const stopProgressAnimation = () => {
@@ -149,13 +159,12 @@ export function OnboardingClient() {
 
     {step === "analyzing" ? <GlassCard className="onboarding-card">
       <div className="onboarding-progress">
-        <h2>Analyse en cours…</h2>
-        <ul>
-          {progressStages.map((label, index) => <li className={index <= progressStage ? "is-done" : ""} key={label}>
-            <span aria-hidden="true">{index < progressStage ? <LuCheck /> : index === progressStage ? <span className="onboarding-progress__spinner" /> : null}</span>
-            {label}
-          </li>)}
-        </ul>
+        <h2>Talvia analyse votre entreprise</h2>
+        <p aria-live="polite" className="onboarding-progress__current">
+          <span aria-hidden="true" className="onboarding-progress__spinner" />
+          {progressStages[progressStage]}
+        </p>
+        <p className="onboarding-progress__note">Cette étape peut prendre quelques instants — l'analyse est toujours en cours tant que cet écran s'affiche.</p>
       </div>
     </GlassCard> : null}
 

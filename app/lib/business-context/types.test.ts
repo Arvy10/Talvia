@@ -42,6 +42,11 @@ describe("validateBusinessAnalysisResult", () => {
       validateBusinessAnalysisResult({ ...validResult, industry: { value: "Logiciel", provenance: "guess", confidence: 0.9 } }),
     ).toBeNull();
   });
+  it("rejects an AI-generated result claiming user_provided provenance (that provenance is reserved for human edits)", () => {
+    expect(
+      validateBusinessAnalysisResult({ ...validResult, industry: { value: "Logiciel", provenance: "user_provided", confidence: 1 } }),
+    ).toBeNull();
+  });
   it("rejects a scored array field whose value is not a string array", () => {
     expect(
       validateBusinessAnalysisResult({ ...validResult, targetCustomers: { value: "PME", provenance: "fact", confidence: 0.8 } }),

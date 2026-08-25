@@ -136,8 +136,8 @@ async function replaceActiveContext(
         workspace_id, is_active, status, error_reason, website, company_name, industry, business_description,
         value_proposition, services, products, target_customers, target_industries, target_company_sizes,
         target_roles, geographies, keywords, pain_points, sales_angles, primary_language, source,
-        analysis_version, source_pages, ai_model
-      ) values ($1,true,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+        analysis_version, source_pages, manually_edited_fields, ai_model
+      ) values ($1,true,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
       returning *`,
       [
         context.workspaceId,
@@ -162,6 +162,7 @@ async function replaceActiveContext(
         values.source ?? "website_analysis",
         values.analysis_version ?? null,
         JSON.stringify(values.source_pages ?? []),
+        JSON.stringify(values.manually_edited_fields ?? []),
         values.ai_model ?? null,
       ],
     );
@@ -268,9 +269,10 @@ const COLUMN_BY_FIELD: Record<string, string> = {
   salesAngles: "sales_angles",
 };
 
-// A human editing a field is, by definition, asserting a fact — provenance
-// and confidence are overwritten accordingly rather than left at whatever
-// the AI originally guessed.
+// A human editing a field is neither a website fact nor a model inference —
+// it gets its own provenance so the UI can say "you told us this" rather
+// than implying Talvia verified it independently. Confidence 1 here means
+// "we're certain the user declared this," not "we verified it's accurate."
 export async function updateActiveBusinessContext(context: WorkspaceContext, input: BusinessContextEditInput): Promise<BusinessContextRecord | null> {
   const existing = await getActiveBusinessContext(context);
   if (!existing) return null;
@@ -290,14 +292,14 @@ export async function updateActiveBusinessContext(context: WorkspaceContext, inp
   for (const field of SCORED_STRING_FIELDS) {
     if (input[field] === undefined) continue;
     setClauses.push(`${COLUMN_BY_FIELD[field]}=$${index}`);
-    values.push(JSON.stringify({ value: input[field], provenance: "fact", confidence: 1 }));
+    values.push(JSON.stringify({ value: input[field], provenance: "user_provided", confidence: 1 }));
     editedFields.add(field);
     index += 1;
   }
   for (const field of SCORED_ARRAY_FIELDS) {
     if (input[field] === undefined) continue;
     setClauses.push(`${COLUMN_BY_FIELD[field]}=$${index}`);
-    values.push(JSON.stringify({ value: input[field], provenance: "fact", confidence: 1 }));
+    values.push(JSON.stringify({ value: input[field], provenance: "user_provided", confidence: 1 }));
     editedFields.add(field);
     index += 1;
   }
@@ -317,8 +319,23 @@ export async function updateActiveBusinessContext(context: WorkspaceContext, inp
   return result.rows[0] ? map(result.rows[0]) : null;
 }
 
+// A field the user corrected by hand must survive the next automatic
+// analysis, even if the model re-detects the old value — reanalysis
+// overwrites everything EXCEPT the fields already in manuallyEditedFields.
+function preserveManualFields(existing: BusinessContextRecord | null, fresh: Partial<Row>): Partial<Row> {
+  if (!existing || existing.manuallyEditedFields.length === 0) return fresh;
+  const merged: Partial<Row> = { ...fresh };
+  for (const field of existing.manuallyEditedFields) {
+    const column = COLUMN_BY_FIELD[field];
+    if (!column) continue;
+    (merged as Record<string, unknown>)[column] = (existing as unknown as Record<string, unknown>)[field];
+  }
+  return merged;
+}
+
 export async function runBusinessContextAnalysis(context: WorkspaceContext, website: string): Promise<BusinessContextRecord> {
   await assertNotRateLimited(context);
+  const existing = await getActiveBusinessContext(context);
   const startedAt = Date.now();
   const outcome = await analyzeBusinessFromWebsite(website);
   const durationMs = Date.now() - startedAt;
@@ -327,10 +344,11 @@ export async function runBusinessContextAnalysis(context: WorkspaceContext, webs
     const saved = await replaceActiveContext(context, {
       status: "ready",
       website,
-      ...toRowFields(outcome.result),
+      ...preserveManualFields(existing, toRowFields(outcome.result)),
       source: "website_analysis",
       analysis_version: ANALYSIS_VERSION,
       source_pages: outcome.sourcePages,
+      manually_edited_fields: existing?.manuallyEditedFields ?? [],
       ai_model: outcome.model,
     });
     await logRun(context, saved.id, website, "succeeded", {

@@ -1,9 +1,12 @@
 import type { JSONSchema } from "../ai/provider";
 
 // Provenance keeps a hard line between what the site actually says (fact),
-// what Talvia concluded from it (inference), and what Talvia recommends
-// (suggestion) — never collapse a guess into a certainty.
-export type Provenance = "fact" | "inference" | "suggestion";
+// what Talvia concluded from it (inference), what Talvia recommends
+// (suggestion), and what a human declared or corrected (user_provided) —
+// never collapse a guess, or a user's word, into a verified certainty.
+// AI generation only ever produces fact/inference/suggestion; user_provided
+// is assigned exclusively by the service layer when a human edits a field.
+export type Provenance = "fact" | "inference" | "suggestion" | "user_provided";
 
 export type ScoredField<T> = {
   value: T;

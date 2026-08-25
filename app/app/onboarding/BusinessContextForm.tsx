@@ -3,7 +3,7 @@
 import type { BusinessContextEditInput, BusinessContextRecord } from "../../lib/business-context/business-context-service";
 import type { Provenance } from "../../lib/business-context/types";
 
-const provenanceLabels: Record<Provenance, string> = { fact: "Constaté", inference: "Déduit", suggestion: "Suggestion" };
+const provenanceLabels: Record<Provenance, string> = { fact: "Constaté", inference: "Déduit", suggestion: "Suggestion", user_provided: "Renseigné par vous" };
 
 function ProvenanceBadge({ provenance, confidence }: { provenance: Provenance; confidence: number }) {
   return <span
