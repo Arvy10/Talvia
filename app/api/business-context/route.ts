@@ -15,6 +15,9 @@ export const runtime = "nodejs";
 function errorResponse(error: unknown) {
   if (error instanceof UnauthorizedError) return NextResponse.json({ error: "Non authentifié." }, { status: 401 });
   if (error instanceof RateLimitedError) return NextResponse.json({ error: error.message }, { status: 429 });
+  // The client only ever sees "Erreur serveur." — log the real cause so it's
+  // diagnosable from server logs instead of vanishing entirely.
+  console.error("[business-context] unexpected error", error);
   return NextResponse.json({ error: "Erreur serveur." }, { status: 400 });
 }
 
