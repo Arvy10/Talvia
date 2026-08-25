@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { LuX } from "react-icons/lu";
 
 import { productNavigation } from "./navigation";
+import { OnboardingGate } from "./OnboardingGate";
 import { Sidebar } from "./Sidebar";
 import { Topbar } from "./Topbar";
 import { IconButton } from "./ui";
@@ -71,6 +72,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [drawerOpen]);
 
   return <div className={sidebarCollapsed ? "talvia-app is-sidebar-collapsed" : "talvia-app"}>
+    <OnboardingGate pathname={pathname} />
     <Sidebar collapsed={sidebarCollapsed} onToggle={toggleSidebar} pathname={pathname} />
     <div className="app-workspace">
       <Topbar onNavigationOpen={openDrawer} title={title} />

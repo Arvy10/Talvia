@@ -2,6 +2,9 @@
 
 import type { BusinessContextEditInput, BusinessContextRecord } from "../../lib/business-context/business-context-service";
 import type { Provenance } from "../../lib/business-context/types";
+import { ChipBand } from "../components/ChipBand";
+import { CountryMultiSelect } from "../components/CountryMultiSelect";
+import { INDUSTRY_OPTIONS } from "../components/industries";
 
 const provenanceLabels: Record<Provenance, string> = { fact: "Constaté", inference: "Déduit", suggestion: "Suggestion", user_provided: "Renseigné par vous" };
 
@@ -76,6 +79,14 @@ export function toEditInput(editable: EditableBusinessContext): BusinessContextE
 }
 
 type Field = { key: keyof EditableBusinessContext; label: string; hint?: string; multiline?: boolean; list?: boolean };
+type Badge = { provenance: Provenance; confidence: number } | null;
+
+function FieldLabel({ label, badge }: { label: string; badge?: Badge }) {
+  return <span className="bc-field__label">
+    {label}
+    {badge ? <ProvenanceBadge confidence={badge.confidence} provenance={badge.provenance} /> : null}
+  </span>;
+}
 
 function FieldRow({
   field,
@@ -86,13 +97,10 @@ function FieldRow({
   field: Field;
   value: string;
   onChange: (value: string) => void;
-  badge?: { provenance: Provenance; confidence: number } | null;
+  badge?: Badge;
 }) {
   return <label className="bc-field">
-    <span className="bc-field__label">
-      {field.label}
-      {badge ? <ProvenanceBadge confidence={badge.confidence} provenance={badge.provenance} /> : null}
-    </span>
+    <FieldLabel badge={badge} label={field.label} />
     {field.hint ? <small>{field.hint}</small> : null}
     {field.multiline || field.list ? (
       <textarea
@@ -123,7 +131,10 @@ export function BusinessContextForm({
       <h3>Identité</h3>
       <FieldRow field={{ key: "companyName", label: "Nom de l'entreprise" }} onChange={set("companyName")} value={value.companyName} />
       <FieldRow field={{ key: "businessDescription", label: "Description de l'activité", multiline: true }} onChange={set("businessDescription")} value={value.businessDescription} />
-      <FieldRow field={{ key: "industry", label: "Secteur" }} badge={record?.industry ?? null} onChange={set("industry")} value={value.industry} />
+      <div className="bc-field">
+        <FieldLabel badge={record?.industry ?? null} label="Secteur" />
+        <ChipBand onChange={set("industry")} options={INDUSTRY_OPTIONS} value={value.industry} />
+      </div>
       <FieldRow field={{ key: "valueProposition", label: "Proposition de valeur", multiline: true }} badge={record?.valueProposition ?? null} onChange={set("valueProposition")} value={value.valueProposition} />
     </section>
 
@@ -140,7 +151,10 @@ export function BusinessContextForm({
       <FieldRow field={{ key: "targetIndustries", label: "Secteurs visés", list: true }} badge={record?.targetIndustries ?? null} onChange={set("targetIndustries")} value={value.targetIndustries} />
       <FieldRow field={{ key: "targetCompanySizes", label: "Taille d'entreprise visée", list: true }} badge={record?.targetCompanySizes ?? null} onChange={set("targetCompanySizes")} value={value.targetCompanySizes} />
       <FieldRow field={{ key: "targetRoles", label: "Interlocuteurs visés", list: true }} badge={record?.targetRoles ?? null} onChange={set("targetRoles")} value={value.targetRoles} />
-      <FieldRow field={{ key: "geographies", label: "Zones géographiques", list: true }} badge={record?.geographies ?? null} onChange={set("geographies")} value={value.geographies} />
+      <div className="bc-field">
+        <FieldLabel badge={record?.geographies ?? null} label="Zones géographiques" />
+        <CountryMultiSelect onChange={(names) => set("geographies")(names.join("\n"))} value={linesToList(value.geographies)} />
+      </div>
     </section>
 
     <section className="bc-form__section">
