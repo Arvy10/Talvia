@@ -1,6 +1,6 @@
 "use client";
 
-import { LuBell } from "react-icons/lu";
+import { BellRing } from "@animateicons/react/lucide";
 
 import { IconButton } from "./ui";
 import { TopbarAccountMenu } from "./TopbarAccountMenu";
@@ -12,7 +12,7 @@ export function Topbar({ title, onNavigationOpen }: { title: string; onNavigatio
     <p>{title}</p>
     <div className="app-topbar__actions">
       <TopbarClock />
-      <IconButton className="app-topbar__bell" label="Notifications"><LuBell aria-hidden="true" /></IconButton>
+      <IconButton className="app-topbar__bell" label="Notifications"><BellRing aria-hidden="true" duration={0.8} size={18} /></IconButton>
       <TopbarAccountMenu />
     </div>
   </header>;

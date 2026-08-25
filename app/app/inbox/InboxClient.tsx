@@ -11,10 +11,9 @@ import {
   LuMessageCircle,
   LuPlus,
   LuSearch,
-  LuSend,
-  LuSparkles,
   LuUserRound,
 } from "react-icons/lu";
+import { Send, Sparkles } from "@animateicons/react/lucide";
 import { Dialog } from "../components/Dialog";
 import { EmptyState } from "../components/ui";
 import { ChannelLogo } from "../connections/ChannelLogo";
@@ -405,7 +404,7 @@ export function InboxClient() {
                     onClick={() => setAiOpen(!aiOpen)}
                     type="button"
                   >
-                    <LuSparkles />
+                    <Sparkles aria-hidden="true" duration={0.9} size={14} />
                     Générer avec Talvia
                   </button>
                 </div>
@@ -414,7 +413,7 @@ export function InboxClient() {
                   disabled={!draft.trim()}
                   type="submit"
                 >
-                  <LuSend />
+                  <Send aria-hidden="true" duration={0.7} size={14} />
                   Envoyer
                 </button>
               </div>
