@@ -1,0 +1,13 @@
+The icon components in this directory (SendIcon, BellIcon, RefreshIcon,
+CheckIcon, ChartLineIcon, SparklesIcon, and shared types.ts) are sourced,
+unmodified in animation logic, from the Its Hover project:
+
+  https://github.com/itshover/itshover
+
+Copyright the Its Hover contributors.
+Licensed under the Apache License, Version 2.0.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+See ./LICENSE (this directory) for the complete license text.
