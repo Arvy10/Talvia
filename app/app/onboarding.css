@@ -79,8 +79,8 @@
 
 .onboarding-overlay-backdrop { position: fixed; z-index: 80; inset: 0; padding: 20px; background: #050408d6; backdrop-filter: blur(6px); display: grid; place-items: center; animation: app-fade-in 0.2s both; }
 .onboarding-overlay { position: relative; width: min(520px, 100%); max-height: min(640px, calc(100vh - 40px)); overflow: auto; padding: 40px 32px 32px; border: 1px solid #ffffff24; border-radius: 20px; background: linear-gradient(145deg, #201925, #151119); box-shadow: 0 30px 80px #0008; }
-.onboarding-overlay__defer { position: absolute; top: 16px; right: 16px; padding: 6px 12px; border: 1px solid #ffffff18; border-radius: 999px; background: #ffffff06; color: var(--app-muted); font-size: 11px; font-weight: 600; cursor: pointer; }
-.onboarding-overlay__defer:hover { border-color: #ffffff30; color: var(--app-text); }
+.onboarding-overlay__defer { position: absolute; top: 16px; right: 16px; padding: 7px 14px; border: 1px solid #ffffff2e; border-radius: 999px; background: #ffffff0e; color: var(--app-text); font-size: 12px; font-weight: 650; cursor: pointer; }
+.onboarding-overlay__defer:hover { border-color: #ffffff4a; background: #ffffff16; }
 .onboarding-overlay__panel { display: grid; justify-items: start; gap: 12px; }
 .onboarding-overlay__icon { width: 40px; height: 40px; display: grid; place-items: center; border: 1px solid #ff6b4a42; border-radius: 12px; background: #ff6b4a12; color: var(--app-coral); }
 .onboarding-overlay__panel h2 { margin: 0; font-family: "Instrument Serif", Georgia, serif; font-size: 23px; font-weight: 400; line-height: 1.2; }

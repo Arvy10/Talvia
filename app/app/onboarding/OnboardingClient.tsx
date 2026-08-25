@@ -175,7 +175,7 @@ export function OnboardingClient() {
           />
           <button className="connection-button" type="submit">Analyser<LuArrowRight aria-hidden="true" /></button>
         </form>
-        <button className="connection-button connection-button--quiet" onClick={() => void startManual()} type="button">Je préfère renseigner ces informations moi-même</button>
+        <button className="connection-button connection-button--secondary" onClick={() => void startManual()} type="button">Je préfère renseigner ces informations moi-même</button>
       </div>
     </GlassCard> : null}
 
