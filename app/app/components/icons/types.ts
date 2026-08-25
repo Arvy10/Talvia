@@ -1,6 +1,11 @@
 // Source: https://github.com/itshover/itshover (Apache-2.0) — see ./LICENSE
 import type { SVGProps } from "react";
 
+/** Scale stroke to match a 24px-based strokeWidth on non-24 viewBoxes */
+export function scaledStrokeWidth(strokeWidth: number, viewBoxSize: number): number {
+  return strokeWidth * (viewBoxSize / 24);
+}
+
 export interface AnimatedIconProps
   extends Omit<
     SVGProps<SVGSVGElement>,
