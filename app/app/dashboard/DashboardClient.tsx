@@ -1,16 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import { LuArrowRight, LuInbox, LuUnplug, LuUsers, LuWorkflow } from "react-icons/lu";
+import { LuArrowRight, LuInbox, LuMessageCircle, LuSend, LuSquareActivity, LuUnplug, LuWorkflow } from "react-icons/lu";
 
 import { ChannelLogo } from "../connections/ChannelLogo";
 import { EmptyState, GlassCard, PageHeader, StatusBadge } from "../components/ui";
+import MailIcon from "../components/icons/MailIcon";
+import UsersGroupIcon from "../components/icons/UsersGroupIcon";
 import { useSandbox } from "../state/SandboxProvider";
 import { channelMap, getConnectedChannelCount } from "../inbox/inbox-model";
 
 const shortcuts = [
-  { href: "/app/inbox", label: "Inbox", description: "Centralisez les conversations lorsqu’elles arriveront.", icon: LuInbox },
-  { href: "/app/contacts", label: "Contacts", description: "Vos contacts apparaîtront au fil de vos échanges.", icon: LuUsers },
+  { href: "/app/inbox", label: "Inbox", description: "Centralisez les conversations lorsqu’elles arriveront.", icon: MailIcon },
+  { href: "/app/contacts", label: "Contacts", description: "Vos contacts apparaîtront au fil de vos échanges.", icon: UsersGroupIcon },
   { href: "/app/automations", label: "Automatisations", description: "Préparez vos prochains flux, à votre rythme.", icon: LuWorkflow },
 ];
 
@@ -58,7 +60,11 @@ export function DashboardClient() {
       </Link>)}
     </section>
 
-    <section className="dashboard-priority-grid"><GlassCard className="dashboard-priority-card"><span>À répondre</span><strong>{inbound}</strong><p>Conversations entrantes à traiter</p></GlassCard><GlassCard className="dashboard-priority-card"><span>Campagnes actives</span><strong>{activeCampaigns}</strong><p>Campagnes actuellement en cours</p></GlassCard><GlassCard className="dashboard-priority-card"><span>Activité récente</span><strong>{activities.length}</strong><p>Actions enregistrées dans votre espace</p></GlassCard></section>
+    <section className="dashboard-priority-grid">
+      <GlassCard className="dashboard-priority-card dashboard-priority-card--coral"><span className="dashboard-priority-card__icon" aria-hidden="true"><LuMessageCircle /></span><span>À répondre</span><strong>{inbound}</strong><p>Conversations entrantes à traiter</p></GlassCard>
+      <GlassCard className="dashboard-priority-card dashboard-priority-card--violet"><span className="dashboard-priority-card__icon" aria-hidden="true"><LuSend /></span><span>Campagnes actives</span><strong>{activeCampaigns}</strong><p>Campagnes actuellement en cours</p></GlassCard>
+      <GlassCard className="dashboard-priority-card dashboard-priority-card--green"><span className="dashboard-priority-card__icon" aria-hidden="true"><LuSquareActivity /></span><span>Activité récente</span><strong>{activities.length}</strong><p>Actions enregistrées dans votre espace</p></GlassCard>
+    </section>
     {activities.length === 0 ? <EmptyState className="dashboard-summary-empty" icon={<LuInbox />} title="Vos priorités apparaîtront ici" description="Ajoutez un contact, créez une campagne ou démarrez une conversation pour construire votre suivi commercial." /> : <GlassCard className="dashboard-activity"><p className="dashboard-kicker">ACTIVITÉ RÉCENTE</p>{activities.slice(-6).reverse().map((activity) => <div key={activity.id}><span>{activity.label}</span><small>Enregistrée</small></div>)}</GlassCard>}
   </div>;
 }
