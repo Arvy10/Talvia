@@ -1,12 +1,7 @@
 import Link from 'next/link';
 import ScrollReveal from './ScrollReveal';
 import { ChannelIcon } from './ChannelIcon';
-
-const conversations = [
-  ['SM', 'Sarah M.', 'LinkedIn', 'Oui, une démo cette semaine serait parfaite.', '2 min'],
-  ['MD', 'Marc D.', 'WhatsApp', 'Merci pour la proposition, je reviens vers vous.', '18 min'],
-  ['AC', 'Acme', 'Gmail', 'Besoin d’automatiser nos relances', '1 h'],
-];
+import MiniInboxPreview from './MiniInboxPreview';
 
 function Brand() { return <span className="brand"><span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /></span>talvia</span>; }
 function Head({ kicker, title, copy }: { kicker: string; title: string; copy: string }) { return <header className="section-head"><span>{kicker}</span><h2>{title}</h2><p>{copy}</p></header>; }
@@ -41,7 +36,7 @@ export function LandingSections() { return <>
 
   <section className="feature section"><div className="section-wrap"><ScrollReveal><Head kicker="ORGANISATION TALVIA" title="Chaque étape de votre cycle commercial, au même endroit." copy="Pas une case de plus dans un tableau. Un fil continu, de la première approche jusqu’à la conversion." /></ScrollReveal><ScrollReveal><Phases /></ScrollReveal></div></section>
 
-  <section className="feature section"><div className="section-wrap split"><ScrollReveal><Head kicker="INBOX UNIFIÉE" title="Une inbox pour toutes vos conversations." copy="Passez d’un prospect à l’autre, pas d’une application à l’autre. Chaque échange reste lisible, quel que soit le canal." /><ul className="benefits"><li><b>Une vue claire</b><span>Filtrez par canal, non-lus ou relances.</span></li><li><b>Tout le contexte</b><span>Retrouvez l’historique avant de répondre.</span></li><li><b>Une seule routine</b><span>Traitez vos conversations depuis le même espace.</span></li></ul></ScrollReveal><ScrollReveal className="mini-inbox"><header><span>Inbox</span><b>8 non lus</b></header><nav>Tout&nbsp;&nbsp;&nbsp; LinkedIn&nbsp;&nbsp;&nbsp; WhatsApp</nav>{conversations.map((c, i) => <article key={c[1]} className={i === 0 ? 'selected' : ''}><i>{c[0]}</i><div><b>{c[1]}</b><small>{c[2]}</small><p>{c[3]}</p></div><time>{c[4]}</time></article>)}</ScrollReveal></div></section>
+  <section className="feature section"><div className="section-wrap split"><ScrollReveal><Head kicker="INBOX UNIFIÉE" title="Une inbox pour toutes vos conversations." copy="Passez d’un prospect à l’autre, pas d’une application à l’autre. Chaque échange reste lisible, quel que soit le canal." /><ul className="benefits"><li><b>Une vue claire</b><span>Filtrez par canal, non-lus ou relances.</span></li><li><b>Tout le contexte</b><span>Retrouvez l’historique avant de répondre.</span></li><li><b>Une seule routine</b><span>Traitez vos conversations depuis le même espace.</span></li></ul></ScrollReveal><MiniInboxPreview /></div></section>
 
   <section className="feature section"><div className="section-wrap split reverse"><ScrollReveal><Sequence /></ScrollReveal><ScrollReveal><Head kicker="CAMPAGNES" title="Approchez, relancez, puis arrêtez dès qu’une vraie conversation commence." copy="Une séquence LinkedIn s’interrompt à la première réponse. Préparez vos relances WhatsApp autour des contacts déjà engagés et gardez la conversation au centre du suivi." /></ScrollReveal></div></section>
 
