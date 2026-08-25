@@ -2,7 +2,9 @@ import Anthropic from "@anthropic-ai/sdk";
 import { jsonSchemaOutputFormat } from "@anthropic-ai/sdk/helpers/index";
 
 import {
+  AI_REQUEST_TIMEOUT_MS,
   AIProviderResponseError,
+  raceWithTimeout,
   type AIProvider,
   type JSONSchema,
   type StructuredGenerationRequest,
@@ -26,14 +28,19 @@ export class AnthropicProvider implements AIProvider {
     const schema = { ...request.schema, type: "object" as const } as JSONSchema & { type: "object" };
     let message;
     try {
-      message = await this.client.messages.parse({
-        model: this.model,
-        max_tokens: request.maxTokens ?? 4096,
-        system: request.system,
-        output_config: { format: jsonSchemaOutputFormat(schema) },
-        messages: [{ role: "user", content: request.prompt }],
-      });
+      message = await raceWithTimeout(
+        this.client.messages.parse({
+          model: this.model,
+          max_tokens: request.maxTokens ?? 4096,
+          system: request.system,
+          output_config: { format: jsonSchemaOutputFormat(schema) },
+          messages: [{ role: "user", content: request.prompt }],
+        }),
+        AI_REQUEST_TIMEOUT_MS,
+        "Le fournisseur IA a mis trop de temps à répondre.",
+      );
     } catch (error) {
+      if (error instanceof AIProviderResponseError) throw error;
       throw new AIProviderResponseError(error instanceof Error ? error.message : "Anthropic request failed.");
     }
 

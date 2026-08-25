@@ -1,7 +1,9 @@
 import { GoogleGenAI } from "@google/genai";
 
 import {
+  AI_REQUEST_TIMEOUT_MS,
   AIProviderResponseError,
+  raceWithTimeout,
   type AIProvider,
   type JSONSchema,
   type StructuredGenerationRequest,
@@ -25,17 +27,22 @@ export class GeminiProvider implements AIProvider {
     const schema = { ...request.schema, type: "object" as const } as JSONSchema & { type: "object" };
     let response;
     try {
-      response = await this.client.models.generateContent({
-        model: this.model,
-        contents: request.prompt,
-        config: {
-          systemInstruction: request.system,
-          responseMimeType: "application/json",
-          responseJsonSchema: schema,
-          maxOutputTokens: request.maxTokens ?? 4096,
-        },
-      });
+      response = await raceWithTimeout(
+        this.client.models.generateContent({
+          model: this.model,
+          contents: request.prompt,
+          config: {
+            systemInstruction: request.system,
+            responseMimeType: "application/json",
+            responseJsonSchema: schema,
+            maxOutputTokens: request.maxTokens ?? 4096,
+          },
+        }),
+        AI_REQUEST_TIMEOUT_MS,
+        "Le fournisseur IA a mis trop de temps à répondre.",
+      );
     } catch (error) {
+      if (error instanceof AIProviderResponseError) throw error;
       throw new AIProviderResponseError(error instanceof Error ? error.message : "Gemini request failed.");
     }
 

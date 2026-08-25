@@ -19,6 +19,11 @@ const PROGRESS_STAGES = [
 
 const MANUAL_STEP_ORDER: SubStep[] = ["manual-1", "manual-2", "manual-3"];
 
+// Bounds the whole request (page fetches + AI call) so the UI always
+// resolves to a clear result instead of spinning indefinitely if
+// something downstream hangs — worst realistic case is well under this.
+const ANALYSIS_TIMEOUT_MS = 45_000;
+
 async function readJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
@@ -77,11 +82,20 @@ export function OnboardingOverlay({
     setProgressStage(0);
     progressTimer.current = setInterval(() => setProgressStage((current) => (current + 1) % PROGRESS_STAGES.length), 1800);
 
-    const response = await fetch("/api/business-context", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ website: website.trim() }),
-    });
+    let response: Response;
+    try {
+      response = await fetch("/api/business-context", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ website: website.trim() }),
+        signal: AbortSignal.timeout(ANALYSIS_TIMEOUT_MS),
+      });
+    } catch (error) {
+      if (progressTimer.current) clearInterval(progressTimer.current);
+      setFailureReason(error instanceof DOMException && error.name === "TimeoutError" ? "L'analyse a pris trop de temps et a été interrompue." : "Impossible de contacter le serveur.");
+      setStep("url-failed");
+      return;
+    }
     if (progressTimer.current) clearInterval(progressTimer.current);
 
     if (!response.ok) {

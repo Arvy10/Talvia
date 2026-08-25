@@ -22,6 +22,11 @@ const progressStages = [
   "Préparation de votre espace",
 ];
 
+// Bounds the whole request (page fetches + AI call) so the UI always
+// resolves to a clear result instead of spinning indefinitely if
+// something downstream hangs — worst realistic case is well under this.
+const ANALYSIS_TIMEOUT_MS = 45_000;
+
 async function readJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
@@ -78,11 +83,20 @@ export function OnboardingClient() {
   const runAnalysis = async (targetWebsite: string) => {
     setStep("analyzing");
     startProgressAnimation();
-    const response = await fetch("/api/business-context", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ website: targetWebsite }),
-    });
+    let response: Response;
+    try {
+      response = await fetch("/api/business-context", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ website: targetWebsite }),
+        signal: AbortSignal.timeout(ANALYSIS_TIMEOUT_MS),
+      });
+    } catch (error) {
+      stopProgressAnimation();
+      setFailureReason(error instanceof DOMException && error.name === "TimeoutError" ? "L'analyse a pris trop de temps et a été interrompue." : "Impossible de contacter le serveur.");
+      setStep("failed");
+      return;
+    }
     stopProgressAnimation();
 
     if (!response.ok) {
