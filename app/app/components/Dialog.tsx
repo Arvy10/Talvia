@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useId, useRef, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { LuX } from "react-icons/lu";
 
 import { IconButton } from "./ui";
@@ -80,24 +81,27 @@ export function Dialog({ open, onClose, title, description, children, className 
     };
   }, [open]);
 
-  if (!open) {
+  if (!open || typeof document === "undefined") {
     return null;
   }
 
-  return <div className="dialog-backdrop" onMouseDown={(event) => {
-    if (event.target === event.currentTarget) {
-      onClose();
-    }
-  }}>
-    <div aria-describedby={description ? descriptionId : undefined} aria-labelledby={titleId} aria-modal="true" className={`dialog${className ? ` ${className}` : ""}`} ref={dialogRef} role="dialog" tabIndex={-1}>
-      <header className="dialog__header">
-        <div>
-          <h2 id={titleId}>{title}</h2>
-          {description ? <p id={descriptionId}>{description}</p> : null}
-        </div>
-        <IconButton label="Fermer la fenêtre" onClick={onClose}><LuX aria-hidden="true" /></IconButton>
-      </header>
-      <div className="dialog__body">{children}</div>
-    </div>
-  </div>;
+  return createPortal(
+    <div className="dialog-backdrop" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) {
+        onClose();
+      }
+    }}>
+      <div aria-describedby={description ? descriptionId : undefined} aria-labelledby={titleId} aria-modal="true" className={`dialog${className ? ` ${className}` : ""}`} ref={dialogRef} role="dialog" tabIndex={-1}>
+        <header className="dialog__header">
+          <div>
+            <h2 id={titleId}>{title}</h2>
+            {description ? <p id={descriptionId}>{description}</p> : null}
+          </div>
+          <IconButton label="Fermer la fenêtre" onClick={onClose}><LuX aria-hidden="true" /></IconButton>
+        </header>
+        <div className="dialog__body">{children}</div>
+      </div>
+    </div>,
+    document.body,
+  );
 }
