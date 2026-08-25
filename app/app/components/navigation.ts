@@ -1,12 +1,5 @@
 import type { ComponentType } from "react";
-import { LuSettings, LuWorkflow } from "react-icons/lu";
-
-import ChartLineIcon from "./icons/ChartLineIcon";
-import HomeIcon from "./icons/HomeIcon";
-import MailIcon from "./icons/MailIcon";
-import PlugConnectedIcon from "./icons/PlugConnectedIcon";
-import SendIcon from "./icons/SendIcon";
-import UsersGroupIcon from "./icons/UsersGroupIcon";
+import { TbChartLine, TbHierarchy2, TbHome, TbInbox, TbPlugConnected, TbSend, TbSettings, TbUsers } from "react-icons/tb";
 
 export type ProductNavigationItem = {
   href: string;
@@ -16,12 +9,12 @@ export type ProductNavigationItem = {
 };
 
 export const productNavigation: ProductNavigationItem[] = [
-  { href: "/app", label: "Vue d’ensemble", icon: HomeIcon, group: "Pilotage" },
-  { href: "/app/inbox", label: "Inbox", icon: MailIcon, group: "Pilotage" },
-  { href: "/app/campaigns", label: "Campagnes", icon: SendIcon, group: "Pilotage" },
-  { href: "/app/opportunities", label: "Opportunités", icon: ChartLineIcon, group: "Relation" },
-  { href: "/app/contacts", label: "Contacts", icon: UsersGroupIcon, group: "Relation" },
-  { href: "/app/automations", label: "Automatisations", icon: LuWorkflow, group: "Relation" },
-  { href: "/app/connections", label: "Connexions", icon: PlugConnectedIcon, group: "Espace" },
-  { href: "/app/settings", label: "Paramètres", icon: LuSettings, group: "Espace" },
+  { href: "/app", label: "Vue d’ensemble", icon: TbHome, group: "Pilotage" },
+  { href: "/app/inbox", label: "Inbox", icon: TbInbox, group: "Pilotage" },
+  { href: "/app/campaigns", label: "Campagnes", icon: TbSend, group: "Pilotage" },
+  { href: "/app/opportunities", label: "Opportunités", icon: TbChartLine, group: "Relation" },
+  { href: "/app/contacts", label: "Contacts", icon: TbUsers, group: "Relation" },
+  { href: "/app/automations", label: "Automatisations", icon: TbHierarchy2, group: "Relation" },
+  { href: "/app/connections", label: "Connexions", icon: TbPlugConnected, group: "Espace" },
+  { href: "/app/settings", label: "Paramètres", icon: TbSettings, group: "Espace" },
 ];
