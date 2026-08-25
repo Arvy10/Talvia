@@ -4,6 +4,7 @@ import { jsonSchemaOutputFormat } from "@anthropic-ai/sdk/helpers/index";
 import {
   AI_REQUEST_TIMEOUT_MS,
   AIProviderResponseError,
+  describeProviderError,
   raceWithTimeout,
   type AIProvider,
   type JSONSchema,
@@ -41,14 +42,14 @@ export class AnthropicProvider implements AIProvider {
       );
     } catch (error) {
       if (error instanceof AIProviderResponseError) throw error;
-      throw new AIProviderResponseError(error instanceof Error ? error.message : "Anthropic request failed.");
+      throw new AIProviderResponseError(describeProviderError(error, "Anthropic"));
     }
 
     if (message.stop_reason === "refusal") {
-      throw new AIProviderResponseError(`Model refused the request (${message.stop_details?.category ?? "unknown category"}).`);
+      throw new AIProviderResponseError("Le modèle a refusé cette demande.");
     }
     if (!message.parsed_output) {
-      throw new AIProviderResponseError("Model response did not match the requested schema.");
+      throw new AIProviderResponseError("La réponse du modèle ne correspondait pas au schéma attendu.");
     }
 
     return {

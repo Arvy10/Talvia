@@ -43,3 +43,19 @@ export function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, timeo
     );
   });
 }
+
+// Anthropic/Gemini SDK errors often carry the raw HTTP error body as
+// `.message` (sometimes literal JSON like `{"error":{"code":503,...}}`) —
+// never worth showing a user directly. This turns whatever the SDK threw
+// into a short, actionable French message; the raw error itself is still
+// available to whoever calls console.error on it upstream.
+export function describeProviderError(error: unknown, providerLabel: string): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (/\b(503|UNAVAILABLE|overloaded|rate.?limit|429|TOO_MANY_REQUESTS)\b/i.test(raw)) {
+    return `Le service ${providerLabel} est temporairement surchargé. Réessayez dans quelques instants.`;
+  }
+  if (/\b(401|403|PERMISSION_DENIED|invalid.?api.?key|UNAUTHENTICATED)\b/i.test(raw)) {
+    return `Le service ${providerLabel} a refusé la demande (clé API invalide ou insuffisante).`;
+  }
+  return `Le service ${providerLabel} a rencontré un problème. Réessayez dans quelques instants.`;
+}

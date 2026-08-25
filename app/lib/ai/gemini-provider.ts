@@ -3,6 +3,7 @@ import { GoogleGenAI } from "@google/genai";
 import {
   AI_REQUEST_TIMEOUT_MS,
   AIProviderResponseError,
+  describeProviderError,
   raceWithTimeout,
   type AIProvider,
   type JSONSchema,
@@ -43,24 +44,24 @@ export class GeminiProvider implements AIProvider {
       );
     } catch (error) {
       if (error instanceof AIProviderResponseError) throw error;
-      throw new AIProviderResponseError(error instanceof Error ? error.message : "Gemini request failed.");
+      throw new AIProviderResponseError(describeProviderError(error, "Gemini"));
     }
 
     const finishReason = response.candidates?.[0]?.finishReason;
     if (finishReason && BLOCKING_FINISH_REASONS.has(finishReason)) {
-      throw new AIProviderResponseError(`Model refused or blocked the request (${finishReason}).`);
+      throw new AIProviderResponseError("Le modèle a refusé ou bloqué cette demande.");
     }
 
     const text = response.text;
     if (!text) {
-      throw new AIProviderResponseError("Model response did not contain any content.");
+      throw new AIProviderResponseError("Le modèle n'a renvoyé aucun contenu.");
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
     } catch {
-      throw new AIProviderResponseError("Model response was not valid JSON.");
+      throw new AIProviderResponseError("La réponse du modèle n'était pas un JSON valide.");
     }
 
     return {

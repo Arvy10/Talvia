@@ -1,3 +1,22 @@
+/* OnboardingGate portals OnboardingOverlay to document.body (same reason
+   Dialog.tsx does: backdrop-filter on the topbar/sidebar creates a CSS
+   containing block that breaks position:fixed if nested inside .talvia-app).
+   But every --app-* custom property is scoped to .talvia-app in app.css, so
+   anything portaled outside it can't see them — var(--app-coral) etc. would
+   silently resolve to nothing. Redeclaring them on :root keeps the portaled
+   overlay's colors working without touching the .talvia-app rule itself. */
+:root {
+  --app-bg: #0D0B10;
+  --app-surface: #16121B;
+  --app-raised: #201925;
+  --app-coral: #FF6B4A;
+  --app-violet: #8B5CF6;
+  --app-text: #F7F4F8;
+  --app-muted: #A9A2AE;
+  --app-border: #2D2632;
+  --app-success: #5DD6A0;
+}
+
 .onboarding-page { width: min(760px, 100%); margin: 0 auto; }
 
 .onboarding-card { padding: clamp(24px, 4vw, 40px); }
