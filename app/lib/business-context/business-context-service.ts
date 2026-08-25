@@ -222,6 +222,101 @@ function toRowFields(result: BusinessAnalysisResult): Partial<Row> {
   };
 }
 
+// Creates a blank active context for a workspace that skips website
+// analysis entirely — the review screen is then filled in by hand.
+export async function startManualBusinessContext(context: WorkspaceContext): Promise<BusinessContextRecord> {
+  return replaceActiveContext(context, { status: "ready", website: null, source: "manual", analysis_version: ANALYSIS_VERSION });
+}
+
+export type BusinessContextEditInput = {
+  companyName?: string;
+  businessDescription?: string;
+  services?: string[];
+  products?: string[];
+  keywords?: string[];
+  primaryLanguage?: string;
+  industry?: string;
+  valueProposition?: string;
+  targetCustomers?: string[];
+  targetIndustries?: string[];
+  targetCompanySizes?: string[];
+  targetRoles?: string[];
+  geographies?: string[];
+  painPoints?: string[];
+  salesAngles?: string[];
+};
+
+const SCORED_STRING_FIELDS = ["industry", "valueProposition"] as const;
+const SCORED_ARRAY_FIELDS = ["targetCustomers", "targetIndustries", "targetCompanySizes", "targetRoles", "geographies", "painPoints", "salesAngles"] as const;
+const PLAIN_FIELDS = ["companyName", "businessDescription", "services", "products", "keywords", "primaryLanguage"] as const;
+
+const COLUMN_BY_FIELD: Record<string, string> = {
+  companyName: "company_name",
+  businessDescription: "business_description",
+  services: "services",
+  products: "products",
+  keywords: "keywords",
+  primaryLanguage: "primary_language",
+  industry: "industry",
+  valueProposition: "value_proposition",
+  targetCustomers: "target_customers",
+  targetIndustries: "target_industries",
+  targetCompanySizes: "target_company_sizes",
+  targetRoles: "target_roles",
+  geographies: "geographies",
+  painPoints: "pain_points",
+  salesAngles: "sales_angles",
+};
+
+// A human editing a field is, by definition, asserting a fact — provenance
+// and confidence are overwritten accordingly rather than left at whatever
+// the AI originally guessed.
+export async function updateActiveBusinessContext(context: WorkspaceContext, input: BusinessContextEditInput): Promise<BusinessContextRecord | null> {
+  const existing = await getActiveBusinessContext(context);
+  if (!existing) return null;
+
+  const setClauses: string[] = [];
+  const values: unknown[] = [];
+  const editedFields = new Set(existing.manuallyEditedFields);
+  let index = 1;
+
+  for (const field of PLAIN_FIELDS) {
+    if (input[field] === undefined) continue;
+    setClauses.push(`${COLUMN_BY_FIELD[field]}=$${index}`);
+    values.push(Array.isArray(input[field]) ? JSON.stringify(input[field]) : input[field]);
+    editedFields.add(field);
+    index += 1;
+  }
+  for (const field of SCORED_STRING_FIELDS) {
+    if (input[field] === undefined) continue;
+    setClauses.push(`${COLUMN_BY_FIELD[field]}=$${index}`);
+    values.push(JSON.stringify({ value: input[field], provenance: "fact", confidence: 1 }));
+    editedFields.add(field);
+    index += 1;
+  }
+  for (const field of SCORED_ARRAY_FIELDS) {
+    if (input[field] === undefined) continue;
+    setClauses.push(`${COLUMN_BY_FIELD[field]}=$${index}`);
+    values.push(JSON.stringify({ value: input[field], provenance: "fact", confidence: 1 }));
+    editedFields.add(field);
+    index += 1;
+  }
+
+  if (setClauses.length === 0) return existing;
+
+  setClauses.push(`manually_edited_fields=$${index}`);
+  values.push(JSON.stringify(Array.from(editedFields)));
+  index += 1;
+  setClauses.push(`status='ready'`, `error_reason=null`, `updated_at=now()`);
+
+  values.push(context.workspaceId, existing.id);
+  const result = await database.query<Row>(
+    `update business_contexts set ${setClauses.join(",")} where workspace_id=$${index} and id=$${index + 1} returning *`,
+    values,
+  );
+  return result.rows[0] ? map(result.rows[0]) : null;
+}
+
 export async function runBusinessContextAnalysis(context: WorkspaceContext, website: string): Promise<BusinessContextRecord> {
   await assertNotRateLimited(context);
   const startedAt = Date.now();

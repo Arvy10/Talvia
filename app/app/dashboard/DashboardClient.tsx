@@ -1,7 +1,8 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import { LuArrowRight, LuInbox, LuMessageCircle, LuSend, LuSquareActivity, LuUnplug, LuWorkflow } from "react-icons/lu";
+import { LuArrowRight, LuInbox, LuMessageCircle, LuSend, LuSparkles, LuSquareActivity, LuUnplug, LuWorkflow } from "react-icons/lu";
 
 import { ChannelLogo } from "../connections/ChannelLogo";
 import { EmptyState, GlassCard, PageHeader, StatusBadge } from "../components/ui";
@@ -18,12 +19,19 @@ const shortcuts = [
 
 export function DashboardClient() {
   const { state } = useSandbox();
+  const [businessContextReady, setBusinessContextReady] = useState<boolean | null>(null);
   const connectedCount = getConnectedChannelCount(state);
   const remainingCount = channelMap.length - connectedCount;
   const messages = state.messages ?? [];
   const activities = state.activities ?? [];
   const inbound = messages.filter((message) => message.direction === "inbound").length;
   const activeCampaigns = (state.campaigns ?? []).filter((campaign) => campaign.status === "active").length;
+
+  useEffect(() => {
+    void fetch("/api/business-context").then((response) => (response.ok ? response.json() : null)).then((data: { businessContext: { status: string } | null } | null) => {
+      setBusinessContextReady(data?.businessContext?.status === "ready");
+    });
+  }, []);
 
   return <div className="dashboard-page">
     <PageHeader
@@ -32,6 +40,12 @@ export function DashboardClient() {
       description="Retrouvez les conversations à traiter, les prospects à relancer et les actions commerciales à poursuivre."
       actions={<Link className="connection-button" href="/app/connections"><LuUnplug aria-hidden="true" />Connexions</Link>}
     />
+
+    {businessContextReady === false ? <GlassCard className="dashboard-bc-banner">
+      <span className="dashboard-bc-banner__icon" aria-hidden="true"><LuSparkles /></span>
+      <div><h2>Configurez le profil de votre entreprise</h2><p>Talvia peut analyser votre site web pour préparer un profil utile à vos échanges commerciaux.</p></div>
+      <Link className="connection-button" href="/app/onboarding">Configurer<LuArrowRight aria-hidden="true" /></Link>
+    </GlassCard> : null}
 
     <GlassCard className="dashboard-setup">
       <div className="dashboard-setup__intro">

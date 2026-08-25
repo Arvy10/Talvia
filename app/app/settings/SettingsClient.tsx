@@ -16,6 +16,21 @@ type Workspace = {
   email: string;
 };
 
+type BusinessContextSummary = {
+  status: "pending" | "analyzing" | "ready" | "error" | "insufficient_content";
+  companyName: string | null;
+  industry: { value: string } | null;
+  website: string | null;
+};
+
+const businessContextStatusLabels: Record<BusinessContextSummary["status"], string> = {
+  pending: "En attente",
+  analyzing: "Analyse en cours",
+  ready: "Configuré",
+  error: "Analyse échouée",
+  insufficient_content: "Contenu insuffisant",
+};
+
 type Editor = "workspace" | "preferences" | "profile" | null;
 
 const localeLabels: Record<string, string> = { fr: "Français", en: "English" };
@@ -23,15 +38,17 @@ const localeLabels: Record<string, string> = { fr: "Français", en: "English" };
 export function SettingsClient() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [connections, setConnections] = useState(0);
+  const [businessContext, setBusinessContext] = useState<BusinessContextSummary | null | undefined>(undefined);
   const [editor, setEditor] = useState<Editor>(null);
   const [notice, setNotice] = useState("");
   const [aiDraft, setAiDraft] = useState<string | null>(null);
   const [aiSaving, setAiSaving] = useState(false);
 
   useEffect(() => {
-    void Promise.all([fetch("/api/workspace"), fetch("/api/connections")]).then(async ([a, b]) => {
+    void Promise.all([fetch("/api/workspace"), fetch("/api/connections"), fetch("/api/business-context")]).then(async ([a, b, c]) => {
       if (a.ok) setWorkspace((await a.json() as { workspace: Workspace }).workspace);
       if (b.ok) setConnections((await b.json() as { connections: Array<{ status: string }> }).connections.filter((item) => item.status === "connected").length);
+      if (c.ok) setBusinessContext((await c.json() as { businessContext: BusinessContextSummary | null }).businessContext);
     });
   }, []);
 
@@ -83,6 +100,13 @@ export function SettingsClient() {
         <div className="settings-row"><div className="settings-row__label"><strong>Nom du workspace</strong></div><span className="settings-row__value">{workspace?.name ?? "—"}</span><button className="settings-row__action" onClick={() => setEditor("workspace")} type="button">Modifier</button></div>
         <div className="settings-row"><div className="settings-row__label"><strong>Langue</strong></div><span className="settings-row__value">{localeLabels[workspace?.default_locale ?? "fr"] ?? workspace?.default_locale}</span><button className="settings-row__action" onClick={() => setEditor("preferences")} type="button">Modifier</button></div>
         <div className="settings-row"><div className="settings-row__label"><strong>Fuseau horaire</strong></div><span className="settings-row__value">{workspace?.default_timezone ?? "—"}</span></div>
+      </section>
+
+      <section className="settings-section">
+        <div className="settings-section__head"><h2>Entreprise</h2><p>Le profil que Talvia utilise pour comprendre votre activité et préparer vos échanges.</p></div>
+        {businessContext ? <>
+          <div className="settings-row"><div className="settings-row__label"><strong>{businessContext.companyName || "Profil sans nom"}</strong><small>{businessContext.industry?.value ?? businessContext.website ?? "—"}</small></div><span className={`settings-row__value${businessContext.status === "ready" ? " settings-row__value--positive" : ""}`}>{businessContextStatusLabels[businessContext.status]}</span><Link className="settings-row__action" href="/app/onboarding">Modifier</Link></div>
+        </> : businessContext === null ? <div className="settings-row"><div className="settings-row__label"><strong>Aucun profil configuré</strong><small>Analysez votre site web pour préremplir ce profil.</small></div><Link className="settings-row__action" href="/app/onboarding">Configurer</Link></div> : null}
       </section>
 
       <section className="settings-section">
