@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { LuChevronUp } from "react-icons/lu";
+import { LuChevronLeft, LuChevronRight, LuChevronUp } from "react-icons/lu";
 
 import { productNavigation } from "./navigation";
 import { SignOutButton } from "./SignOutButton";
@@ -17,10 +17,10 @@ function isActive(pathname: string, href: string) {
 }
 
 export function Sidebar({ pathname, drawer = false, onNavigate, collapsed = false, onToggle }: SidebarProps) {
-  const brand = <><span aria-hidden="true" className="app-brand__mark"><i /><i /><i /><i /></span><span>talvia</span></>;
+  const brand = <><span aria-hidden="true" className="app-brand__mark"><i /><i /><i /><i /></span><span className="app-brand__label">talvia</span></>;
 
   return <aside className={`${drawer ? "app-sidebar app-sidebar--drawer" : "app-sidebar"}${collapsed ? " is-collapsed" : ""}`}>
-    {onToggle ? <button aria-label={collapsed ? "Agrandir la navigation" : "Réduire la navigation"} className="app-brand app-brand--toggle" onClick={onToggle} title={collapsed ? "Agrandir la navigation" : "Réduire la navigation"} type="button">{brand}</button> : <Link aria-label="Accueil Talvia" className="app-brand" href="/app" onClick={onNavigate}>{brand}</Link>}
+    {onToggle ? <button aria-label={collapsed ? "Agrandir la navigation" : "Réduire la navigation"} className="app-brand app-brand--toggle" onClick={onToggle} title={collapsed ? "Agrandir la navigation" : "Réduire la navigation"} type="button">{brand}<span aria-hidden="true" className="app-brand__chevron">{collapsed ? <LuChevronRight /> : <LuChevronLeft />}</span></button> : <Link aria-label="Accueil Talvia" className="app-brand" href="/app" onClick={onNavigate}>{brand}</Link>}
     <nav aria-label="Navigation de l’application" className="app-navigation">
       {productNavigation.map((item, index) => {
         const Icon = item.icon;
