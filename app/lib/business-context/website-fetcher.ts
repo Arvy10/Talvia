@@ -61,6 +61,30 @@ async function resolvePinnedAddress(hostname: string): Promise<{ address: string
   return records[0]!;
 }
 
+type LookupOptions = { all?: boolean } | undefined;
+type LookupCallback =
+  | ((err: null, address: string, family: number) => void)
+  | ((err: null, addresses: Array<{ address: string; family: number }>) => void);
+
+// Pin the connection to the pre-validated IP; the original hostname is
+// still sent via SNI/Host so the site resolves normally. Node's
+// happy-eyeballs connector calls this with `{all: true}` and expects
+// callback(err, addresses[]) instead of callback(err, address, family) —
+// without handling both shapes, every request fails with
+// ERR_INVALID_IP_ADDRESS regardless of the target site (not a per-site
+// blocking issue — it broke 100% of requests until fixed).
+export function createPinnedLookup(pinned: { address: string; family: number }) {
+  return (_hostname: string, options: LookupOptions, callback: LookupCallback) => {
+    if (options?.all) {
+      (callback as (err: null, addresses: Array<{ address: string; family: number }>) => void)(null, [
+        { address: pinned.address, family: pinned.family },
+      ]);
+      return;
+    }
+    (callback as (err: null, address: string, family: number) => void)(null, pinned.address, pinned.family);
+  };
+}
+
 function fetchOnce(url: URL, pinned: { address: string; family: number }): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
   return new Promise((resolve, reject) => {
     const transport = url.protocol === "https:" ? https : http;
@@ -73,11 +97,8 @@ function fetchOnce(url: URL, pinned: { address: string; family: number }): Promi
         method: "GET",
         headers: { "user-agent": USER_AGENT, accept: "text/html,application/xhtml+xml" },
         timeout: REQUEST_TIMEOUT_MS,
-        // Pin the connection to the pre-validated IP; the original hostname
-        // is still sent via SNI/Host so the site resolves normally.
-        lookup: (_hostname, _options, callback) => {
-          callback(null, pinned.address, pinned.family);
-        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Node's LookupFunction overloads don't cleanly accept our unified handler
+        lookup: createPinnedLookup(pinned) as any,
       },
       (response) => {
         const chunks: Buffer[] = [];

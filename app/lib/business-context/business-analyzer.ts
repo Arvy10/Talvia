@@ -51,9 +51,11 @@ async function collectPages(website: string): Promise<{ pages: { url: string; te
       totalChars += extracted.text.length;
     } catch (error) {
       if (path === "") {
-        // Homepage is required; a failure there ends the crawl immediately.
-        if (error instanceof UnsafeUrlError) throw error;
-        break;
+        // Homepage is required — surface the real reason (blocked, timed
+        // out, wrong content-type…) instead of swallowing it into a vague
+        // "insufficient content" further down; that made every homepage
+        // failure indistinguishable from a genuinely thin site.
+        throw error;
       }
       // Secondary pages are best-effort — a missing /pricing page shouldn't fail the whole analysis.
     }
