@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { initialSandboxState } from "./reducer";
-import { loadSandboxState, saveSandboxState, STORAGE_KEY } from "./storage";
+import { loadSandboxState, sandboxStorageKey, saveSandboxState } from "./storage";
 
 const validContact = {
   id: "contact-1",
@@ -44,22 +44,22 @@ describe("sandbox storage", () => {
   });
 
   it("returns defaults when no saved state exists", () => {
-    expect(loadSandboxState()).toEqual(initialSandboxState);
+    expect(loadSandboxState(null)).toEqual(initialSandboxState);
   });
 
   it("returns defaults for malformed saved state", () => {
-    localStorage.setItem(STORAGE_KEY, "not json");
+    localStorage.setItem(sandboxStorageKey(null), "not json");
 
-    expect(loadSandboxState()).toEqual(initialSandboxState);
+    expect(loadSandboxState(null)).toEqual(initialSandboxState);
   });
 
   it("returns defaults for a saved state from another schema version", () => {
     localStorage.setItem(
-      STORAGE_KEY,
+      sandboxStorageKey(null),
       JSON.stringify({ ...initialSandboxState, schemaVersion: 2 }),
     );
 
-    expect(loadSandboxState()).toEqual(initialSandboxState);
+    expect(loadSandboxState(null)).toEqual(initialSandboxState);
   });
 
   it("returns a valid saved snapshot", () => {
@@ -70,9 +70,9 @@ describe("sandbox storage", () => {
         gmail: { status: "connected" as const },
       },
     };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+    localStorage.setItem(sandboxStorageKey(null), JSON.stringify(saved));
 
-    expect(loadSandboxState()).toEqual({
+    expect(loadSandboxState(null)).toEqual({
       ...saved,
       storageAvailable: true,
     });
@@ -96,18 +96,18 @@ describe("sandbox storage", () => {
     ["automation enabled", { automations: [{ ...validAutomation, enabled: "yes" }] }],
   ])("rejects a malformed nested %s field", (_field, invalidCollection) => {
     localStorage.setItem(
-      STORAGE_KEY,
+      sandboxStorageKey(null),
       JSON.stringify({ ...validPersistedSnapshot, ...invalidCollection }),
     );
 
-    expect(loadSandboxState()).toEqual(initialSandboxState);
+    expect(loadSandboxState(null)).toEqual(initialSandboxState);
   });
 
   it.each(["connecting", "syncing"] as const)(
     "normalizes a hydrated %s connection to disconnected",
     (status) => {
       localStorage.setItem(
-        STORAGE_KEY,
+        sandboxStorageKey(null),
         JSON.stringify({
           ...initialSandboxState,
           storageAvailable: undefined,
@@ -118,7 +118,7 @@ describe("sandbox storage", () => {
         }),
       );
 
-      expect(loadSandboxState().connections.linkedin.status).toBe(
+      expect(loadSandboxState(null).connections.linkedin.status).toBe(
         "disconnected",
       );
     },
@@ -133,17 +133,17 @@ describe("sandbox storage", () => {
           ...initialSandboxState.connections,
           linkedin: { status },
         },
-      });
+      }, null);
 
-      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
+      const saved = JSON.parse(localStorage.getItem(sandboxStorageKey(null)) ?? "{}");
       expect(saved.connections.linkedin.status).toBe("disconnected");
     },
   );
 
   it("does not persist the transient storage availability flag", () => {
-    saveSandboxState({ ...initialSandboxState, storageAvailable: false });
+    saveSandboxState({ ...initialSandboxState, storageAvailable: false }, null);
 
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
+    const saved = JSON.parse(localStorage.getItem(sandboxStorageKey(null)) ?? "{}");
 
     expect(saved).not.toHaveProperty("storageAvailable");
   });
@@ -153,7 +153,7 @@ describe("sandbox storage", () => {
       throw new Error("storage unavailable");
     });
 
-    expect(loadSandboxState()).toEqual(initialSandboxState);
+    expect(loadSandboxState(null)).toEqual(initialSandboxState);
   });
 
   it("restores availability after storage becomes healthy again", () => {
@@ -163,14 +163,14 @@ describe("sandbox storage", () => {
         throw new Error("storage unavailable");
       });
 
-    loadSandboxState();
+    loadSandboxState(null);
     getItem.mockRestore();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    localStorage.setItem(sandboxStorageKey(null), JSON.stringify({
       ...initialSandboxState,
       storageAvailable: false,
     }));
 
-    expect(loadSandboxState().storageAvailable).toBe(true);
+    expect(loadSandboxState(null).storageAvailable).toBe(true);
   });
 
   it("never throws when writing storage throws", () => {
@@ -178,6 +178,6 @@ describe("sandbox storage", () => {
       throw new Error("storage unavailable");
     });
 
-    expect(() => saveSandboxState(initialSandboxState)).not.toThrow();
+    expect(() => saveSandboxState(initialSandboxState, null)).not.toThrow();
   });
 });

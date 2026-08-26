@@ -13,7 +13,7 @@ vi.mock("next/navigation", () => ({
 }));
 
 import { SandboxProvider } from "../state/SandboxProvider";
-import { STORAGE_KEY } from "../state/storage";
+import { sandboxStorageKey } from "../state/storage";
 import { ContactsClient } from "./ContactsClient";
 
 afterEach(() => {
@@ -34,7 +34,7 @@ beforeEach(() => {
 describe("Contacts mobile detail flow", () => {
   it("opens a selected contact and returns to the contact list", async () => {
     localStorage.setItem(
-      STORAGE_KEY,
+      sandboxStorageKey(null),
       JSON.stringify({
         schemaVersion: 1,
         sessionActive: true,

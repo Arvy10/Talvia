@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from "react";
 
+import { authClient } from "../../lib/auth-client";
 import { initialSandboxState, sandboxReducer } from "./reducer";
 import {
   isSandboxStorageAvailable,
@@ -32,6 +33,10 @@ export function SandboxProvider({ children }: { children: ReactNode }) {
   const [hydrated, markHydrated] = useReducer(() => true, false);
   const storageAvailableRef = useRef(state.storageAvailable);
   storageAvailableRef.current = state.storageAvailable;
+  // Resolved once on mount and reused for every save — storage is scoped
+  // per user so a second person signing into the same browser never
+  // inherits the previous account's contacts, messages, or opportunities.
+  const userIdRef = useRef<string | null>(null);
   const {
     schemaVersion,
     sessionActive,
@@ -79,18 +84,34 @@ export function SandboxProvider({ children }: { children: ReactNode }) {
   );
 
   useEffect(() => {
-    const restoredState = loadSandboxState();
-    dispatch({
-      type: "RESTORE_SANDBOX_STATE",
-      state: {
-        ...restoredState,
-        storageAvailable: isSandboxStorageAvailable(),
-      },
-    });
-    if (!restoredState.sessionActive) {
-      dispatch({ type: "ACTIVATE_SANDBOX_SESSION" });
-    }
-    markHydrated();
+    let cancelled = false;
+    const hydrate = (userId: string | null) => {
+      if (cancelled) return;
+      userIdRef.current = userId;
+
+      const restoredState = loadSandboxState(userId);
+      dispatch({
+        type: "RESTORE_SANDBOX_STATE",
+        state: {
+          ...restoredState,
+          storageAvailable: isSandboxStorageAvailable(),
+        },
+      });
+      if (!restoredState.sessionActive) {
+        dispatch({ type: "ACTIVATE_SANDBOX_SESSION" });
+      }
+      markHydrated();
+    };
+    // A rejected session check (network hiccup, blocked request…) must
+    // still hydrate — falling back to the unscoped "anon" bucket — rather
+    // than leaving the app stuck on "loading" forever.
+    authClient.getSession().then(
+      (session) => hydrate(session.data?.user?.id ?? null),
+      () => hydrate(null),
+    );
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -98,7 +119,7 @@ export function SandboxProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    saveSandboxState(stateToPersist);
+    saveSandboxState(stateToPersist, userIdRef.current);
     const available = isSandboxStorageAvailable();
     if (available !== storageAvailableRef.current) {
       dispatch({ type: "SET_STORAGE_AVAILABILITY", available });

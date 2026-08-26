@@ -3,7 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { initialSandboxState } from "./reducer";
 import { SandboxProvider, useSandbox } from "./SandboxProvider";
-import { STORAGE_KEY } from "./storage";
+import { sandboxStorageKey } from "./storage";
+
+vi.mock("../../lib/auth-client", () => ({
+  authClient: { getSession: () => Promise.resolve({ data: null, error: null }) },
+}));
 
 afterEach(() => {
   cleanup();
@@ -40,7 +44,7 @@ describe("SandboxProvider", () => {
   it("activates and persists an inactive session after direct product hydration", async () => {
     const { storageAvailable: _storageAvailable, ...inactiveSnapshot } =
       initialSandboxState;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(inactiveSnapshot));
+    localStorage.setItem(sandboxStorageKey(null), JSON.stringify(inactiveSnapshot));
 
     render(
       <SandboxProvider>
@@ -52,7 +56,7 @@ describe("SandboxProvider", () => {
       expect(screen.getByLabelText("hydration").textContent).toBe("ready");
       expect(screen.getByLabelText("session").textContent).toBe("active");
       expect(
-        JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}").sessionActive,
+        JSON.parse(localStorage.getItem(sandboxStorageKey(null)) ?? "{}").sessionActive,
       ).toBe(true);
     });
   });

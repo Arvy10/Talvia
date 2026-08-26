@@ -12,7 +12,14 @@ import type {
   SandboxConversation,
 } from "./types";
 
-export const STORAGE_KEY = "talvia:sandbox:v1";
+// Scoped per user so a second person signing into the same browser never
+// sees the previous account's contacts, messages, or opportunities — this
+// was a single global key before, shared by every account on the device.
+const LEGACY_UNSCOPED_STORAGE_KEY = "talvia:sandbox:v1";
+
+export function sandboxStorageKey(userId: string | null): string {
+  return userId ? `talvia:sandbox:v1:${userId}` : "talvia:sandbox:v1:anon";
+}
 
 let storageAvailable = true;
 
@@ -173,13 +180,26 @@ function isPersistedSandboxState(value: unknown): value is PersistedSandboxState
   );
 }
 
-export function loadSandboxState(): SandboxState {
+// Removed once, best-effort, whenever we touch storage for a real user —
+// clears out any data left behind from before per-user scoping existed, so
+// it can't keep leaking to whoever uses this browser next.
+function removeLegacyUnscopedState(): void {
+  try {
+    window.localStorage.removeItem(LEGACY_UNSCOPED_STORAGE_KEY);
+  } catch {
+    // best-effort cleanup only
+  }
+}
+
+export function loadSandboxState(userId: string | null): SandboxState {
   if (typeof window === "undefined") {
     return createInitialSandboxState();
   }
 
+  removeLegacyUnscopedState();
+
   try {
-    const saved = window.localStorage.getItem(STORAGE_KEY);
+    const saved = window.localStorage.getItem(sandboxStorageKey(userId));
     storageAvailable = true;
     if (saved === null) {
       return createInitialSandboxState();
@@ -199,7 +219,7 @@ export function loadSandboxState(): SandboxState {
   }
 }
 
-export function saveSandboxState(state: SandboxState): void {
+export function saveSandboxState(state: SandboxState, userId: string | null): void {
   if (typeof window === "undefined") {
     return;
   }
@@ -219,10 +239,26 @@ export function saveSandboxState(state: SandboxState): void {
       ...(state.activities ? { activities: state.activities } : {}),
       ...(state.profile ? { profile: state.profile } : {}),
     };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedState));
+    window.localStorage.setItem(sandboxStorageKey(userId), JSON.stringify(persistedState));
     storageAvailable = true;
   } catch {
     storageAvailable = false;
+  }
+}
+
+// Called on sign-out so the next person to use this browser starts clean —
+// scoping the key by user already stops cross-account reads, but leaving
+// the previous account's data sitting in localStorage after they've
+// explicitly logged out is still worth cleaning up.
+export function clearSandboxState(userId: string | null): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.removeItem(sandboxStorageKey(userId));
+    removeLegacyUnscopedState();
+  } catch {
+    // best-effort cleanup only
   }
 }
 

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { initialSandboxState } from "./reducer";
 import { activateSandboxSession } from "./session";
-import { loadSandboxState, STORAGE_KEY } from "./storage";
+import { loadSandboxState, sandboxStorageKey } from "./storage";
 
 describe("sandbox session activation", () => {
   afterEach(() => {
@@ -30,9 +30,9 @@ describe("sandbox session activation", () => {
   });
 
   it("activates initial state when saved storage is malformed", () => {
-    localStorage.setItem(STORAGE_KEY, "not json");
+    localStorage.setItem(sandboxStorageKey(null), "not json");
 
-    expect(activateSandboxSession(loadSandboxState())).toEqual({
+    expect(activateSandboxSession(loadSandboxState(null))).toEqual({
       ...initialSandboxState,
       sessionActive: true,
     });
@@ -43,7 +43,7 @@ describe("sandbox session activation", () => {
 
     const activeState = activateSandboxSession(initialSandboxState);
     const persistedState = JSON.parse(
-      localStorage.getItem(STORAGE_KEY) ?? "{}",
+      localStorage.getItem(sandboxStorageKey(null)) ?? "{}",
     );
 
     expect(activeState).not.toHaveProperty("password");
