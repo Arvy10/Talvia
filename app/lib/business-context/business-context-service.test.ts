@@ -4,24 +4,34 @@ import type { BusinessAnalysisResult } from "./types";
 
 // business-context-service.ts talks to Postgres exclusively through
 // `database.query` / `database.connect`. This fake understands only the
-// handful of query shapes the service actually issues, and skips the
-// analysis-runs rate-limit lookup entirely — rate limiting isn't what this
-// file tests, and a real clock would make sequential calls flaky.
+// handful of query shapes the service actually issues.
 const JSON_COLUMNS = new Set([
   "services", "products", "keywords", "industry", "value_proposition", "customer_type",
   "target_customers", "target_industries", "target_company_sizes", "target_roles",
   "geographies", "pain_points", "sales_angles", "manually_edited_fields", "source_pages",
 ]);
 
+// Must exceed the service's own MIN_REANALYSIS_INTERVAL_MS (60s) so a
+// freshly "inserted" run doesn't trip the cooldown for the *next* call in
+// the same test by default — tests that specifically want to exercise the
+// cooldown/quota seed `runs` directly with a genuinely recent timestamp.
+const RUN_BACKDATE_MS = 70_000;
+
 function createFakeDatabase() {
   const contexts: Array<Record<string, unknown>> = [];
+  const runs: Array<Record<string, unknown>> = [];
   let idCounter = 0;
+  let runIdCounter = 0;
 
   async function query(sql: string, params: unknown[] = []) {
     const text = sql.replace(/\s+/g, " ").trim();
 
     if (text === "begin" || text === "commit" || text === "rollback") {
       return { rows: [] };
+    }
+
+    if (text.startsWith("select pg_advisory_xact_lock")) {
+      return { rows: [{ pg_advisory_xact_lock: null }] };
     }
 
     if (text.startsWith("select id,status")) {
@@ -79,11 +89,55 @@ function createFakeDatabase() {
     }
 
     if (text.startsWith("select created_at from business_context_analysis_runs")) {
-      return { rows: [] }; // rate-limit lookup intentionally short-circuited, see header comment
+      const workspaceId = params[0];
+      const matching = runs
+        .filter((r) => r.workspace_id === workspaceId)
+        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+      return { rows: matching[0] ? [{ created_at: matching[0].created_at }] : [] };
+    }
+
+    if (text.startsWith("select count(*)::text as count from business_context_analysis_runs")) {
+      const workspaceId = params[0];
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      const count = runs.filter((r) => r.workspace_id === workspaceId && new Date(String(r.created_at)).getTime() > cutoff).length;
+      return { rows: [{ count: String(count) }] };
     }
 
     if (text.startsWith("insert into business_context_analysis_runs")) {
-      return { rows: [] };
+      const [workspaceId, website, status] = params as string[];
+      const row: Record<string, unknown> = {
+        id: `run-${(runIdCounter += 1)}`,
+        workspace_id: workspaceId,
+        business_context_id: null,
+        website,
+        status,
+        pages_fetched: 0,
+        content_chars: 0,
+        duration_ms: 0,
+        ai_model: null,
+        input_tokens: null,
+        output_tokens: null,
+        error_reason: null,
+        created_at: new Date(Date.now() - RUN_BACKDATE_MS).toISOString(),
+      };
+      runs.push(row);
+      return { rows: [{ id: row.id }] };
+    }
+
+    if (text.startsWith("update business_context_analysis_runs set")) {
+      const [runId, businessContextId, status, pagesFetched, contentChars, durationMs, aiModel, inputTokens, outputTokens, errorReason] = params as unknown[];
+      const row = runs.find((r) => r.id === runId);
+      if (!row) return { rows: [] };
+      row.business_context_id = businessContextId ?? null;
+      row.status = status;
+      row.pages_fetched = pagesFetched;
+      row.content_chars = contentChars;
+      row.duration_ms = durationMs;
+      row.ai_model = aiModel ?? null;
+      row.input_tokens = inputTokens ?? null;
+      row.output_tokens = outputTokens ?? null;
+      row.error_reason = errorReason ?? null;
+      return { rows: [row] };
     }
 
     if (text.startsWith("update business_contexts set")) {
@@ -118,6 +172,7 @@ function createFakeDatabase() {
   return {
     query,
     connect: async () => ({ query, release: () => {} }),
+    runs,
   };
 }
 
@@ -127,7 +182,7 @@ vi.mock("../database", () => ({ get database() { return fakeDatabase; } }));
 const analyzeMock = vi.fn();
 vi.mock("./business-analyzer", () => ({ analyzeBusinessFromWebsite: (...args: unknown[]) => analyzeMock(...args) }));
 
-const { getActiveBusinessContext, runBusinessContextAnalysis, startManualBusinessContext, updateActiveBusinessContext } = await import("./business-context-service");
+const { getActiveBusinessContext, RateLimitedError, runBusinessContextAnalysis, startManualBusinessContext, updateActiveBusinessContext } = await import("./business-context-service");
 
 const context: WorkspaceContext = { authUserId: "auth-1", userId: "user-1", workspaceId: "ws-1", role: "owner" };
 
@@ -152,6 +207,18 @@ function analysisResult(overrides: Partial<BusinessAnalysisResult> = {}): Busine
     insufficientContent: false,
     ...overrides,
   };
+}
+
+function mockSuccessfulAnalysis(overrides: Partial<BusinessAnalysisResult> = {}) {
+  analyzeMock.mockResolvedValue({
+    status: "ready",
+    result: analysisResult(overrides),
+    model: "test-model",
+    usage: { inputTokens: 10, outputTokens: 10 },
+    sourcePages: ["https://entreprise.com"],
+    contentChars: 500,
+    pagesFetched: 1,
+  });
 }
 
 beforeEach(() => {
@@ -190,31 +257,15 @@ describe("business context service", () => {
   });
 
   it("does not silently overwrite a manually corrected field on the next analysis", async () => {
-    analyzeMock.mockResolvedValue({
-      status: "ready",
-      result: analysisResult({ targetCustomers: { value: ["PME"], provenance: "fact", confidence: 0.8 } }),
-      model: "test-model",
-      usage: { inputTokens: 10, outputTokens: 10 },
-      sourcePages: ["https://entreprise.com"],
-      contentChars: 500,
-      pagesFetched: 1,
-    });
+    mockSuccessfulAnalysis({ targetCustomers: { value: ["PME"], provenance: "fact", confidence: 0.8 } });
 
     await runBusinessContextAnalysis(context, "https://entreprise.com");
     await updateActiveBusinessContext(context, { targetCustomers: ["Cabinets médicaux"] });
 
     // Second analysis re-detects the same "PME" the model saw the first time.
-    analyzeMock.mockResolvedValue({
-      status: "ready",
-      result: analysisResult({
-        companyName: "Entreprise SAS (mise à jour)",
-        targetCustomers: { value: ["PME"], provenance: "fact", confidence: 0.85 },
-      }),
-      model: "test-model",
-      usage: { inputTokens: 10, outputTokens: 10 },
-      sourcePages: ["https://entreprise.com"],
-      contentChars: 520,
-      pagesFetched: 1,
+    mockSuccessfulAnalysis({
+      companyName: "Entreprise SAS (mise à jour)",
+      targetCustomers: { value: ["PME"], provenance: "fact", confidence: 0.85 },
     });
     await runBusinessContextAnalysis(context, "https://entreprise.com");
 
@@ -224,5 +275,50 @@ describe("business context service", () => {
     // Untouched fields still pick up the fresh analysis.
     expect(record?.companyName).toBe("Entreprise SAS (mise à jour)");
     expect(record?.manuallyEditedFields).toContain("targetCustomers");
+  });
+
+  describe("atomic analysis rate limiting (audit lot 2, P0 #1)", () => {
+    it("rejects a second analysis started inside the cooldown window", async () => {
+      mockSuccessfulAnalysis();
+      // Seed a genuinely recent run directly — a run inserted through the
+      // real reservation path is deliberately backdated by the fake (see
+      // RUN_BACKDATE_MS) so unrelated tests aren't flaky.
+      fakeDatabase.runs.push({ id: "run-seed", workspace_id: context.workspaceId, created_at: new Date().toISOString() });
+
+      await expect(runBusinessContextAnalysis(context, "https://entreprise.com")).rejects.toThrow(RateLimitedError);
+      expect(analyzeMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects analysis once the daily quota is reached", async () => {
+      mockSuccessfulAnalysis();
+      for (let i = 0; i < 10; i += 1) {
+        fakeDatabase.runs.push({
+          id: `run-seed-${i}`,
+          workspace_id: context.workspaceId,
+          // Within the 24h window but well outside the 60s cooldown.
+          created_at: new Date(Date.now() - RUN_BACKDATE_MS - i * 1000).toISOString(),
+        });
+      }
+
+      await expect(runBusinessContextAnalysis(context, "https://entreprise.com")).rejects.toThrow(RateLimitedError);
+      expect(analyzeMock).not.toHaveBeenCalled();
+    });
+
+    it("does not count another workspace's runs toward this workspace's quota or cooldown", async () => {
+      mockSuccessfulAnalysis();
+      fakeDatabase.runs.push({ id: "run-other", workspace_id: "ws-other", created_at: new Date().toISOString() });
+
+      const record = await runBusinessContextAnalysis(context, "https://entreprise.com");
+      expect(record.status).toBe("ready");
+    });
+
+    it("finalizes the run as failed instead of leaving it stuck 'running' when analysis throws unexpectedly", async () => {
+      analyzeMock.mockRejectedValue(new Error("boom"));
+
+      await expect(runBusinessContextAnalysis(context, "https://entreprise.com")).rejects.toThrow("boom");
+
+      const run = fakeDatabase.runs.find((r) => r.workspace_id === context.workspaceId);
+      expect(run?.status).toBe("failed");
+    });
   });
 });

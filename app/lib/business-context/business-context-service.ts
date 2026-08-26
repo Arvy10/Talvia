@@ -5,6 +5,7 @@ import type { BusinessAnalysisResult, CustomerType, ScoredField } from "./types"
 
 const ANALYSIS_VERSION = "1";
 const MIN_REANALYSIS_INTERVAL_MS = 60_000;
+const MAX_ANALYSES_PER_DAY = 10;
 
 export type BusinessContextStatus = "pending" | "analyzing" | "ready" | "error" | "insufficient_content";
 
@@ -112,14 +113,48 @@ export async function getActiveBusinessContext(context: WorkspaceContext): Promi
 
 export class RateLimitedError extends Error {}
 
-async function assertNotRateLimited(context: WorkspaceContext) {
-  const result = await database.query<{ created_at: string }>(
-    `select created_at from business_context_analysis_runs where workspace_id=$1 order by created_at desc limit 1`,
-    [context.workspaceId],
-  );
-  const last = result.rows[0];
-  if (last && Date.now() - new Date(last.created_at).getTime() < MIN_REANALYSIS_INTERVAL_MS) {
-    throw new RateLimitedError("Une analyse a déjà été lancée récemment. Merci de patienter avant de relancer.");
+// Reserves a run BEFORE the slow website fetch + AI call, inside a
+// transaction serialized by a per-workspace advisory lock — the previous
+// version only recorded a run's existence after the whole analysis
+// finished, so N concurrent requests could all see "no recent run" and
+// race past the cooldown/quota check together before any of them
+// committed anything. The lock forces them to queue; only the first to
+// acquire it sees an empty slot and inserts the reservation, so every
+// later one in the queue then sees that fresh row and gets rejected.
+async function reserveAnalysisRun(context: WorkspaceContext, website: string): Promise<string> {
+  const client = await database.connect();
+  try {
+    await client.query("begin");
+    await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [`business-context:${context.workspaceId}`]);
+
+    const last = await client.query<{ created_at: string }>(
+      `select created_at from business_context_analysis_runs where workspace_id=$1 order by created_at desc limit 1`,
+      [context.workspaceId],
+    );
+    const lastRun = last.rows[0];
+    if (lastRun && Date.now() - new Date(lastRun.created_at).getTime() < MIN_REANALYSIS_INTERVAL_MS) {
+      throw new RateLimitedError("Une analyse a déjà été lancée récemment. Merci de patienter avant de relancer.");
+    }
+
+    const dailyCount = await client.query<{ count: string }>(
+      `select count(*)::text as count from business_context_analysis_runs where workspace_id=$1 and created_at > now() - interval '24 hours'`,
+      [context.workspaceId],
+    );
+    if (Number(dailyCount.rows[0]!.count) >= MAX_ANALYSES_PER_DAY) {
+      throw new RateLimitedError("Limite quotidienne d'analyses atteinte pour ce workspace. Réessayez demain.");
+    }
+
+    const inserted = await client.query<{ id: string }>(
+      `insert into business_context_analysis_runs (workspace_id, website, status) values ($1,$2,'running') returning id`,
+      [context.workspaceId, website],
+    );
+    await client.query("commit");
+    return inserted.rows[0]!.id;
+  } catch (error) {
+    await client.query("rollback").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -180,21 +215,23 @@ async function replaceActiveContext(
   }
 }
 
-async function logRun(
-  context: WorkspaceContext,
+// Completes the row reserveAnalysisRun() inserted up front, rather than
+// inserting a fresh one — the reservation itself is what makes the quota
+// check atomic, so the same row has to carry both states.
+async function finalizeAnalysisRun(
+  runId: string,
   businessContextId: string | null,
-  website: string,
   status: "succeeded" | "failed" | "insufficient_content",
   fields: { pagesFetched: number; contentChars: number; durationMs: number; aiModel?: string | null; inputTokens?: number; outputTokens?: number; errorReason?: string },
 ) {
   await database.query(
-    `insert into business_context_analysis_runs
-      (workspace_id, business_context_id, website, status, pages_fetched, content_chars, duration_ms, ai_model, input_tokens, output_tokens, error_reason)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    `update business_context_analysis_runs
+     set business_context_id=$2, status=$3, pages_fetched=$4, content_chars=$5, duration_ms=$6,
+         ai_model=$7, input_tokens=$8, output_tokens=$9, error_reason=$10
+     where id=$1`,
     [
-      context.workspaceId,
+      runId,
       businessContextId,
-      website,
       status,
       fields.pagesFetched,
       fields.contentChars,
@@ -341,47 +378,63 @@ function preserveManualFields(existing: BusinessContextRecord | null, fresh: Par
 }
 
 export async function runBusinessContextAnalysis(context: WorkspaceContext, website: string): Promise<BusinessContextRecord> {
-  await assertNotRateLimited(context);
-  const existing = await getActiveBusinessContext(context);
+  const runId = await reserveAnalysisRun(context, website);
   const startedAt = Date.now();
-  const outcome = await analyzeBusinessFromWebsite(website);
-  const durationMs = Date.now() - startedAt;
 
-  if (outcome.status === "ready") {
+  try {
+    const existing = await getActiveBusinessContext(context);
+    const outcome = await analyzeBusinessFromWebsite(website);
+    const durationMs = Date.now() - startedAt;
+
+    if (outcome.status === "ready") {
+      const saved = await replaceActiveContext(context, {
+        status: "ready",
+        website,
+        ...preserveManualFields(existing, toRowFields(outcome.result)),
+        source: "website_analysis",
+        analysis_version: ANALYSIS_VERSION,
+        source_pages: outcome.sourcePages,
+        manually_edited_fields: existing?.manuallyEditedFields ?? [],
+        ai_model: outcome.model,
+      });
+      await finalizeAnalysisRun(runId, saved.id, "succeeded", {
+        pagesFetched: outcome.pagesFetched,
+        contentChars: outcome.contentChars,
+        durationMs,
+        aiModel: outcome.model,
+        inputTokens: outcome.usage.inputTokens,
+        outputTokens: outcome.usage.outputTokens,
+      });
+      return saved;
+    }
+
+    const status: BusinessContextStatus = outcome.status === "insufficient_content" ? "insufficient_content" : "error";
     const saved = await replaceActiveContext(context, {
-      status: "ready",
+      status,
       website,
-      ...preserveManualFields(existing, toRowFields(outcome.result)),
+      error_reason: outcome.reason,
       source: "website_analysis",
       analysis_version: ANALYSIS_VERSION,
-      source_pages: outcome.sourcePages,
-      manually_edited_fields: existing?.manuallyEditedFields ?? [],
-      ai_model: outcome.model,
     });
-    await logRun(context, saved.id, website, "succeeded", {
+    await finalizeAnalysisRun(runId, saved.id, outcome.status === "insufficient_content" ? "insufficient_content" : "failed", {
       pagesFetched: outcome.pagesFetched,
       contentChars: outcome.contentChars,
       durationMs,
-      aiModel: outcome.model,
-      inputTokens: outcome.usage.inputTokens,
-      outputTokens: outcome.usage.outputTokens,
+      errorReason: outcome.reason,
     });
     return saved;
+  } catch (error) {
+    // An unexpected exception (not one of the normal outcome branches
+    // above) must still resolve the reservation — otherwise it's left
+    // "running" forever and, combined with the cooldown/quota checks
+    // reading this same table, could keep blocking this workspace from
+    // ever analyzing again.
+    await finalizeAnalysisRun(runId, null, "failed", {
+      pagesFetched: 0,
+      contentChars: 0,
+      durationMs: Date.now() - startedAt,
+      errorReason: error instanceof Error ? error.message : "Erreur inattendue.",
+    }).catch(() => {});
+    throw error;
   }
-
-  const status: BusinessContextStatus = outcome.status === "insufficient_content" ? "insufficient_content" : "error";
-  const saved = await replaceActiveContext(context, {
-    status,
-    website,
-    error_reason: outcome.reason,
-    source: "website_analysis",
-    analysis_version: ANALYSIS_VERSION,
-  });
-  await logRun(context, saved.id, website, outcome.status === "insufficient_content" ? "insufficient_content" : "failed", {
-    pagesFetched: outcome.pagesFetched,
-    contentChars: outcome.contentChars,
-    durationMs,
-    errorReason: outcome.reason,
-  });
-  return saved;
 }
