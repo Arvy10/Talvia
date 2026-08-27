@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { LuX } from "react-icons/lu";
 
 import { listCountries } from "./countries";
@@ -9,6 +9,15 @@ const ALL_COUNTRIES = listCountries();
 
 export function CountryMultiSelect({ value, onChange }: { value: string[]; onChange: (next: string[]) => void }) {
   const [query, setQuery] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onClickOutside = (event: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setQuery("");
+    };
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, []);
 
   const suggestions = useMemo(() => {
     if (!query.trim()) return [];
@@ -22,7 +31,7 @@ export function CountryMultiSelect({ value, onChange }: { value: string[]; onCha
   };
   const remove = (name: string) => onChange(value.filter((item) => item !== name));
 
-  return <div className="country-picker">
+  return <div className="country-picker" ref={rootRef}>
     {value.length > 0 ? <div className="country-picker__chips">
       {value.map((name) => <span className="country-chip" key={name}>
         {name}
@@ -32,6 +41,7 @@ export function CountryMultiSelect({ value, onChange }: { value: string[]; onCha
     <div className="country-picker__search">
       <input
         onChange={(event) => setQuery(event.target.value)}
+        onKeyDown={(event) => { if (event.key === "Escape") setQuery(""); }}
         placeholder="Rechercher un pays…"
         type="text"
         value={query}

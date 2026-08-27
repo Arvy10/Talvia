@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { LuX } from "react-icons/lu";
 
 // Generalized version of the country picker: multi-value chips + a search
@@ -20,11 +20,27 @@ export function TagComboBox({
   allowCustom?: boolean;
 }) {
   const [query, setQuery] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  // Closing on outside click / Escape — without this the panel could stay
+  // open after the user clicked elsewhere, and with several of these
+  // stacked in the same step (target types, roles, industries, geography)
+  // an open one could sit on top of the fields/buttons below it.
+  useEffect(() => {
+    const onClickOutside = (event: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setQuery("");
+    };
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, []);
 
   const suggestions = useMemo(() => {
+    // A blank query must suggest nothing — showing the full option list
+    // (up to 8 items) by default meant this panel was effectively always
+    // open, not just while the user was actively searching.
+    if (!query.trim()) return [];
     const needle = query.trim().toLowerCase();
-    const base = needle ? options.filter((option) => option.toLowerCase().includes(needle)) : options;
-    return base.filter((option) => !value.includes(option)).slice(0, 8);
+    return options.filter((option) => option.toLowerCase().includes(needle) && !value.includes(option)).slice(0, 8);
   }, [query, options, value]);
 
   const add = (item: string) => {
@@ -38,7 +54,7 @@ export function TagComboBox({
     && !options.some((option) => option.toLowerCase() === trimmedQuery.toLowerCase())
     && !value.some((item) => item.toLowerCase() === trimmedQuery.toLowerCase());
 
-  return <div className="country-picker">
+  return <div className="country-picker" ref={rootRef}>
     {value.length > 0 ? <div className="country-picker__chips">
       {value.map((item) => <span className="country-chip" key={item}>
         {item}
@@ -49,6 +65,10 @@ export function TagComboBox({
       <input
         onChange={(event) => setQuery(event.target.value)}
         onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            setQuery("");
+            return;
+          }
           if (event.key === "Enter" && showCustomOption) {
             event.preventDefault();
             add(trimmedQuery);
