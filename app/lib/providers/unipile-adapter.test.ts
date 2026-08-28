@@ -91,6 +91,14 @@ function createFakeDatabase() {
       return { rows: [] };
     }
 
+    if (text.startsWith("delete from conversation_participants")) {
+      const [conversationId, contactId] = params as string[];
+      for (let i = participants.length - 1; i >= 0; i -= 1) {
+        if (participants[i]!.conversation_id === conversationId && participants[i]!.contact_id === contactId) participants.splice(i, 1);
+      }
+      return { rows: [] };
+    }
+
     if (text.startsWith("update conversations set last_message_at")) {
       const [conversationId] = params as string[];
       const row = conversations.find((c) => c.id === conversationId);
@@ -271,12 +279,14 @@ describe("ingestMessage", () => {
     // correct resolution ever ran against this thread.
     fakeDatabase.contacts.push({ id: "contact-self-bug", workspace_id: workspaceId, display_name: "Divin Nzabidi" });
     fakeDatabase.conversations.push({ id: "conv-poisoned", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-self-bug", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
+    fakeDatabase.participants.push({ conversation_id: "conv-poisoned", contact_id: "contact-self-bug", external_participant_id: "contact-self-bug" });
 
     const result = await ingestMessage(messagePayload());
 
     expect(result).toEqual({ status: "ingested" });
     const conversation = fakeDatabase.conversations.find((c) => c.id === "conv-poisoned");
     expect(conversation!.contact_id).not.toBe("contact-self-bug");
+    expect(fakeDatabase.participants.some((p) => p.conversation_id === "conv-poisoned" && p.contact_id === "contact-self-bug")).toBe(false);
     expect(fakeDatabase.contacts.find((c) => c.id === conversation!.contact_id)).toMatchObject({ display_name: "Jane Doe" });
   });
 });

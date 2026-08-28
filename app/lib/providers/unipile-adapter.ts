@@ -97,6 +97,9 @@ async function findOrCreateConversation(client: import("pg").PoolClient, workspa
     // counterparty this call actually resolved.
     if (existing.rows[0].contact_id !== contactId) {
       await client.query(`update conversations set contact_id=$2,updated_at=now() where id=$1`, [existing.rows[0].id, contactId]);
+      if (existing.rows[0].contact_id) {
+        await client.query(`delete from conversation_participants where conversation_id=$1 and contact_id=$2`, [existing.rows[0].id, existing.rows[0].contact_id]);
+      }
       await client.query(
         `insert into conversation_participants(conversation_id,contact_id,external_participant_id,role) values($1,$2,$3,'sender')
          on conflict(conversation_id,external_participant_id) do nothing`,
