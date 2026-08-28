@@ -63,10 +63,17 @@ function createFakeDatabase() {
       return { rows: [] };
     }
 
-    if (text.startsWith("select id from conversations")) {
+    if (text.startsWith("select id,contact_id from conversations")) {
       const [connectionId, externalThreadId] = params as string[];
       const row = conversations.find((c) => c.connection_id === connectionId && c.external_thread_id === externalThreadId);
-      return { rows: row ? [{ id: row.id }] : [] };
+      return { rows: row ? [{ id: row.id, contact_id: row.contact_id }] : [] };
+    }
+
+    if (text.startsWith("update conversations set contact_id")) {
+      const [conversationId, contactId] = params as string[];
+      const row = conversations.find((c) => c.id === conversationId);
+      if (row) row.contact_id = contactId;
+      return { rows: [] };
     }
 
     if (text.startsWith("insert into conversations")) {
@@ -255,5 +262,21 @@ describe("ingestMessage", () => {
     }));
     expect(result).toEqual({ status: "unknown_account" });
     expect(fakeDatabase.messages).toHaveLength(0);
+  });
+
+  it("reconciles a thread that a broken prior delivery pinned to the wrong Contact", async () => {
+    await connectAccount();
+    // Simulates a conversation a stale/pre-fix ingestion path already
+    // created against the workspace's own identity, before this run's
+    // correct resolution ever ran against this thread.
+    fakeDatabase.contacts.push({ id: "contact-self-bug", workspace_id: workspaceId, display_name: "Divin Nzabidi" });
+    fakeDatabase.conversations.push({ id: "conv-poisoned", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-self-bug", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
+
+    const result = await ingestMessage(messagePayload());
+
+    expect(result).toEqual({ status: "ingested" });
+    const conversation = fakeDatabase.conversations.find((c) => c.id === "conv-poisoned");
+    expect(conversation!.contact_id).not.toBe("contact-self-bug");
+    expect(fakeDatabase.contacts.find((c) => c.id === conversation!.contact_id)).toMatchObject({ display_name: "Jane Doe" });
   });
 });

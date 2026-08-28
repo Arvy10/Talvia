@@ -99,3 +99,63 @@ export function toConnectionStatus(unipileStatus: string): "connected" | "connec
   if (unipileStatus === "DELETED") return "disconnected";
   return "connecting";
 }
+
+// --- Historical sync (GET /chats, /chats/{id}/messages, /chats/{id}/attendees) ---
+// Field shapes below are confirmed against Unipile's live API, not just the
+// docs (which don't fully specify the message/attendee schema) — verified
+// with a real connected LinkedIn account during this integration.
+
+export type UnipileChat = {
+  id: string;
+  account_id: string;
+  account_type: string;
+  attendee_provider_id?: string;
+  timestamp: string | null;
+  archived: number;
+};
+
+export type UnipileChatMessage = {
+  id: string;
+  chat_id: string;
+  text: string;
+  is_sender: 0 | 1;
+  sender_id: string;
+  timestamp: string;
+  deleted: 0 | 1;
+};
+
+export type UnipileChatAttendee = {
+  id: string;
+  provider_id: string;
+  name?: string;
+  is_self: 0 | 1;
+  profile_url?: string;
+};
+
+async function unipileGet<T>(config: UnipileConfig, path: string): Promise<T> {
+  const response = await fetch(`${config.apiUrl}${path}`, { headers: { "X-API-KEY": config.apiKey, accept: "application/json" } });
+  if (!response.ok) throw new Error(`Unipile GET ${path} failed (${response.status}).`);
+  return response.json() as Promise<T>;
+}
+
+// https://developer.unipile.com/reference/chatscontroller_listallchats
+export async function listChats(config: UnipileConfig, accountId: string, cursor?: string): Promise<{ items: UnipileChat[]; cursor: string | null }> {
+  const params = new URLSearchParams({ account_id: accountId, limit: "100" });
+  if (cursor) params.set("cursor", cursor);
+  const data = await unipileGet<{ items: UnipileChat[]; cursor: string | null }>(config, `/api/v1/chats?${params.toString()}`);
+  return { items: data.items, cursor: data.cursor };
+}
+
+// https://developer.unipile.com/docs/get-messages — most recent first.
+export async function listChatMessages(config: UnipileConfig, chatId: string, cursor?: string): Promise<{ items: UnipileChatMessage[]; cursor: string | null }> {
+  const params = new URLSearchParams({ limit: "100" });
+  if (cursor) params.set("cursor", cursor);
+  const data = await unipileGet<{ items: UnipileChatMessage[]; cursor: string | null }>(config, `/api/v1/chats/${chatId}/messages?${params.toString()}`);
+  return { items: data.items, cursor: data.cursor };
+}
+
+// https://developer.unipile.com/reference/chatscontroller_listattendees
+export async function listChatAttendees(config: UnipileConfig, chatId: string): Promise<UnipileChatAttendee[]> {
+  const data = await unipileGet<{ items: UnipileChatAttendee[] }>(config, `/api/v1/chats/${chatId}/attendees`);
+  return data.items;
+}
