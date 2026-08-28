@@ -31,7 +31,7 @@ export async function PATCH(request: Request) {
     const provider = input.channel === "email" ? "gmail" : input.channel;
     const result = await database.query(
       `insert into connections(workspace_id,provider,channel_type,external_account_id,display_name,status,connected_at,last_synced_at)
-       values($1,$2,$3,$4,$5,$6,case when $6='connected' then now() else null end,case when $6='connected' then now() else null end)
+       values($1,$2,$3,$4,$5,$6,case when $6::varchar='connected' then now() else null end,case when $6::varchar='connected' then now() else null end)
        on conflict(workspace_id,provider,external_account_id) do update set status=excluded.status,connected_at=case when excluded.status='connected' then now() else connections.connected_at end,last_synced_at=case when excluded.status='connected' then now() else connections.last_synced_at end
        returning id,provider,channel_type,status,display_name,connected_at,last_synced_at`,
       [context.workspaceId, provider, input.channel, `local:${context.workspaceId}:${provider}`, provider === "gmail" ? "Gmail" : provider === "linkedin" ? "LinkedIn" : "WhatsApp", input.status],

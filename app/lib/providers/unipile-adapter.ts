@@ -30,7 +30,7 @@ export async function ingestHostedAuthNotification(payload: UnipileHostedAuthNot
   const status = toConnectionStatus(payload.status);
   await database.query(
     `insert into connections(workspace_id,provider,channel_type,external_account_id,display_name,status,connected_at,last_synced_at)
-     values($1,$2,$3,$4,$5,$6,case when $6='connected' then now() else null end,case when $6='connected' then now() else null end)
+     values($1,$2,$3,$4,$5,$6,case when $6::varchar='connected' then now() else null end,case when $6::varchar='connected' then now() else null end)
      on conflict(workspace_id,provider,external_account_id) do update set
        status=excluded.status,
        connected_at=case when excluded.status='connected' then now() else connections.connected_at end,
@@ -44,8 +44,8 @@ export async function ingestHostedAuthNotification(payload: UnipileHostedAuthNot
 export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["AccountStatus"]) {
   await database.query(
     `update connections set status=$1,
-       connected_at=case when $1='connected' then now() else connected_at end,
-       last_synced_at=case when $1='connected' then now() else last_synced_at end,
+       connected_at=case when $1::varchar='connected' then now() else connected_at end,
+       last_synced_at=case when $1::varchar='connected' then now() else last_synced_at end,
        updated_at=now()
      where provider=$2 and external_account_id=$3`,
     [toConnectionStatus(payload.message), PROVIDER, payload.account_id],

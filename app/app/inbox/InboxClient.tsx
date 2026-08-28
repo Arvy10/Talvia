@@ -114,6 +114,27 @@ export function InboxClient() {
   const activeContact = contacts.find(
     (contact) => contact.id === activeThread?.contactId,
   );
+
+  // The list endpoint only carries each conversation's latest message (for
+  // the preview line); the full history is fetched here once a thread is
+  // actually open, so the list stays cheap regardless of conversation length.
+  const loadThreadMessages = async (conversationId: string) => {
+    const response = await fetch(`/api/inbox/conversations/${conversationId}`);
+    if (!response.ok) return;
+    const data = (await response.json()) as { conversation?: ApiConversation };
+    if (!data.conversation) return;
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === conversationId
+          ? { ...conversation, messages: data.conversation!.messages }
+          : conversation,
+      ),
+    );
+  };
+  useEffect(() => {
+    if (activeThread) void loadThreadMessages(activeThread.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeThread?.id]);
   // A conversation can only start on a channel Talvia is actually connected
   // to — otherwise nothing would ever be sent, even though the contact
   // happens to have a phone number or email on file.
@@ -172,6 +193,7 @@ export function InboxClient() {
     setDraft("");
     setAiOpen(false);
     await refresh();
+    await loadThreadMessages(activeThread.id);
   };
   const useAi = (mode: ReplyMode) => {
     setDraft(
