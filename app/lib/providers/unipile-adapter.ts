@@ -102,11 +102,30 @@ async function findOrCreateConversation(client: import("pg").PoolClient, workspa
 
 export type IngestResult = { status: "ingested" | "duplicate" | "unknown_account" };
 
+type Attendee = NonNullable<UnipileNewMessagePayload["sender"]>;
+
+// Unipile's webhook always reports `sender` as whoever actually sent the
+// message — including when it's us. Comparing sender.attendee_provider_id
+// against account_info.user_id (per Unipile's own docs) is the only way to
+// tell an outbound message apart from an inbound one; get this wrong and
+// every conversation's Contact ends up being the workspace's own LinkedIn
+// identity instead of the person actually being talked to.
+function resolveCounterparty(payload: UnipileNewMessagePayload): { attendee: Attendee; isOutbound: boolean } | null {
+  const selfId = payload.account_info?.user_id;
+  const isOutbound = Boolean(selfId && payload.sender?.attendee_provider_id === selfId);
+  if (!isOutbound) return payload.sender ? { attendee: payload.sender, isOutbound: false } : null;
+  const other = payload.attendees?.find((attendee) => attendee.attendee_provider_id !== selfId);
+  return other ? { attendee: other, isOutbound: true } : null;
+}
+
 // Idempotent by (conversation_id, provider_message_id) — a redelivered
 // webhook for a message we already stored is a safe no-op, matching the
 // same unique-constraint pattern createTestInbound() uses in lib/inbox.ts.
-export async function ingestInboundMessage(payload: UnipileNewMessagePayload): Promise<IngestResult> {
-  if (payload.event !== "message_received" || !payload.sender) return { status: "unknown_account" };
+export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<IngestResult> {
+  if (payload.event !== "message_received") return { status: "unknown_account" };
+  const resolved = resolveCounterparty(payload);
+  if (!resolved) return { status: "unknown_account" };
+  const { attendee: counterparty, isOutbound } = resolved;
 
   const client = await database.connect();
   try {
@@ -121,15 +140,17 @@ export async function ingestInboundMessage(payload: UnipileNewMessagePayload): P
     }
     const { id: connectionId, workspace_id: workspaceId, channel_type: channelType } = connection.rows[0];
 
-    const contactId = await findOrCreateContact(client, workspaceId, payload.sender.attendee_provider_id, payload.sender.attendee_profile_url, payload.sender.attendee_name ?? "");
+    const contactId = await findOrCreateContact(client, workspaceId, counterparty.attendee_provider_id, counterparty.attendee_profile_url, counterparty.attendee_name ?? "");
     const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, channelType, payload.chat_id, contactId);
 
+    const direction = isOutbound ? "outbound" : "inbound";
+    const status = isOutbound ? "sent" : "received";
     const inserted = await client.query<{ id: string }>(
-      `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,received_at)
-       values($1,$2,'inbound',$3,$4,'received',$5,now())
+      `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at)
+       values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then now() else null end,case when $3::varchar='inbound' then now() else null end)
        on conflict(conversation_id,provider_message_id) where provider_message_id is not null do nothing
        returning id`,
-      [workspaceId, conversationId, contactId, payload.message ?? "", payload.message_id],
+      [workspaceId, conversationId, direction, isOutbound ? null : contactId, payload.message ?? "", status, payload.message_id],
     );
     if (!inserted.rows[0]) {
       await client.query("rollback");
@@ -138,7 +159,7 @@ export async function ingestInboundMessage(payload: UnipileNewMessagePayload): P
 
     await client.query(`update conversations set last_message_at=now(),updated_at=now() where id=$1`, [conversationId]);
     const activity = await recordSystemActivity(workspaceId, {
-      eventType: "message.received",
+      eventType: isOutbound ? "message.sent" : "message.received",
       entityType: "conversation",
       entityId: conversationId,
       metadata: { conversationId, connectionId },

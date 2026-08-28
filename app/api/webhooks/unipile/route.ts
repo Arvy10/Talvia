@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getUnipileConfig, isAccountStatusPayload, isHostedAuthNotifyPayload, type UnipileNewMessagePayload, type UnipileWebhookPayload } from "../../../lib/providers/unipile";
-import { ingestAccountStatus, ingestHostedAuthNotification, ingestInboundMessage } from "../../../lib/providers/unipile-adapter";
+import { ingestAccountStatus, ingestHostedAuthNotification, ingestMessage } from "../../../lib/providers/unipile-adapter";
 
 export const runtime = "nodejs";
 
@@ -33,7 +33,7 @@ export async function POST(request: Request) {
     } else if (isAccountStatusPayload(payload)) {
       await ingestAccountStatus(payload.AccountStatus);
     } else {
-      await ingestInboundMessage(payload as UnipileNewMessagePayload);
+      await ingestMessage(payload as UnipileNewMessagePayload);
     }
     return NextResponse.json({ ok: true });
   } catch (error) {

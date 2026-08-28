@@ -92,11 +92,11 @@ function createFakeDatabase() {
     }
 
     if (text.startsWith("insert into messages")) {
-      const [workspaceId, conversationId, senderContactId, body, providerMessageId] = params as string[];
+      const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId] = params as string[];
       if (messages.some((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId)) {
         return { rows: [] }; // on conflict do nothing
       }
-      const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, sender_contact_id: senderContactId, body, provider_message_id: providerMessageId };
+      const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, direction, sender_contact_id: senderContactId, body, status, provider_message_id: providerMessageId };
       messages.push(row);
       return { rows: [{ id: row.id }] };
     }
@@ -117,7 +117,7 @@ function createFakeDatabase() {
 let fakeDatabase = createFakeDatabase();
 vi.mock("../database", () => ({ get database() { return fakeDatabase; } }));
 
-const { ingestAccountStatus, ingestHostedAuthNotification, ingestInboundMessage } = await import("./unipile-adapter");
+const { ingestAccountStatus, ingestHostedAuthNotification, ingestMessage } = await import("./unipile-adapter");
 
 beforeEach(() => { fakeDatabase = createFakeDatabase(); });
 
@@ -128,10 +128,13 @@ function connectAccount(status = "OK") {
   return ingestHostedAuthNotification({ status, account_id: accountId, name: `${workspaceId}::linkedin` } satisfies UnipileHostedAuthNotifyPayload);
 }
 
+const selfUserId = "linkedin-self-divin";
+
 function messagePayload(overrides: Partial<UnipileNewMessagePayload> = {}): UnipileNewMessagePayload {
   return {
     account_id: accountId,
     account_type: "LINKEDIN",
+    account_info: { type: "LINKEDIN", user_id: selfUserId },
     event: "message_received",
     chat_id: "chat-1",
     timestamp: new Date().toISOString(),
@@ -163,16 +166,16 @@ describe("ingestAccountStatus", () => {
   });
 });
 
-describe("ingestInboundMessage", () => {
+describe("ingestMessage", () => {
   it("returns unknown_account when no connection matches the payload's account_id", async () => {
-    const result = await ingestInboundMessage(messagePayload());
+    const result = await ingestMessage(messagePayload());
     expect(result).toEqual({ status: "unknown_account" });
     expect(fakeDatabase.messages).toHaveLength(0);
   });
 
   it("creates a Contact, Conversation, and Message on the first message from a new sender", async () => {
     await connectAccount();
-    const result = await ingestInboundMessage(messagePayload());
+    const result = await ingestMessage(messagePayload());
     expect(result).toEqual({ status: "ingested" });
     expect(fakeDatabase.contacts).toHaveLength(1);
     expect(fakeDatabase.contactIdentities).toHaveLength(1);
@@ -182,8 +185,8 @@ describe("ingestInboundMessage", () => {
 
   it("reuses the same Contact and Conversation for a second message from the same sender/thread", async () => {
     await connectAccount();
-    await ingestInboundMessage(messagePayload({ message_id: "msg-provider-1" }));
-    await ingestInboundMessage(messagePayload({ message_id: "msg-provider-2", message: "Une deuxième question." }));
+    await ingestMessage(messagePayload({ message_id: "msg-provider-1" }));
+    await ingestMessage(messagePayload({ message_id: "msg-provider-2", message: "Une deuxième question." }));
     expect(fakeDatabase.contacts).toHaveLength(1);
     expect(fakeDatabase.conversations).toHaveLength(1);
     expect(fakeDatabase.messages).toHaveLength(2);
@@ -191,16 +194,16 @@ describe("ingestInboundMessage", () => {
 
   it("is idempotent: redelivering the same provider_message_id does not duplicate the message", async () => {
     await connectAccount();
-    await ingestInboundMessage(messagePayload());
-    const redelivered = await ingestInboundMessage(messagePayload());
+    await ingestMessage(messagePayload());
+    const redelivered = await ingestMessage(messagePayload());
     expect(redelivered).toEqual({ status: "duplicate" });
     expect(fakeDatabase.messages).toHaveLength(1);
   });
 
   it("creates a separate Contact for a different sender on the same connection", async () => {
     await connectAccount();
-    await ingestInboundMessage(messagePayload());
-    await ingestInboundMessage(messagePayload({
+    await ingestMessage(messagePayload());
+    await ingestMessage(messagePayload({
       chat_id: "chat-2",
       message_id: "msg-provider-3",
       sender: { attendee_id: "att-2", attendee_name: "John Smith", attendee_provider_id: "linkedin-john" },
@@ -215,12 +218,42 @@ describe("ingestInboundMessage", () => {
     fakeDatabase.contacts.push({ id: "contact-manual", workspace_id: workspaceId, display_name: "Jane Doe" });
     fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-manual", channel_type: "linkedin", identifier_normalized: "linkedin.com/in/jane-doe" });
 
-    const result = await ingestInboundMessage(messagePayload({
+    const result = await ingestMessage(messagePayload({
       sender: { attendee_id: "att-1", attendee_name: "Jane Doe", attendee_provider_id: "linkedin-jane", attendee_profile_url: "https://www.linkedin.com/in/jane-doe/" },
     }));
 
     expect(result).toEqual({ status: "ingested" });
     expect(fakeDatabase.contacts).toHaveLength(1);
     expect(fakeDatabase.messages[0]!.sender_contact_id).toBe("contact-manual");
+  });
+
+  it("attaches an outbound message to the recipient's Contact, not the workspace's own LinkedIn identity", async () => {
+    await connectAccount();
+    // Unipile reports `sender` as whoever actually sent it — here, us. The
+    // real prospect only shows up in `attendees`.
+    const result = await ingestMessage(messagePayload({
+      message_id: "msg-provider-outbound-1",
+      message: "Merci pour votre message, je vous recontacte rapidement.",
+      sender: { attendee_id: "att-self", attendee_name: "Divin Nzabidi", attendee_provider_id: selfUserId },
+      attendees: [
+        { attendee_id: "att-self", attendee_name: "Divin Nzabidi", attendee_provider_id: selfUserId },
+        { attendee_id: "att-1", attendee_name: "Jane Doe", attendee_provider_id: "linkedin-jane", attendee_profile_url: "https://www.linkedin.com/in/jane-doe/" },
+      ],
+    }));
+
+    expect(result).toEqual({ status: "ingested" });
+    expect(fakeDatabase.contacts).toHaveLength(1);
+    expect(fakeDatabase.contacts[0]).toMatchObject({ display_name: "Jane Doe" });
+    expect(fakeDatabase.messages[0]).toMatchObject({ direction: "outbound", status: "sent", sender_contact_id: null });
+  });
+
+  it("returns unknown_account for an outbound message when no other attendee is present", async () => {
+    await connectAccount();
+    const result = await ingestMessage(messagePayload({
+      sender: { attendee_id: "att-self", attendee_name: "Divin Nzabidi", attendee_provider_id: selfUserId },
+      attendees: [{ attendee_id: "att-self", attendee_name: "Divin Nzabidi", attendee_provider_id: selfUserId }],
+    }));
+    expect(result).toEqual({ status: "unknown_account" });
+    expect(fakeDatabase.messages).toHaveLength(0);
   });
 });
