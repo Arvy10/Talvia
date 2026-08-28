@@ -49,10 +49,17 @@ function createFakeDatabase() {
     }
 
     if (text.startsWith("insert into contacts")) {
-      const [workspaceId, firstName, lastName, displayName] = params as string[];
-      const row = { id: nextId("contact"), workspace_id: workspaceId, first_name: firstName, last_name: lastName, display_name: displayName };
+      const [workspaceId, firstName, lastName, displayName, jobTitle] = params as string[];
+      const row = { id: nextId("contact"), workspace_id: workspaceId, first_name: firstName, last_name: lastName, display_name: displayName, job_title: jobTitle ?? null };
       contacts.push(row);
       return { rows: [{ id: row.id }] };
+    }
+
+    if (text.startsWith("update contacts set job_title")) {
+      const [contactId, jobTitle] = params as string[];
+      const row = contacts.find((c) => c.id === contactId);
+      if (row && (!row.job_title || row.job_title === "")) row.job_title = jobTitle;
+      return { rows: [] };
     }
 
     if (text.startsWith("insert into contact_identities")) {
@@ -142,6 +149,23 @@ function createFakeDatabase() {
       return { rows: [{ id: message.id }] };
     }
 
+    if (text.startsWith("select m.provider_message_id,m.sent_at,m.direction")) {
+      const [workspaceId, messageId, provider] = params as string[];
+      const message = messages.find((m) => m.id === messageId && m.workspace_id === workspaceId);
+      if (!message) return { rows: [] };
+      const conversation = conversations.find((c) => c.id === message.conversation_id);
+      const connection = conversation ? connections.find((c) => c.id === conversation.connection_id && c.provider === provider) : undefined;
+      if (!connection) return { rows: [] };
+      return { rows: [{ provider_message_id: message.provider_message_id, sent_at: message.sent_at ?? message.created_at, direction: message.direction }] };
+    }
+
+    if (text.startsWith("update messages set body=")) {
+      const [body, messageId] = params as string[];
+      const row = messages.find((m) => m.id === messageId);
+      if (row) { row.body = body; row.edited = true; }
+      return { rows: [] };
+    }
+
     if (text.startsWith("select v.external_thread_id,c.external_account_id,c.status")) {
       const [workspaceId, conversationId, provider] = params as string[];
       const conversation = conversations.find((c) => c.id === conversationId && c.workspace_id === workspaceId);
@@ -163,15 +187,17 @@ vi.mock("../database", () => ({ get database() { return fakeDatabase; } }));
 // sendMessage's own DB logic is what's under test here — sendChatMessage
 // itself is a real network call to Unipile, mocked to isolate that.
 const sendChatMessageMock = vi.hoisted(() => vi.fn(async () => "provider-msg-outbound-1"));
+const editChatMessageMock = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock("./unipile", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./unipile")>()),
   getUnipileConfig: () => ({ apiKey: "test-key", apiUrl: "https://api.test", webhookSecret: "test-secret", appBaseUrl: "https://app.test" }),
   sendChatMessage: sendChatMessageMock,
+  editChatMessage: editChatMessageMock,
 }));
 
-const { ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, sendMessage } = await import("./unipile-adapter");
+const { editMessage, ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, sendMessage } = await import("./unipile-adapter");
 
-beforeEach(() => { fakeDatabase = createFakeDatabase(); sendChatMessageMock.mockClear(); });
+beforeEach(() => { fakeDatabase = createFakeDatabase(); sendChatMessageMock.mockClear(); editChatMessageMock.mockClear(); });
 
 const workspaceId = "ws-1";
 const accountId = "acct-unipile-1";
@@ -388,5 +414,46 @@ describe("ingestMessage — delivery/read receipts", () => {
     fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
     const result = await ingestMessage({ ...messagePayload(), event: "message_read", chat_id: "chat-1", message_id: "never-sent" });
     expect(result).toEqual({ status: "duplicate" });
+  });
+});
+
+describe("editMessage", () => {
+  async function sendAndGetMessageId() {
+    await connectAccount();
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
+    const sent = await sendMessage(workspaceId, "conv-1", "Salut frre");
+    return sent.id;
+  }
+
+  it("edits a recently-sent outbound message via Unipile and updates the local body", async () => {
+    const messageId = await sendAndGetMessageId();
+
+    await editMessage(workspaceId, messageId, "Salut frère");
+
+    expect(editChatMessageMock).toHaveBeenCalledWith(expect.anything(), "provider-msg-outbound-1", "Salut frère");
+    expect(fakeDatabase.messages[0]!.body).toBe("Salut frère");
+  });
+
+  it("refuses to edit a message older than LinkedIn's 60-minute window", async () => {
+    const messageId = await sendAndGetMessageId();
+    fakeDatabase.messages[0]!.sent_at = new Date(Date.now() - 61 * 60 * 1000).toISOString();
+
+    await expect(editMessage(workspaceId, messageId, "Trop tard")).rejects.toThrow();
+    expect(editChatMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses to edit an inbound message", async () => {
+    await connectAccount();
+    await ingestMessage(messagePayload());
+    const inboundId = fakeDatabase.messages[0]!.id as string;
+
+    await expect(editMessage(workspaceId, inboundId, "Non merci")).rejects.toThrow();
+    expect(editChatMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses to edit a message that doesn't belong to the workspace", async () => {
+    const messageId = await sendAndGetMessageId();
+    await expect(editMessage("other-workspace", messageId, "Nope")).rejects.toThrow();
+    expect(editChatMessageMock).not.toHaveBeenCalled();
   });
 });

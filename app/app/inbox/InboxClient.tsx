@@ -13,6 +13,7 @@ import {
   LuEllipsis,
   LuInbox,
   LuMessageCircle,
+  LuPencil,
   LuPlus,
   LuSearch,
   LuUserRound,
@@ -97,6 +98,9 @@ export function InboxClient() {
     "list",
   );
   const [error, setError] = useState("");
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingBody, setEditingBody] = useState("");
+  const [editSaving, setEditSaving] = useState(false);
   const [connectedChannels, setConnectedChannels] = useState<Set<ChannelId> | null>(null);
   const refresh = async (archived = false) => {
     const [a, b, c] = await Promise.all([
@@ -239,6 +243,36 @@ export function InboxClient() {
     setAiOpen(false);
     await refresh();
     await loadThreadMessages(activeThread.id);
+  };
+  const startEditingMessage = (message: ApiMessage) => {
+    setEditingMessageId(message.id);
+    setEditingBody(message.body);
+    setError("");
+  };
+  const cancelEditingMessage = () => {
+    setEditingMessageId(null);
+    setEditingBody("");
+  };
+  const saveMessageEdit = async () => {
+    if (!editingMessageId || !editingBody.trim() || !activeThread) return;
+    setEditSaving(true);
+    try {
+      const response = await fetch(`/api/inbox/messages/${editingMessageId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ body: editingBody }),
+      });
+      if (!response.ok) {
+        const data = (await response.json().catch(() => null)) as { error?: string } | null;
+        setError(data?.error ?? "Impossible de modifier ce message.");
+        return;
+      }
+      setEditingMessageId(null);
+      setEditingBody("");
+      await loadThreadMessages(activeThread.id);
+    } finally {
+      setEditSaving(false);
+    }
   };
   const useAi = (mode: ReplyMode) => {
     setDraft(
@@ -474,7 +508,47 @@ export function InboxClient() {
                       </div>
                     ) : null}
                     <div className={`inbox-message inbox-message--${message.direction}`}>
-                      <p>{message.body}</p>
+                      {editingMessageId === message.id ? (
+                        <div className="inbox-message-edit">
+                          <textarea
+                            autoFocus
+                            onChange={(event) => setEditingBody(event.target.value)}
+                            rows={2}
+                            value={editingBody}
+                          />
+                          <div className="inbox-message-edit__actions">
+                            <button
+                              disabled={editSaving}
+                              onClick={cancelEditingMessage}
+                              type="button"
+                            >
+                              Annuler
+                            </button>
+                            <button
+                              className="is-primary"
+                              disabled={editSaving || !editingBody.trim()}
+                              onClick={() => void saveMessageEdit()}
+                              type="button"
+                            >
+                              {editSaving ? "Enregistrement..." : "Enregistrer"}
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <p>{message.body}</p>
+                          {message.direction === "outbound" ? (
+                            <button
+                              aria-label="Modifier ce message"
+                              className="inbox-message__edit-trigger"
+                              onClick={() => startEditingMessage(message)}
+                              type="button"
+                            >
+                              <LuPencil aria-hidden="true" />
+                            </button>
+                          ) : null}
+                        </>
+                      )}
                       <span>
                         {new Date(message.createdAt).toLocaleTimeString("fr", {
                           hour: "2-digit",

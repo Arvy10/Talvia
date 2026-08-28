@@ -2,6 +2,7 @@ import { database } from "../database";
 import { dispatchCommittedActivity, recordSystemActivity } from "../activities";
 import { normalizeLinkedIn } from "../../app/contacts/contact-utils";
 import {
+  editChatMessage,
   getUnipileConfig,
   listChatAttendees,
   listChatMessages,
@@ -61,7 +62,7 @@ export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["
 // and CSV-imported contacts (workspace_id, channel_type, identifier_normalized)
 // — a LinkedIn profile discovered via Unipile resolves to the same Contact as
 // one a user already added by hand, instead of creating a duplicate.
-async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, providerId: string, profileUrl: string | undefined, displayName: string, avatarUrl?: string) {
+async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, providerId: string, profileUrl: string | undefined, displayName: string, avatarUrl?: string, occupation?: string) {
   const identifier = profileUrl || providerId;
   const identifierNormalized = profileUrl ? normalizeLinkedIn(profileUrl) : providerId;
 
@@ -70,13 +71,21 @@ async function findOrCreateContact(client: import("pg").PoolClient, workspaceId:
     [workspaceId, identifierNormalized],
   );
   if (existing.rows[0]) {
-    // Contacts already imported before an avatar was ever captured (e.g. by
-    // the message webhook, which carries no picture field) get one attached
-    // the next time a resync sees it, instead of staying blank forever.
+    // Contacts already imported before an avatar/headline was ever captured
+    // (e.g. by the message webhook, which carries neither field) get them
+    // attached the next time a resync sees it, instead of staying blank.
     if (avatarUrl) {
       await client.query(
         `update contact_identities set metadata=metadata||jsonb_build_object('avatarUrl',$3::text) where workspace_id=$1 and channel_type='linkedin' and identifier_normalized=$2`,
         [workspaceId, identifierNormalized, avatarUrl],
+      );
+    }
+    if (occupation) {
+      // Never overwrite a job_title a human already typed in — LinkedIn's
+      // "occupation" is a headline/pitch, not authoritative over that.
+      await client.query(
+        `update contacts set job_title=$2 where id=$1 and (job_title is null or job_title='')`,
+        [existing.rows[0].contact_id, occupation],
       );
     }
     return existing.rows[0].contact_id;
@@ -84,8 +93,8 @@ async function findOrCreateContact(client: import("pg").PoolClient, workspaceId:
 
   const { firstName, lastName } = splitDisplayName(displayName || "Contact LinkedIn");
   const contact = await client.query<{ id: string }>(
-    `insert into contacts(workspace_id,first_name,last_name,display_name,status) values($1,$2,$3,$4,'new') returning id`,
-    [workspaceId, firstName, lastName, displayName || "Contact sans nom"],
+    `insert into contacts(workspace_id,first_name,last_name,display_name,job_title,status) values($1,$2,$3,$4,$5,'new') returning id`,
+    [workspaceId, firstName, lastName, displayName || "Contact sans nom", occupation ?? null],
   );
   const contactId = contact.rows[0]!.id;
   await client.query(
@@ -241,7 +250,7 @@ async function backfillChat(workspaceId: string, connectionId: string, config: N
   const client = await database.connect();
   try {
     await client.query("begin");
-    const contactId = await findOrCreateContact(client, workspaceId, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "", counterparty.picture_url);
+    const contactId = await findOrCreateContact(client, workspaceId, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "", counterparty.picture_url, counterparty.specifics?.occupation);
     const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, "linkedin", chat.id, contactId);
 
     let messagesCursor: string | undefined;
@@ -367,4 +376,31 @@ export async function sendMessage(workspaceId: string, conversationId: string, t
   await dispatchCommittedActivity(activity);
 
   return { id: savedRow.id, body: text, direction: "outbound", status: "sent", createdAt: savedRow.created_at };
+}
+
+const EDIT_WINDOW_MS = 60 * 60 * 1000;
+
+// LinkedIn Classic accepts an edit up to 60 minutes after sending (per
+// Unipile's docs — WhatsApp's own window is shorter). Checked here too, not
+// just left to whatever error Unipile returns, so the UI can say something
+// clearer than a raw provider rejection.
+export async function editMessage(workspaceId: string, messageId: string, text: string): Promise<void> {
+  const config = getUnipileConfig();
+  if (!config) throw new Error("Unipile n'est pas configuré sur cet environnement.");
+
+  const result = await database.query<{ provider_message_id: string | null; sent_at: string | null; direction: string }>(
+    `select m.provider_message_id,m.sent_at,m.direction
+     from messages m join conversations v on v.id=m.conversation_id join connections c on c.id=v.connection_id
+     where m.workspace_id=$1 and m.id=$2 and c.provider=$3`,
+    [workspaceId, messageId, PROVIDER],
+  );
+  const row = result.rows[0];
+  if (!row?.provider_message_id) throw new Error("Ce message n'est pas modifiable.");
+  if (row.direction !== "outbound") throw new Error("Seuls vos propres messages peuvent être modifiés.");
+  if (!row.sent_at || Date.now() - new Date(row.sent_at).getTime() > EDIT_WINDOW_MS) {
+    throw new Error("Ce message ne peut plus être modifié — LinkedIn n'autorise la modification que dans l'heure suivant l'envoi.");
+  }
+
+  await editChatMessage(config, row.provider_message_id, text);
+  await database.query(`update messages set body=$1,metadata=metadata||'{"edited":true}'::jsonb where id=$2`, [text, messageId]);
 }

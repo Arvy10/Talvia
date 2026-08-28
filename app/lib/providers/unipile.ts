@@ -132,6 +132,7 @@ export type UnipileChatAttendee = {
   is_self: 0 | 1;
   profile_url?: string;
   picture_url?: string;
+  specifics?: { occupation?: string };
 };
 
 // Without a timeout, a slow/rate-limited Unipile response leaves the caller
@@ -181,4 +182,18 @@ export async function sendChatMessage(config: UnipileConfig, chatId: string, tex
   if (!response.ok) throw new Error(`Unipile send message failed (${response.status}).`);
   const data = await response.json() as { object: string; message_id: string | null };
   return data.message_id;
+}
+
+// https://developer.unipile.com/reference/messagescontroller_patchmessage — per
+// Unipile's docs, edits are provider-limited: LinkedIn Classic accepts them up
+// to 60 minutes after sending, WhatsApp up to ~15. Past that window the
+// provider itself rejects it; we surface whatever error Unipile returns.
+export async function editChatMessage(config: UnipileConfig, messageId: string, text: string): Promise<void> {
+  const response = await fetch(`${config.apiUrl}/api/v1/messages/${messageId}`, {
+    method: "PATCH",
+    headers: { "X-API-KEY": config.apiKey, accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error(`Unipile edit message failed (${response.status}).`);
 }
