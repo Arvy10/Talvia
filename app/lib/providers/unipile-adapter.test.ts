@@ -43,8 +43,8 @@ function createFakeDatabase() {
     }
 
     if (text.startsWith("select contact_id from contact_identities")) {
-      const [workspaceId, provider, externalId] = params as string[];
-      const row = contactIdentities.find((c) => c.workspace_id === workspaceId && c.provider === provider && c.external_id === externalId);
+      const [workspaceId, identifierNormalized] = params as string[];
+      const row = contactIdentities.find((c) => c.workspace_id === workspaceId && c.channel_type === "linkedin" && c.identifier_normalized === identifierNormalized);
       return { rows: row ? [{ contact_id: row.contact_id }] : [] };
     }
 
@@ -56,9 +56,9 @@ function createFakeDatabase() {
     }
 
     if (text.startsWith("insert into contact_identities")) {
-      const [workspaceId, contactId, provider, channelType, externalId, displayLabel] = params as string[];
-      if (!contactIdentities.some((c) => c.workspace_id === workspaceId && c.provider === provider && c.external_id === externalId)) {
-        contactIdentities.push({ workspace_id: workspaceId, contact_id: contactId, provider, channel_type: channelType, external_id: externalId, display_label: displayLabel });
+      const [workspaceId, contactId, provider, identifier, identifierNormalized, profileUrl] = params as string[];
+      if (!contactIdentities.some((c) => c.workspace_id === workspaceId && c.channel_type === "linkedin" && c.identifier_normalized === identifierNormalized)) {
+        contactIdentities.push({ workspace_id: workspaceId, contact_id: contactId, channel_type: "linkedin", provider, identifier, identifier_normalized: identifierNormalized, profile_url: profileUrl });
       }
       return { rows: [] };
     }
@@ -207,5 +207,20 @@ describe("ingestInboundMessage", () => {
     }));
     expect(fakeDatabase.contacts).toHaveLength(2);
     expect(fakeDatabase.conversations).toHaveLength(2);
+  });
+
+  it("resolves to an existing Contact already added manually with the same LinkedIn profile, instead of duplicating it", async () => {
+    await connectAccount();
+    // Mirrors what contacts.ts's replaceIdentities() writes for a manually-entered contact.
+    fakeDatabase.contacts.push({ id: "contact-manual", workspace_id: workspaceId, display_name: "Jane Doe" });
+    fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-manual", channel_type: "linkedin", identifier_normalized: "linkedin.com/in/jane-doe" });
+
+    const result = await ingestInboundMessage(messagePayload({
+      sender: { attendee_id: "att-1", attendee_name: "Jane Doe", attendee_provider_id: "linkedin-jane", attendee_profile_url: "https://www.linkedin.com/in/jane-doe/" },
+    }));
+
+    expect(result).toEqual({ status: "ingested" });
+    expect(fakeDatabase.contacts).toHaveLength(1);
+    expect(fakeDatabase.messages[0]!.sender_contact_id).toBe("contact-manual");
   });
 });

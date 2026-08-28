@@ -1,5 +1,6 @@
 import { database } from "../database";
 import { dispatchCommittedActivity, recordSystemActivity } from "../activities";
+import { normalizeLinkedIn } from "../../app/contacts/contact-utils";
 import {
   toConnectionStatus,
   type UnipileAccountStatusPayload,
@@ -51,10 +52,17 @@ export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["
   );
 }
 
-async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, externalId: string, displayName: string) {
+// Dedup key matches the one contacts.ts already uses for manually-entered
+// and CSV-imported contacts (workspace_id, channel_type, identifier_normalized)
+// — a LinkedIn profile discovered via Unipile resolves to the same Contact as
+// one a user already added by hand, instead of creating a duplicate.
+async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, providerId: string, profileUrl: string | undefined, displayName: string) {
+  const identifier = profileUrl || providerId;
+  const identifierNormalized = profileUrl ? normalizeLinkedIn(profileUrl) : providerId;
+
   const existing = await client.query<{ contact_id: string }>(
-    `select contact_id from contact_identities where workspace_id=$1 and provider=$2 and external_id=$3`,
-    [workspaceId, PROVIDER, externalId],
+    `select contact_id from contact_identities where workspace_id=$1 and channel_type='linkedin' and identifier_normalized=$2`,
+    [workspaceId, identifierNormalized],
   );
   if (existing.rows[0]) return existing.rows[0].contact_id;
 
@@ -65,9 +73,9 @@ async function findOrCreateContact(client: import("pg").PoolClient, workspaceId:
   );
   const contactId = contact.rows[0]!.id;
   await client.query(
-    `insert into contact_identities(workspace_id,contact_id,provider,channel_type,external_id,display_label) values($1,$2,$3,$4,$5,$6)
-     on conflict(workspace_id,provider,external_id) do nothing`,
-    [workspaceId, contactId, PROVIDER, "linkedin", externalId, displayName || null],
+    `insert into contact_identities(workspace_id,contact_id,channel_type,provider,identifier,identifier_normalized,profile_url,metadata) values($1,$2,'linkedin',$3,$4,$5,$6,$7)
+     on conflict(workspace_id,channel_type,identifier_normalized) do nothing`,
+    [workspaceId, contactId, PROVIDER, identifier, identifierNormalized, profileUrl ?? null, JSON.stringify({ unipileProviderId: providerId })],
   );
   return contactId;
 }
@@ -113,7 +121,7 @@ export async function ingestInboundMessage(payload: UnipileNewMessagePayload): P
     }
     const { id: connectionId, workspace_id: workspaceId, channel_type: channelType } = connection.rows[0];
 
-    const contactId = await findOrCreateContact(client, workspaceId, payload.sender.attendee_provider_id, payload.sender.attendee_name ?? "");
+    const contactId = await findOrCreateContact(client, workspaceId, payload.sender.attendee_provider_id, payload.sender.attendee_profile_url, payload.sender.attendee_name ?? "");
     const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, channelType, payload.chat_id, contactId);
 
     const inserted = await client.query<{ id: string }>(
