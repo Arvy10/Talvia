@@ -18,6 +18,19 @@ export type ActivityRecord = ActivityInput & {
   createdAt: string;
 };
 
+// For events that originate outside a user's session — a provider webhook, for
+// instance — where there is no acting Talvia user to attribute the activity to.
+export async function recordSystemActivity(workspaceId: string, input: ActivityInput, client?: PoolClient): Promise<ActivityRecord> {
+  const executor = client ?? database;
+  const result = await executor.query<{ id: string; created_at: string }>(
+    `insert into activities(workspace_id, actor_type, actor_id, event_type, entity_type, entity_id, metadata, source, automation_run_id)
+     values($1, 'system', null, $2, $3, $4, $5, $6, $7) returning id, created_at`,
+    [workspaceId, input.eventType, input.entityType, input.entityId, input.metadata ?? {}, input.source ?? "user", input.automationRunId ?? null],
+  );
+  const row = result.rows[0]!;
+  return { ...input, id: row.id, workspaceId, actorUserId: "", createdAt: row.created_at };
+}
+
 export async function recordActivity(context: WorkspaceContext, input: ActivityInput, client?: PoolClient): Promise<ActivityRecord> {
   const executor = client ?? database;
   const result = await executor.query<{ id: string; created_at: string }>(

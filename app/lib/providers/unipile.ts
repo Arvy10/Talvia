@@ -1,0 +1,101 @@
+import type { ChannelId } from "../../app/state/types";
+
+// Unipile is infrastructure, not Talvia's domain model (ARCHITECTURE.md §3).
+// This module is the only place that knows Unipile's request/response shapes;
+// everything past unipile-adapter.ts deals in normalized Talvia entities.
+
+export type UnipileProvider = "LINKEDIN" | "WHATSAPP" | "GOOGLE";
+
+export const PROVIDER_BY_CHANNEL: Record<ChannelId, UnipileProvider> = {
+  linkedin: "LINKEDIN",
+  whatsapp: "WHATSAPP",
+  gmail: "GOOGLE",
+};
+
+export type UnipileConfig = { apiKey: string; apiUrl: string; webhookSecret: string; appBaseUrl: string };
+
+// Mirrors the database.ts lesson from the production outage: a module that
+// throws at import time when a config var is merely unset breaks build-time
+// page-data collection. Callers check for null and fail per-request instead.
+export function getUnipileConfig(): UnipileConfig | null {
+  const apiKey = process.env.UNIPILE_API_KEY;
+  const apiUrl = process.env.UNIPILE_API_URL;
+  const webhookSecret = process.env.UNIPILE_WEBHOOK_SECRET;
+  const appBaseUrl = process.env.BETTER_AUTH_URL;
+  if (!apiKey || !apiUrl || !webhookSecret || !appBaseUrl) return null;
+  return { apiKey, apiUrl, webhookSecret, appBaseUrl };
+}
+
+export type HostedAuthLinkParams = { channel: ChannelId; workspaceId: string };
+
+// https://developer.unipile.com/reference/hostedcontroller_requestlink
+export async function createHostedAuthLink(config: UnipileConfig, params: HostedAuthLinkParams): Promise<string> {
+  const response = await fetch(`${config.apiUrl}/api/v1/hosted/accounts/link`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "X-API-KEY": config.apiKey },
+    body: JSON.stringify({
+      type: "create",
+      providers: [PROVIDER_BY_CHANNEL[params.channel]],
+      api_url: config.apiUrl,
+      expiresOn: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      success_redirect_url: `${config.appBaseUrl}/app/connections?status=success`,
+      failure_redirect_url: `${config.appBaseUrl}/app/connections?status=failure`,
+      notify_url: `${config.appBaseUrl}/api/webhooks/unipile`,
+      // The hosted-auth notify webhook echoes `name` back but — per the
+      // documented payload — carries no account_type field of its own, so we
+      // pack the channel in ourselves rather than guess at an undocumented one.
+      name: `${params.workspaceId}::${params.channel}`,
+    }),
+  });
+  if (!response.ok) throw new Error(`Unipile hosted auth link request failed (${response.status}).`);
+  const data = await response.json() as { object: string; url: string };
+  return data.url;
+}
+
+// https://developer.unipile.com/docs/hosted-auth — delivered once, to notify_url,
+// right after the user finishes the hosted auth wizard. `name` echoes the
+// workspaceId we passed when creating the link, which is how we learn which
+// workspace this brand-new account_id belongs to.
+export type UnipileHostedAuthNotifyPayload = { status: string; account_id: string; name: string };
+
+// https://developer.unipile.com/docs/account-lifecycle — delivered to any
+// persistent "account" webhook subscription for accounts already connected.
+// No `name` field: the connection must already exist, looked up by account_id.
+export type UnipileAccountStatusPayload = {
+  AccountStatus: { account_id: string; account_type: string; message: string };
+};
+
+// https://developer.unipile.com/docs/new-messages-webhook
+export type UnipileNewMessagePayload = {
+  account_id: string;
+  account_type: string;
+  account_info?: { type?: string; feature?: string; user_id?: string };
+  event: "message_received" | "message_reaction" | "message_read" | "message_edited" | "message_deleted" | "message_delivered";
+  chat_id: string;
+  timestamp: string;
+  webhook_name?: string;
+  message_id: string;
+  message?: string;
+  sender?: { attendee_id: string; attendee_name?: string; attendee_provider_id: string; attendee_profile_url?: string };
+  attendees?: Array<{ attendee_id: string; attendee_name?: string; attendee_provider_id: string; attendee_profile_url?: string }>;
+};
+
+export type UnipileWebhookPayload = UnipileHostedAuthNotifyPayload | UnipileAccountStatusPayload | UnipileNewMessagePayload;
+
+export function isHostedAuthNotifyPayload(payload: UnipileWebhookPayload): payload is UnipileHostedAuthNotifyPayload {
+  return "status" in payload && "name" in payload;
+}
+
+export function isAccountStatusPayload(payload: UnipileWebhookPayload): payload is UnipileAccountStatusPayload {
+  return "AccountStatus" in payload;
+}
+
+const CONNECTED_STATUSES = new Set(["CREATION_SUCCESS", "RECONNECTED", "SYNC_SUCCESS", "OK"]);
+const ERROR_STATUSES = new Set(["ERROR", "CREDENTIALS", "STOPPED"]);
+
+export function toConnectionStatus(unipileStatus: string): "connected" | "connecting" | "error" | "disconnected" {
+  if (CONNECTED_STATUSES.has(unipileStatus)) return "connected";
+  if (ERROR_STATUSES.has(unipileStatus)) return "error";
+  if (unipileStatus === "DELETED") return "disconnected";
+  return "connecting";
+}

@@ -15,7 +15,16 @@ export async function GET() {
   }
 }
 
+// Self-reported status, kept only as a local dev/test harness (see
+// ConnectionsClient's "Tester les états" panel) — a real connection's status
+// now comes exclusively from Unipile's webhook (api/webhooks/unipile), via
+// the hosted-auth flow started by api/connections/[channel]/connect. Without
+// this guard, any authenticated caller could PATCH their own workspace
+// straight to "connected" without actually connecting anything.
 export async function PATCH(request: Request) {
+  if (process.env.NODE_ENV === "production") {
+    return NextResponse.json({ error: "Introuvable." }, { status: 404 });
+  }
   try {
     const context = await getCurrentWorkspace();
     const input = await request.json() as { channel: "linkedin" | "whatsapp" | "email"; status: "disconnected" | "connecting" | "syncing" | "connected" | "error" };
