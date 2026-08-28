@@ -131,6 +131,7 @@ export type UnipileChatAttendee = {
   name?: string;
   is_self: 0 | 1;
   profile_url?: string;
+  picture_url?: string;
 };
 
 // Without a timeout, a slow/rate-limited Unipile response leaves the caller

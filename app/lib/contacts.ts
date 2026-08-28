@@ -11,6 +11,7 @@ export type ContactRecord = {
   email?: string;
   phone?: string;
   linkedinUrl?: string;
+  avatarUrl?: string;
   channel?: "linkedin" | "whatsapp" | "gmail";
   company?: string;
   role?: string;
@@ -20,12 +21,12 @@ export type ContactRecord = {
   notesUpdatedAt?: string;
 };
 
-export type ContactInput = Omit<ContactRecord, "id" | "channel" | "notesUpdatedAt">;
+export type ContactInput = Omit<ContactRecord, "id" | "channel" | "notesUpdatedAt" | "avatarUrl">;
 
 type ContactRow = {
   id: string; display_name: string; job_title: string | null; status: ContactStatus; notes_summary: string | null;
   company: string | null; website_url: string | null; created_at: string;
-  email: string | null; phone: string | null; linkedin_url: string | null;
+  email: string | null; phone: string | null; linkedin_url: string | null; avatar_url: string | null;
 };
 
 function normalizedEmail(value: string) { return value.trim().toLowerCase(); }
@@ -40,6 +41,7 @@ function contactFromRow(row: ContactRow): ContactRecord {
     ...(row.email ? { email: row.email } : {}),
     ...(row.phone ? { phone: row.phone } : {}),
     ...(row.linkedin_url ? { linkedinUrl: row.linkedin_url } : {}),
+    ...(row.avatar_url ? { avatarUrl: row.avatar_url } : {}),
     channel: row.linkedin_url ? "linkedin" : row.phone ? "whatsapp" : row.email ? "gmail" : undefined,
     ...(row.company ? { company: row.company } : {}),
     ...(row.job_title ? { role: row.job_title } : {}),
@@ -54,7 +56,8 @@ const contactSelect = `
          company.name as company, company.website_url,
          max(ci.identifier) filter (where ci.channel_type = 'email') as email,
          max(ci.identifier) filter (where ci.channel_type = 'whatsapp') as phone,
-         max(ci.profile_url) filter (where ci.channel_type = 'linkedin') as linkedin_url
+         max(ci.profile_url) filter (where ci.channel_type = 'linkedin') as linkedin_url,
+         max(ci.metadata->>'avatarUrl') as avatar_url
   from contacts c
   left join companies company on company.id = c.company_id and company.workspace_id = c.workspace_id
   left join contact_identities ci on ci.contact_id = c.id and ci.workspace_id = c.workspace_id

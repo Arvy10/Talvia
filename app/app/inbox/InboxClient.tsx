@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   LuArrowLeft,
   LuArrowRight,
@@ -45,6 +45,14 @@ type ApiConversation = {
   messages: ApiMessage[];
 };
 type Thread = ApiConversation & { key: string; latest?: ApiMessage };
+
+function ContactAvatar({ contact, large }: { contact?: Pick<Contact, "name" | "avatarUrl">; large?: boolean }) {
+  const className = large ? "inbox-avatar inbox-avatar--large" : "inbox-avatar";
+  if (contact?.avatarUrl) {
+    return <span className={className}><img alt="" src={contact.avatarUrl} /></span>;
+  }
+  return <span className={className}>{contact?.name.slice(0, 2).toUpperCase() ?? "?"}</span>;
+}
 
 export function InboxClient() {
   const router = useRouter();
@@ -135,6 +143,16 @@ export function InboxClient() {
     if (activeThread) void loadThreadMessages(activeThread.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeThread?.id]);
+  const messageScrollRef = useRef<HTMLDivElement>(null);
+  // Oldest-to-newest top-to-bottom is the correct order (matches every real
+  // messaging app), but a long thread renders taller than the panel, and
+  // without this the browser leaves the scroll position at the top — so the
+  // first thing anyone sees on opening a conversation is months-old history
+  // instead of the latest message, which reads as "backwards".
+  useEffect(() => {
+    const node = messageScrollRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [activeThread?.id, threadMessages.length]);
   // A conversation can only start on a channel Talvia is actually connected
   // to — otherwise nothing would ever be sent, even though the contact
   // happens to have a phone number or email on file.
@@ -333,9 +351,7 @@ export function InboxClient() {
                     }}
                     type="button"
                   >
-                    <span className="inbox-avatar">
-                      {contact?.name.slice(0, 2).toUpperCase() ?? "?"}
-                    </span>
+                    <ContactAvatar contact={contact} />
                     <span>
                       <strong>{contact?.name ?? "Contact"}</strong>
                       <small>
@@ -379,9 +395,7 @@ export function InboxClient() {
             {activeContact && activeThread ? (
               <>
                 <div className="inbox-chat-person">
-                  <span className="inbox-avatar">
-                    {activeContact.name.slice(0, 2).toUpperCase()}
-                  </span>
+                  <ContactAvatar contact={activeContact} />
                   <span>
                     <strong>{activeContact.name}</strong>
                     <small>
@@ -408,7 +422,7 @@ export function InboxClient() {
               <strong>Conversation</strong>
             )}
           </header>
-          <div className="inbox-message-scroll">
+          <div className="inbox-message-scroll" ref={messageScrollRef}>
             {!activeThread ? (
               <EmptyState
                 icon={<LuMessageCircle />}
@@ -526,9 +540,7 @@ export function InboxClient() {
           {activeContact && activeThread ? (
             <>
               <section className="inbox-contact-identity">
-                <span className="inbox-avatar inbox-avatar--large">
-                  {activeContact.name.slice(0, 2).toUpperCase()}
-                </span>
+                <ContactAvatar contact={activeContact} large />
                 <h2>{activeContact.name}</h2>
                 <p>
                   {activeContact.role ?? "Fonction non renseignée"}

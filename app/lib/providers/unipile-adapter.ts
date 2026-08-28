@@ -60,7 +60,7 @@ export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["
 // and CSV-imported contacts (workspace_id, channel_type, identifier_normalized)
 // — a LinkedIn profile discovered via Unipile resolves to the same Contact as
 // one a user already added by hand, instead of creating a duplicate.
-async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, providerId: string, profileUrl: string | undefined, displayName: string) {
+async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, providerId: string, profileUrl: string | undefined, displayName: string, avatarUrl?: string) {
   const identifier = profileUrl || providerId;
   const identifierNormalized = profileUrl ? normalizeLinkedIn(profileUrl) : providerId;
 
@@ -68,7 +68,18 @@ async function findOrCreateContact(client: import("pg").PoolClient, workspaceId:
     `select contact_id from contact_identities where workspace_id=$1 and channel_type='linkedin' and identifier_normalized=$2`,
     [workspaceId, identifierNormalized],
   );
-  if (existing.rows[0]) return existing.rows[0].contact_id;
+  if (existing.rows[0]) {
+    // Contacts already imported before an avatar was ever captured (e.g. by
+    // the message webhook, which carries no picture field) get one attached
+    // the next time a resync sees it, instead of staying blank forever.
+    if (avatarUrl) {
+      await client.query(
+        `update contact_identities set metadata=metadata||jsonb_build_object('avatarUrl',$3::text) where workspace_id=$1 and channel_type='linkedin' and identifier_normalized=$2`,
+        [workspaceId, identifierNormalized, avatarUrl],
+      );
+    }
+    return existing.rows[0].contact_id;
+  }
 
   const { firstName, lastName } = splitDisplayName(displayName || "Contact LinkedIn");
   const contact = await client.query<{ id: string }>(
@@ -79,7 +90,7 @@ async function findOrCreateContact(client: import("pg").PoolClient, workspaceId:
   await client.query(
     `insert into contact_identities(workspace_id,contact_id,channel_type,provider,identifier,identifier_normalized,profile_url,metadata) values($1,$2,'linkedin',$3,$4,$5,$6,$7)
      on conflict(workspace_id,channel_type,identifier_normalized) do nothing`,
-    [workspaceId, contactId, PROVIDER, identifier, identifierNormalized, profileUrl ?? null, JSON.stringify({ unipileProviderId: providerId })],
+    [workspaceId, contactId, PROVIDER, identifier, identifierNormalized, profileUrl ?? null, JSON.stringify({ unipileProviderId: providerId, ...(avatarUrl ? { avatarUrl } : {}) })],
   );
   return contactId;
 }
@@ -208,7 +219,7 @@ async function backfillChat(workspaceId: string, connectionId: string, config: N
   const client = await database.connect();
   try {
     await client.query("begin");
-    const contactId = await findOrCreateContact(client, workspaceId, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "");
+    const contactId = await findOrCreateContact(client, workspaceId, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "", counterparty.picture_url);
     const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, "linkedin", chat.id, contactId);
 
     let messagesCursor: string | undefined;

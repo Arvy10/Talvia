@@ -26,6 +26,7 @@ export type Contact = {
   phone?: string;
   channel?: ChannelId;
   linkedinUrl?: string;
+  avatarUrl?: string;
   company?: string;
   role?: string;
   website?: string;
