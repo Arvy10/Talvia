@@ -43,13 +43,13 @@ export function ConnectionsClient() {
     setSyncingChannel(channel);
     setSyncResult((current) => ({ ...current, [channel]: undefined }));
     const response = await fetch(`/api/connections/${channel}/sync`, { method: "POST" });
-    const data = await response.json().catch(() => null) as { chatsProcessed?: number; messagesInserted?: number; error?: string } | null;
+    const data = await response.json().catch(() => null) as { chatsProcessed?: number; messagesInserted?: number; chatsFailed?: number; error?: string } | null;
     setSyncingChannel(null);
     setSyncResult((current) => ({
       ...current,
       [channel]: !response.ok || !data
         ? (data?.error ?? "Échec de la synchronisation.")
-        : `${data.chatsProcessed} conversation(s), ${data.messagesInserted} message(s) importés.`,
+        : `${data.chatsProcessed} conversation(s), ${data.messagesInserted} message(s) importés.${data.chatsFailed ? ` ${data.chatsFailed} conversation(s) ignorée(s) après échec — relancez la synchronisation pour réessayer.` : ""}`,
     }));
   };
   useEffect(() => { void fetch("/api/connections").then(async (response) => response.ok ? response.json() : null).then((data) => { if (!data) return; setStatuses((current) => ({ ...current, ...Object.fromEntries(data.connections.map((item: { channel_type: "linkedin" | "whatsapp" | "email"; status: ConnectionStatus }) => [item.channel_type === "email" ? "gmail" : item.channel_type, item.status])) })); }); }, []);

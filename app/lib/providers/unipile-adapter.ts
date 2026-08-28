@@ -194,7 +194,55 @@ export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<
   }
 }
 
-export type BackfillSummary = { chatsProcessed: number; messagesInserted: number };
+export type BackfillSummary = { chatsProcessed: number; messagesInserted: number; chatsFailed: number };
+
+async function backfillChat(workspaceId: string, connectionId: string, config: NonNullable<ReturnType<typeof getUnipileConfig>>, chat: Awaited<ReturnType<typeof listChats>>["items"][number]): Promise<number> {
+  const attendees = await listChatAttendees(config, chat.id);
+  const counterparty = attendees.find((attendee) => !attendee.is_self);
+  if (!counterparty) return 0; // group chats / chats with no external attendee aren't handled yet
+
+  let messagesInserted = 0;
+  const client = await database.connect();
+  try {
+    await client.query("begin");
+    const contactId = await findOrCreateContact(client, workspaceId, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "");
+    const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, "linkedin", chat.id, contactId);
+
+    let messagesCursor: string | undefined;
+    do {
+      const messagesPage = await listChatMessages(config, chat.id, messagesCursor);
+      for (const message of messagesPage.items) {
+        if (message.deleted) continue;
+        const direction = message.is_sender ? "outbound" : "inbound";
+        const status = message.is_sender ? "sent" : "received";
+        // Upsert, not insert-or-skip: this is a resync against Unipile's
+        // authoritative record, so a message a stale ingestion path already
+        // stored with the wrong direction/contact (e.g. from a production
+        // deploy that predates a bugfix) gets corrected here instead of
+        // being silently left wrong forever.
+        const upserted = await client.query<{ id: string }>(
+          `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at)
+           values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then $8::timestamptz else null end,case when $3::varchar='inbound' then $8::timestamptz else null end)
+           on conflict(conversation_id,provider_message_id) where provider_message_id is not null do update set
+             direction=excluded.direction,sender_contact_id=excluded.sender_contact_id,body=excluded.body,status=excluded.status
+           returning id`,
+          [workspaceId, conversationId, direction, message.is_sender ? null : contactId, message.text ?? "", status, message.id, message.timestamp],
+        );
+        if (upserted.rows[0]) messagesInserted += 1;
+      }
+      messagesCursor = messagesPage.cursor ?? undefined;
+    } while (messagesCursor);
+
+    await client.query(`update conversations set last_message_at=greatest(coalesce(last_message_at,'epoch'::timestamptz),$2::timestamptz),updated_at=now() where id=$1`, [conversationId, chat.timestamp ?? new Date().toISOString()]);
+    await client.query("commit");
+    return messagesInserted;
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 // One-time historical import, run explicitly after a connection succeeds
 // (see api/connections/[channel]/sync) rather than inline in the webhook
@@ -215,54 +263,20 @@ export async function backfillConnectionHistory(connectionId: string): Promise<B
   if (connection.channel_type !== "linkedin") throw new Error(`Synchronisation de l'historique non disponible pour ${connection.channel_type} pour le moment.`);
   const { workspace_id: workspaceId, external_account_id: accountId } = connection;
 
-  const summary: BackfillSummary = { chatsProcessed: 0, messagesInserted: 0 };
+  const summary: BackfillSummary = { chatsProcessed: 0, messagesInserted: 0, chatsFailed: 0 };
   let chatsCursor: string | undefined;
   do {
     const chatsPage = await listChats(config, accountId, chatsCursor);
     for (const chat of chatsPage.items) {
-      const attendees = await listChatAttendees(config, chat.id);
-      const counterparty = attendees.find((attendee) => !attendee.is_self);
-      if (!counterparty) continue; // group chats / chats with no external attendee aren't handled yet
-
-      const client = await database.connect();
       try {
-        await client.query("begin");
-        const contactId = await findOrCreateContact(client, workspaceId, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "");
-        const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, "linkedin", chat.id, contactId);
-
-        let messagesCursor: string | undefined;
-        do {
-          const messagesPage = await listChatMessages(config, chat.id, messagesCursor);
-          for (const message of messagesPage.items) {
-            if (message.deleted) continue;
-            const direction = message.is_sender ? "outbound" : "inbound";
-            const status = message.is_sender ? "sent" : "received";
-            // Upsert, not insert-or-skip: this is a resync against Unipile's
-            // authoritative record, so a message a stale ingestion path
-            // already stored with the wrong direction/contact (e.g. from a
-            // production deploy that predates a bugfix) gets corrected here
-            // instead of being silently left wrong forever.
-            const upserted = await client.query<{ id: string }>(
-              `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at)
-               values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then $8::timestamptz else null end,case when $3::varchar='inbound' then $8::timestamptz else null end)
-               on conflict(conversation_id,provider_message_id) where provider_message_id is not null do update set
-                 direction=excluded.direction,sender_contact_id=excluded.sender_contact_id,body=excluded.body,status=excluded.status
-               returning id`,
-              [workspaceId, conversationId, direction, message.is_sender ? null : contactId, message.text ?? "", status, message.id, message.timestamp],
-            );
-            if (upserted.rows[0]) summary.messagesInserted += 1;
-          }
-          messagesCursor = messagesPage.cursor ?? undefined;
-        } while (messagesCursor);
-
-        await client.query(`update conversations set last_message_at=greatest(coalesce(last_message_at,'epoch'::timestamptz),$2::timestamptz),updated_at=now() where id=$1`, [conversationId, chat.timestamp ?? new Date().toISOString()]);
-        await client.query("commit");
+        summary.messagesInserted += await backfillChat(workspaceId, connectionId, config, chat);
         summary.chatsProcessed += 1;
       } catch (error) {
-        await client.query("rollback");
-        throw error;
-      } finally {
-        client.release();
+        // A single slow/failed chat (timeout, transient Unipile error) must
+        // not abort hours of otherwise-successful pagination — log and move
+        // on; re-running the sync will retry whatever didn't complete.
+        summary.chatsFailed += 1;
+        console.error(`[unipile] backfill failed for chat ${chat.id}`, error);
       }
     }
     chatsCursor = chatsPage.cursor ?? undefined;

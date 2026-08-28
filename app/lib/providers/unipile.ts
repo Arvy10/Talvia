@@ -46,6 +46,7 @@ export async function createHostedAuthLink(config: UnipileConfig, params: Hosted
       // pack the channel in ourselves rather than guess at an undocumented one.
       name: `${params.workspaceId}::${params.channel}`,
     }),
+    signal: AbortSignal.timeout(20_000),
   });
   if (!response.ok) throw new Error(`Unipile hosted auth link request failed (${response.status}).`);
   const data = await response.json() as { object: string; url: string };
@@ -132,8 +133,11 @@ export type UnipileChatAttendee = {
   profile_url?: string;
 };
 
+// Without a timeout, a slow/rate-limited Unipile response leaves the caller
+// (e.g. the backfill's sequential chat-by-chat loop) hanging indefinitely
+// with no error and no progress — observed during this integration.
 async function unipileGet<T>(config: UnipileConfig, path: string): Promise<T> {
-  const response = await fetch(`${config.apiUrl}${path}`, { headers: { "X-API-KEY": config.apiKey, accept: "application/json" } });
+  const response = await fetch(`${config.apiUrl}${path}`, { headers: { "X-API-KEY": config.apiKey, accept: "application/json" }, signal: AbortSignal.timeout(20_000) });
   if (!response.ok) throw new Error(`Unipile GET ${path} failed (${response.status}).`);
   return response.json() as Promise<T>;
 }
