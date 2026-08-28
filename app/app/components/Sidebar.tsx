@@ -1,8 +1,11 @@
+"use client";
+
 import Link from "next/link";
 import { LuChevronLeft, LuChevronRight, LuChevronUp } from "react-icons/lu";
 
 import { productNavigation } from "./navigation";
 import { SignOutButton } from "./SignOutButton";
+import { getInitials, useUserIdentity } from "./useUserIdentity";
 
 type SidebarProps = {
   pathname: string;
@@ -17,6 +20,8 @@ function isActive(pathname: string, href: string) {
 }
 
 export function Sidebar({ pathname, drawer = false, onNavigate, collapsed = false, onToggle }: SidebarProps) {
+  const identity = useUserIdentity();
+  const fullName = `${identity.firstName} ${identity.lastName}`.trim();
   const brand = <><span aria-hidden="true" className="app-brand__mark"><i /><i /><i /><i /></span><span className="app-brand__label">talvia</span></>;
 
   return <aside className={`${drawer ? "app-sidebar app-sidebar--drawer" : "app-sidebar"}${collapsed ? " is-collapsed" : ""}`}>
@@ -35,9 +40,9 @@ export function Sidebar({ pathname, drawer = false, onNavigate, collapsed = fals
       })}
     </nav>
     <footer className="app-sidebar__footer">
-      <span aria-hidden="true">TS</span>
+      <span aria-hidden="true">{getInitials(identity)}</span>
       <details className="app-user-menu">
-        <summary><div><strong>Sandbox Talvia</strong><small>Mode démonstration</small></div><LuChevronUp aria-hidden="true" /></summary>
+        <summary><div><strong>{fullName || "Mon compte"}</strong><small>{identity.email}</small></div><LuChevronUp aria-hidden="true" /></summary>
         <div className="app-user-menu__panel"><Link href="/app/profile" onClick={onNavigate}>Mon profil</Link><Link href="/app/settings" onClick={onNavigate}>Mon workspace</Link><Link href="/app/settings#subscription" onClick={onNavigate}>Abonnement</Link><Link href="/app/settings" onClick={onNavigate}>Paramètres</Link><SignOutButton className="app-user-menu__logout" onComplete={onNavigate} /></div>
       </details>
     </footer>

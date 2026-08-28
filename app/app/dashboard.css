@@ -1,8 +1,8 @@
 .dashboard-brief { margin-bottom: 26px; }
 .dashboard-brief__eyebrow { margin: 0 0 12px; color: var(--app-coral); font-size: 10px; font-weight: 750; letter-spacing: 0.13em; text-transform: uppercase; }
 .dashboard-brief__head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
-.dashboard-brief__head h1 { margin: 0; max-width: 900px; font-size: clamp(28px, 3.4vw, 44px); font-weight: 800; letter-spacing: -0.03em; line-height: 1.08; }
-.dashboard-brief__head h1 span { font-weight: 400; color: var(--app-muted); }
+.dashboard-brief__head h1 { margin: 0; max-width: 900px; font-size: clamp(28px, 3.4vw, 44px); font-weight: 800; letter-spacing: -0.03em; line-height: 1.08; text-wrap: balance; }
+.dashboard-brief__date { margin: 6px 0 0; color: var(--app-muted); font-size: 14px; font-weight: 500; }
 .dashboard-brief__tagline { margin: 14px 0 0; font-family: "Instrument Serif", Georgia, serif; font-size: 20px; font-weight: 400; color: var(--app-text); }
 .dashboard-brief__description { max-width: 620px; margin: 8px 0 0; color: var(--app-muted); font-size: 13px; line-height: 1.65; }
 

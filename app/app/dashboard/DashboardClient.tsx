@@ -11,6 +11,7 @@ import PlugConnectedIcon from "../components/icons/PlugConnectedIcon";
 import UsersGroupIcon from "../components/icons/UsersGroupIcon";
 import { useSandbox } from "../state/SandboxProvider";
 import { channelMap, getConnectedChannelCount } from "../inbox/inbox-model";
+import { useUserIdentity } from "../components/useUserIdentity";
 
 const shortcuts = [
   { href: "/app/inbox", label: "Inbox", description: "Centralisez les conversations lorsqu’elles arriveront.", icon: MailIcon },
@@ -31,9 +32,8 @@ function formatTime(date: Date): string {
 
 export function DashboardClient() {
   const { state } = useSandbox();
+  const identity = useUserIdentity();
   const [businessContextReady, setBusinessContextReady] = useState<boolean | null>(null);
-  const [firstName, setFirstName] = useState("");
-  const [timezone, setTimezone] = useState("");
   const [now, setNow] = useState<Date | null>(null);
 
   const connectedCount = getConnectedChannelCount(state);
@@ -48,22 +48,19 @@ export function DashboardClient() {
     void fetch("/api/business-context").then((response) => (response.ok ? response.json() : null)).then((data: { businessContext: { status: string } | null } | null) => {
       setBusinessContextReady(data?.businessContext?.status === "ready");
     });
-    void fetch("/api/workspace").then((response) => (response.ok ? response.json() : null)).then((data: { workspace: { first_name: string; default_timezone: string } } | null) => {
-      if (!data) return;
-      setFirstName(data.workspace.first_name ?? "");
-      setTimezone(data.workspace.default_timezone ?? "");
-    });
   }, []);
 
   const dateLabel = useMemo(() => (now ? now.toLocaleDateString("fr-FR", { day: "numeric", month: "long", year: "numeric" }) : ""), [now]);
   const updatedAtLabel = now ? `Actualisé à ${formatTime(now)}` : "";
-  const locationLabel = timezone ? timezone.replace(/_/g, " ").split("/").reverse().join(" — ") : "";
 
   return <div className="dashboard-page">
     <header className="dashboard-brief">
-      {locationLabel ? <p className="dashboard-brief__eyebrow">Brief quotidien — {locationLabel}</p> : <p className="dashboard-brief__eyebrow">Brief quotidien</p>}
+      <p className="dashboard-brief__eyebrow">Brief quotidien</p>
       <div className="dashboard-brief__head">
-        <h1>{greeting(now?.getHours() ?? 12)}{firstName ? `, ${firstName}` : ""}. {dateLabel ? <span>Nous sommes le {dateLabel}.</span> : null}</h1>
+        <div>
+          <h1>{greeting(now?.getHours() ?? 12)}{identity.firstName ? `, ${identity.firstName}` : ""}.</h1>
+          {dateLabel ? <p className="dashboard-brief__date">Nous sommes le {dateLabel}.</p> : null}
+        </div>
         <Link className="connection-button" href="/app/connections"><LuUnplug aria-hidden="true" />Connexions</Link>
       </div>
       <p className="dashboard-brief__tagline">Votre suivi commercial, en un coup d’œil.</p>
@@ -75,6 +72,25 @@ export function DashboardClient() {
       <div><h2>Configurez le profil de votre entreprise</h2><p>Talvia peut analyser votre site web pour préparer un profil utile à vos échanges commerciaux.</p></div>
       <Link className="connection-button" href="/app/onboarding">Configurer<LuArrowRight aria-hidden="true" /></Link>
     </GlassCard> : null}
+
+    <GlassCard className="dashboard-setup">
+      <div className="dashboard-setup__intro">
+        <p className="dashboard-kicker">MISE EN PLACE</p>
+        <h2>Un espace prêt à structurer votre suivi.</h2>
+        <p>Configurez vos canaux, puis organisez vos conversations, contacts et opportunités à votre rythme.</p>
+      </div>
+      <div className="dashboard-setup__progress" aria-label={`${connectedCount} canaux connectés sur ${channelMap.length}`}>
+        <div className="dashboard-progress-label"><strong>{connectedCount} sur {channelMap.length} canaux configurés</strong><span>{remainingCount === 0 ? "Votre espace est prêt à accueillir vos premiers échanges." : `${remainingCount} canal(x) à configurer pour compléter votre espace.`}</span></div>
+        <div aria-hidden="true" className="dashboard-progress-track"><span style={{ width: `${(connectedCount / channelMap.length) * 100}%` }} /></div>
+        <div className="dashboard-channel-statuses">
+          {channelMap.map(({ id, label }) => <div className="dashboard-channel-status" key={id}>
+            <ChannelLogo channel={id} />
+            <span>{label}</span>
+            <StatusBadge status={state.connections[id].status} />
+          </div>)}
+        </div>
+      </div>
+    </GlassCard>
 
     <section aria-label="Indicateurs du jour" className="dashboard-stats-grid">
       <GlassCard className="dashboard-stat-card">
@@ -98,25 +114,6 @@ export function DashboardClient() {
         <p>{updatedAtLabel}</p>
       </GlassCard>
     </section>
-
-    <GlassCard className="dashboard-setup">
-      <div className="dashboard-setup__intro">
-        <p className="dashboard-kicker">MISE EN PLACE</p>
-        <h2>Un espace prêt à structurer votre suivi.</h2>
-        <p>Configurez vos canaux, puis organisez vos conversations, contacts et opportunités à votre rythme.</p>
-      </div>
-      <div className="dashboard-setup__progress" aria-label={`${connectedCount} canaux connectés sur ${channelMap.length}`}>
-        <div className="dashboard-progress-label"><strong>{connectedCount} sur {channelMap.length} canaux configurés</strong><span>{remainingCount === 0 ? "Votre espace est prêt à accueillir vos premiers échanges." : `${remainingCount} canal(x) à configurer pour compléter votre espace.`}</span></div>
-        <div aria-hidden="true" className="dashboard-progress-track"><span style={{ width: `${(connectedCount / channelMap.length) * 100}%` }} /></div>
-        <div className="dashboard-channel-statuses">
-          {channelMap.map(({ id, label }) => <div className="dashboard-channel-status" key={id}>
-            <ChannelLogo channel={id} />
-            <span>{label}</span>
-            <StatusBadge status={state.connections[id].status} />
-          </div>)}
-        </div>
-      </div>
-    </GlassCard>
 
     <div className="dashboard-secondary-grid">
       <GlassCard className="dashboard-secondary-card">
