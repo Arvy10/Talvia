@@ -164,3 +164,21 @@ export async function listChatAttendees(config: UnipileConfig, chatId: string): 
   const data = await unipileGet<{ items: UnipileChatAttendee[] }>(config, `/api/v1/chats/${chatId}/attendees`);
   return data.items;
 }
+
+// https://developer.unipile.com/reference/chatscontroller_sendmessageinchat — this is
+// the one call in this module that has a real, irreversible side effect on
+// LinkedIn (a real person receives a real message), unlike every read-only
+// call above.
+export async function sendChatMessage(config: UnipileConfig, chatId: string, text: string): Promise<string | null> {
+  const form = new FormData();
+  form.set("text", text);
+  const response = await fetch(`${config.apiUrl}/api/v1/chats/${chatId}/messages`, {
+    method: "POST",
+    headers: { "X-API-KEY": config.apiKey, accept: "application/json" },
+    body: form,
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error(`Unipile send message failed (${response.status}).`);
+  const data = await response.json() as { object: string; message_id: string | null };
+  return data.message_id;
+}

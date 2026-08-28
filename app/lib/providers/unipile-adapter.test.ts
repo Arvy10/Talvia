@@ -106,6 +106,15 @@ function createFakeDatabase() {
       return { rows: [] };
     }
 
+    if (text.startsWith("insert into messages(workspace_id,conversation_id,direction,body,status,provider_message_id,sent_at)")) {
+      const [workspaceId, conversationId, body, providerMessageId] = params as string[];
+      const existing = messages.find((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId);
+      if (existing) { existing.status = "sent"; return { rows: [{ id: existing.id, created_at: existing.created_at }] }; }
+      const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, direction: "outbound", sender_contact_id: null, body, status: "sent", provider_message_id: providerMessageId, created_at: new Date().toISOString() };
+      messages.push(row);
+      return { rows: [{ id: row.id, created_at: row.created_at }] };
+    }
+
     if (text.startsWith("insert into messages")) {
       const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId] = params as string[];
       if (messages.some((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId)) {
@@ -123,6 +132,15 @@ function createFakeDatabase() {
       return { rows: [{ id: row.id, created_at: row.created_at }] };
     }
 
+    if (text.startsWith("select v.external_thread_id,c.external_account_id,c.status")) {
+      const [workspaceId, conversationId, provider] = params as string[];
+      const conversation = conversations.find((c) => c.id === conversationId && c.workspace_id === workspaceId);
+      if (!conversation) return { rows: [] };
+      const connection = connections.find((c) => c.id === conversation.connection_id && c.provider === provider);
+      if (!connection) return { rows: [] };
+      return { rows: [{ external_thread_id: conversation.external_thread_id, external_account_id: connection.external_account_id, status: connection.status }] };
+    }
+
     throw new Error(`unhandled query in fake database: ${text}`);
   }
 
@@ -132,9 +150,18 @@ function createFakeDatabase() {
 let fakeDatabase = createFakeDatabase();
 vi.mock("../database", () => ({ get database() { return fakeDatabase; } }));
 
-const { ingestAccountStatus, ingestHostedAuthNotification, ingestMessage } = await import("./unipile-adapter");
+// sendMessage's own DB logic is what's under test here — sendChatMessage
+// itself is a real network call to Unipile, mocked to isolate that.
+const sendChatMessageMock = vi.hoisted(() => vi.fn(async () => "provider-msg-outbound-1"));
+vi.mock("./unipile", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./unipile")>()),
+  getUnipileConfig: () => ({ apiKey: "test-key", apiUrl: "https://api.test", webhookSecret: "test-secret", appBaseUrl: "https://app.test" }),
+  sendChatMessage: sendChatMessageMock,
+}));
 
-beforeEach(() => { fakeDatabase = createFakeDatabase(); });
+const { ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, sendMessage } = await import("./unipile-adapter");
+
+beforeEach(() => { fakeDatabase = createFakeDatabase(); sendChatMessageMock.mockClear(); });
 
 const workspaceId = "ws-1";
 const accountId = "acct-unipile-1";
@@ -288,5 +315,33 @@ describe("ingestMessage", () => {
     expect(conversation!.contact_id).not.toBe("contact-self-bug");
     expect(fakeDatabase.participants.some((p) => p.conversation_id === "conv-poisoned" && p.contact_id === "contact-self-bug")).toBe(false);
     expect(fakeDatabase.contacts.find((c) => c.id === conversation!.contact_id)).toMatchObject({ display_name: "Jane Doe" });
+  });
+});
+
+describe("sendMessage", () => {
+  it("sends via Unipile and stores the message as outbound/sent, keyed by the returned provider message id", async () => {
+    await connectAccount();
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
+
+    const result = await sendMessage(workspaceId, "conv-1", "Merci, à bientôt !");
+
+    expect(sendChatMessageMock).toHaveBeenCalledWith(expect.anything(), "chat-1", "Merci, à bientôt !");
+    expect(result).toMatchObject({ direction: "outbound", status: "sent", body: "Merci, à bientôt !" });
+    expect(fakeDatabase.messages).toHaveLength(1);
+    expect(fakeDatabase.messages[0]).toMatchObject({ direction: "outbound", provider_message_id: "provider-msg-outbound-1", sender_contact_id: null });
+  });
+
+  it("refuses to send on a conversation with no real provider connection behind it", async () => {
+    fakeDatabase.conversations.push({ id: "conv-manual", workspace_id: workspaceId, connection_id: null, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: null, last_message_at: null });
+    await expect(sendMessage(workspaceId, "conv-manual", "Bonjour")).rejects.toThrow();
+    expect(sendChatMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses to send when the connection isn't actually connected", async () => {
+    await connectAccount();
+    fakeDatabase.connections[0]!.status = "error";
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
+    await expect(sendMessage(workspaceId, "conv-1", "Bonjour")).rejects.toThrow();
+    expect(sendChatMessageMock).not.toHaveBeenCalled();
   });
 });

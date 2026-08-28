@@ -6,6 +6,7 @@ import {
   listChatAttendees,
   listChatMessages,
   listChats,
+  sendChatMessage,
   toConnectionStatus,
   type UnipileAccountStatusPayload,
   type UnipileHostedAuthNotifyPayload,
@@ -297,4 +298,52 @@ export async function backfillConnectionHistory(connectionId: string): Promise<B
   } while (chatsCursor);
 
   return summary;
+}
+
+export type SendMessageResult = { id: string; body: string; direction: "outbound"; status: "sent"; createdAt: string };
+
+// The one write path in this module with a real, irreversible external
+// effect: a real LinkedIn message to a real person. Only usable on a
+// conversation whose connection is an actually-connected Unipile channel —
+// api/inbox/conversations/[id]/messages falls back to a local draft
+// (createDraft in lib/inbox.ts) for everything else, same as before this
+// existed.
+export async function sendMessage(workspaceId: string, conversationId: string, text: string): Promise<SendMessageResult> {
+  const config = getUnipileConfig();
+  if (!config) throw new Error("Unipile n'est pas configuré sur cet environnement.");
+
+  const result = await database.query<{ external_thread_id: string | null; external_account_id: string; status: string }>(
+    `select v.external_thread_id,c.external_account_id,c.status
+     from conversations v join connections c on c.id=v.connection_id
+     where v.workspace_id=$1 and v.id=$2 and c.provider=$3`,
+    [workspaceId, conversationId, PROVIDER],
+  );
+  const row = result.rows[0];
+  if (!row?.external_thread_id) throw new Error("Ce canal n'est pas encore relié à un fournisseur réel.");
+  if (row.status !== "connected") throw new Error("Ce canal n'est pas connecté.");
+
+  const messageId = await sendChatMessage(config, row.external_thread_id, text);
+
+  // ON CONFLICT DO UPDATE (a no-op update, not DO NOTHING) so this always
+  // returns a row even in the rare race where the webhook for this exact
+  // send already landed first — the message truly did go out either way.
+  const inserted = await database.query<{ id: string; created_at: string }>(
+    `insert into messages(workspace_id,conversation_id,direction,body,status,provider_message_id,sent_at)
+     values($1,$2,'outbound',$3,'sent',$4,now())
+     on conflict(conversation_id,provider_message_id) where provider_message_id is not null do update set status=excluded.status
+     returning id,created_at`,
+    [workspaceId, conversationId, text, messageId],
+  );
+  const savedRow = inserted.rows[0]!;
+
+  await database.query(`update conversations set last_message_at=now(),updated_at=now() where id=$1`, [conversationId]);
+  const activity = await recordSystemActivity(workspaceId, {
+    eventType: "message.sent",
+    entityType: "conversation",
+    entityId: conversationId,
+    metadata: { conversationId },
+  });
+  await dispatchCommittedActivity(activity);
+
+  return { id: savedRow.id, body: text, direction: "outbound", status: "sent", createdAt: savedRow.created_at };
 }

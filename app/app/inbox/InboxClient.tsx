@@ -205,7 +205,8 @@ export function InboxClient() {
       },
     );
     if (!response.ok) {
-      setError("Impossible d’enregistrer le brouillon.");
+      const data = (await response.json().catch(() => null)) as { error?: string } | null;
+      setError(data?.error ?? "Impossible d’envoyer le message.");
       return;
     }
     setDraft("");
