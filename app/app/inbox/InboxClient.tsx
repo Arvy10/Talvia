@@ -2,11 +2,14 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   LuArrowLeft,
   LuArrowRight,
   LuBot,
+  LuCheck,
+  LuCheckCheck,
+  LuClock,
   LuEllipsis,
   LuInbox,
   LuMessageCircle,
@@ -45,6 +48,29 @@ type ApiConversation = {
   messages: ApiMessage[];
 };
 type Thread = ApiConversation & { key: string; latest?: ApiMessage };
+
+function isSameDay(a: string, b: string) {
+  const dateA = new Date(a);
+  const dateB = new Date(b);
+  return dateA.toDateString() === dateB.toDateString();
+}
+
+function dateSeparatorLabel(iso: string) {
+  const date = new Date(iso);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === today.toDateString()) return "Aujourd’hui";
+  if (date.toDateString() === yesterday.toDateString()) return "Hier";
+  return date.toLocaleDateString("fr", { day: "numeric", month: "long", year: date.getFullYear() === today.getFullYear() ? undefined : "numeric" });
+}
+
+function MessageStatus({ status }: { status: ApiMessage["status"] }) {
+  if (status === "read") return <LuCheckCheck aria-label="Lu" className="inbox-message__status inbox-message__status--read" />;
+  if (status === "delivered") return <LuCheckCheck aria-label="Distribué" className="inbox-message__status" />;
+  if (status === "sent") return <LuCheck aria-label="Envoyé" className="inbox-message__status" />;
+  return <LuClock aria-label="En cours" className="inbox-message__status" />;
+}
 
 function ContactAvatar({ contact, large }: { contact?: Pick<Contact, "name" | "avatarUrl">; large?: boolean }) {
   const className = large ? "inbox-avatar inbox-avatar--large" : "inbox-avatar";
@@ -437,20 +463,29 @@ export function InboxClient() {
                 <p>Commencez la conversation avec ce contact.</p>
               </div>
             ) : (
-              threadMessages.map((message) => (
-                <div
-                  className={`inbox-message inbox-message--${message.direction}`}
-                  key={message.id}
-                >
-                  <p>{message.body}</p>
-                  <span>
-                    {new Date(message.createdAt).toLocaleTimeString("fr", {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                  </span>
-                </div>
-              ))
+              threadMessages.map((message, index) => {
+                const previous = threadMessages[index - 1];
+                const showDateSeparator = !previous || !isSameDay(previous.createdAt, message.createdAt);
+                return (
+                  <Fragment key={message.id}>
+                    {showDateSeparator ? (
+                      <div className="inbox-date-separator">
+                        <span>{dateSeparatorLabel(message.createdAt)}</span>
+                      </div>
+                    ) : null}
+                    <div className={`inbox-message inbox-message--${message.direction}`}>
+                      <p>{message.body}</p>
+                      <span>
+                        {new Date(message.createdAt).toLocaleTimeString("fr", {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                        {message.direction === "outbound" ? <MessageStatus status={message.status} /> : null}
+                      </span>
+                    </div>
+                  </Fragment>
+                );
+              })
             )}
           </div>
           {activeThread ? (

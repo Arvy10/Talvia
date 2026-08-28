@@ -132,6 +132,16 @@ function createFakeDatabase() {
       return { rows: [{ id: row.id, created_at: row.created_at }] };
     }
 
+    if (text.startsWith("update messages m set status=")) {
+      const [status, provider, accountId, externalThreadId, providerMessageId] = params as string[];
+      const connection = connections.find((c) => c.provider === provider && c.external_account_id === accountId);
+      const conversation = connection ? conversations.find((c) => c.connection_id === connection.id && c.external_thread_id === externalThreadId) : undefined;
+      const message = conversation ? messages.find((m) => m.conversation_id === conversation.id && m.provider_message_id === providerMessageId && m.status !== "read") : undefined;
+      if (!message) return { rows: [] };
+      message.status = status;
+      return { rows: [{ id: message.id }] };
+    }
+
     if (text.startsWith("select v.external_thread_id,c.external_account_id,c.status")) {
       const [workspaceId, conversationId, provider] = params as string[];
       const conversation = conversations.find((c) => c.id === conversationId && c.workspace_id === workspaceId);
@@ -343,5 +353,40 @@ describe("sendMessage", () => {
     fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
     await expect(sendMessage(workspaceId, "conv-1", "Bonjour")).rejects.toThrow();
     expect(sendChatMessageMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("ingestMessage — delivery/read receipts", () => {
+  it("marks a sent message delivered, then read, on the matching receipt events", async () => {
+    await connectAccount();
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
+    await sendMessage(workspaceId, "conv-1", "Bonjour");
+    expect(fakeDatabase.messages[0]!.status).toBe("sent");
+
+    const delivered = await ingestMessage({ ...messagePayload(), event: "message_delivered", chat_id: "chat-1", message_id: "provider-msg-outbound-1" });
+    expect(delivered).toEqual({ status: "ingested" });
+    expect(fakeDatabase.messages[0]!.status).toBe("delivered");
+
+    const read = await ingestMessage({ ...messagePayload(), event: "message_read", chat_id: "chat-1", message_id: "provider-msg-outbound-1" });
+    expect(read).toEqual({ status: "ingested" });
+    expect(fakeDatabase.messages[0]!.status).toBe("read");
+  });
+
+  it("does not regress a message already marked read back to delivered on a stale redelivery", async () => {
+    await connectAccount();
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
+    await sendMessage(workspaceId, "conv-1", "Bonjour");
+    await ingestMessage({ ...messagePayload(), event: "message_read", chat_id: "chat-1", message_id: "provider-msg-outbound-1" });
+
+    const stale = await ingestMessage({ ...messagePayload(), event: "message_delivered", chat_id: "chat-1", message_id: "provider-msg-outbound-1" });
+    expect(stale).toEqual({ status: "duplicate" });
+    expect(fakeDatabase.messages[0]!.status).toBe("read");
+  });
+
+  it("is a no-op for a receipt on a message that was never stored", async () => {
+    await connectAccount();
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
+    const result = await ingestMessage({ ...messagePayload(), event: "message_read", chat_id: "chat-1", message_id: "never-sent" });
+    expect(result).toEqual({ status: "duplicate" });
   });
 });

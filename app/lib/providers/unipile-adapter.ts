@@ -152,10 +152,31 @@ function resolveCounterparty(payload: UnipileNewMessagePayload): { attendee: Att
   return other ? { attendee: other, isOutbound: true } : null;
 }
 
+// "Was it delivered / seen" — the receipt only carries chat_id + message_id,
+// no sender/attendee info, so this never touches Contact resolution at all,
+// just moves an existing row forward in the pending -> sent -> delivered ->
+// read progression. Guarded against regressing 'read' back to 'delivered'
+// on an out-of-order redelivery.
+async function ingestMessageStatusUpdate(payload: UnipileNewMessagePayload): Promise<IngestResult> {
+  const status = payload.event === "message_read" ? "read" : "delivered";
+  const result = await database.query<{ id: string }>(
+    `update messages m set status=$1
+     from conversations v, connections c
+     where m.conversation_id=v.id and v.connection_id=c.id
+       and c.provider=$2 and c.external_account_id=$3
+       and v.external_thread_id=$4 and m.provider_message_id=$5
+       and m.status<>'read'
+     returning m.id`,
+    [status, PROVIDER, payload.account_id, payload.chat_id, payload.message_id],
+  );
+  return { status: result.rows[0] ? "ingested" : "duplicate" };
+}
+
 // Idempotent by (conversation_id, provider_message_id) — a redelivered
 // webhook for a message we already stored is a safe no-op, matching the
 // same unique-constraint pattern createTestInbound() uses in lib/inbox.ts.
 export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<IngestResult> {
+  if (payload.event === "message_read" || payload.event === "message_delivered") return ingestMessageStatusUpdate(payload);
   if (payload.event !== "message_received") return { status: "unknown_account" };
   const resolved = resolveCounterparty(payload);
   if (!resolved) return { status: "unknown_account" };
