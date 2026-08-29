@@ -111,7 +111,10 @@ function toContactChannelType(channelType: string): "linkedin" | "whatsapp" | "o
 // filed under a 'linkedin' contact identity and run through LinkedIn's URL
 // normalizer on what's actually a phone number. Fixed by threading the real
 // channel type through from the connection row.
-async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, channelType: string, providerId: string, profileUrl: string | undefined, displayName: string, avatarUrl?: string, occupation?: string) {
+// Exported for reuse by app/lib/prospecting.ts, which needs the exact same
+// dedup-by-contact_identities behavior for LinkedIn search candidates that
+// get approved into real Contacts.
+export async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, channelType: string, providerId: string, profileUrl: string | undefined, displayName: string, avatarUrl?: string, occupation?: string) {
   const contactChannelType = toContactChannelType(channelType);
   const identifier = profileUrl || providerId;
   const identifierNormalized = contactChannelType === "linkedin"
@@ -277,6 +280,7 @@ export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<
     }
 
     await client.query(`update conversations set last_message_at=now(),updated_at=now() where id=$1`, [conversationId]);
+    const acceptedInvites = await markProspectingInvitesAccepted(client, workspaceId, contactId);
     const activity = await recordSystemActivity(workspaceId, {
       eventType: isOutbound ? "message.sent" : "message.received",
       entityType: "conversation",
@@ -285,12 +289,53 @@ export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<
     }, client);
     await client.query("commit");
     await dispatchCommittedActivity(activity);
+    for (const participant of acceptedInvites) {
+      await sendProspectingFollowUp(workspaceId, participant.id, participant.campaign_id, conversationId);
+    }
     return { status: "ingested" };
   } catch (error) {
     await client.query("rollback");
     throw error;
   } finally {
     client.release();
+  }
+}
+
+// --- LinkedIn prospecting: invitation acceptance detection ---
+// Per Unipile's docs, an invitation sent with a personalized note opens a
+// chat whose first message IS that note once accepted — so acceptance
+// arrives through this same message-ingestion path, not a separate
+// 'new_relation' webhook subscription (which can lag up to 8 hours since
+// LinkedIn has no real-time support for it). See app/lib/prospecting.ts for
+// the sending side of this flow.
+async function markProspectingInvitesAccepted(client: import("pg").PoolClient, workspaceId: string, contactId: string): Promise<Array<{ id: string; campaign_id: string }>> {
+  const result = await client.query<{ id: string; campaign_id: string }>(
+    `update campaign_participants set invite_accepted_at=now(),updated_at=now()
+     where contact_id=$1 and invite_sent_at is not null and invite_accepted_at is null
+       and campaign_id in (select id from campaigns where workspace_id=$2)
+     returning id,campaign_id`,
+    [contactId, workspaceId],
+  );
+  return result.rows;
+}
+
+// Advances the participant to the sequence's message step (if one exists —
+// an invite-only sequence with no follow-up step is valid, just a no-op
+// here) and sends it. Runs after ingestMessage's own transaction commits: a
+// real Unipile send must never happen while still holding the row locks
+// from that transaction.
+async function sendProspectingFollowUp(workspaceId: string, participantId: string, campaignId: string, conversationId: string): Promise<void> {
+  const step = await database.query<{ id: string; message_template: string | null }>(
+    `select id,message_template from campaign_steps where campaign_id=$1 and step_type='message' order by position limit 1`,
+    [campaignId],
+  );
+  const messageStep = step.rows[0];
+  if (!messageStep?.message_template) return;
+  await database.query(`update campaign_participants set current_step_id=$1,status='completed',updated_at=now() where id=$2`, [messageStep.id, participantId]);
+  try {
+    await sendMessage(workspaceId, conversationId, messageStep.message_template);
+  } catch (error) {
+    console.error(`[prospecting] follow-up message failed for participant ${participantId}`, error);
   }
 }
 

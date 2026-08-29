@@ -7,7 +7,7 @@ import type { WorkspaceContext } from "./workspace-context";
 export type CampaignChannel = "linkedin" | "whatsapp" | "email";
 export type CampaignObjective = "prospecting" | "follow_up" | "reactivation";
 export type CampaignStatus = "draft" | "active" | "paused" | "completed" | "archived";
-export type CampaignStepType = "message" | "wait" | "follow_up" | "end";
+export type CampaignStepType = "invite" | "message" | "wait" | "follow_up" | "end";
 export type ParticipantStatus = "waiting" | "active" | "replied" | "completed" | "stopped";
 
 export type CampaignStepInput = { id?: string; position: number; stepType: CampaignStepType; channelType?: CampaignChannel; delayValue?: number; delayUnit?: "minutes" | "hours" | "days"; messageTemplate?: string };

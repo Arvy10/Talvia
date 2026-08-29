@@ -221,6 +221,70 @@ export async function editChatMessage(config: UnipileConfig, messageId: string, 
   if (!response.ok) throw new Error(`Unipile edit message failed (${response.status}).`);
 }
 
+// --- LinkedIn prospecting (search + invite) ---
+// Search result shape below is best-effort from Unipile's docs (a Sales
+// Navigator example was the only one with a full worked response) — verify
+// against a real call before relying on any field not already used here.
+
+export type UnipileSearchCriteria = {
+  keywords?: string;
+  advancedKeywords?: { firstName?: string; lastName?: string; title?: string };
+};
+
+export type UnipileSearchResult = {
+  id: string;
+  name: string;
+  headline?: string;
+  profile_url?: string;
+  profile_picture_url?: string;
+  location?: string;
+  current_positions?: Array<{ company?: string; role?: string }>;
+};
+
+// https://developer.unipile.com/reference/linkedincontroller_search — V1 only
+// uses free-text `keywords`/`advanced_keywords` (no request needed to resolve
+// LinkedIn's numeric parameter IDs for industry/location/company, which
+// `keywords` alone sidesteps); LinkedIn Classic search only, not Sales
+// Navigator.
+export async function searchLinkedInPeople(config: UnipileConfig, accountId: string, criteria: UnipileSearchCriteria, cursor?: string): Promise<{ items: UnipileSearchResult[]; cursor: string | null }> {
+  const params = new URLSearchParams({ account_id: accountId, limit: "50" });
+  if (cursor) params.set("cursor", cursor);
+  const response = await fetch(`${config.apiUrl}/api/v1/linkedin/search?${params.toString()}`, {
+    method: "POST",
+    headers: { "X-API-KEY": config.apiKey, accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify({
+      api: "classic",
+      category: "people",
+      keywords: criteria.keywords,
+      advanced_keywords: criteria.advancedKeywords ? {
+        first_name: criteria.advancedKeywords.firstName,
+        last_name: criteria.advancedKeywords.lastName,
+        title: criteria.advancedKeywords.title,
+      } : undefined,
+    }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error(`Unipile LinkedIn search failed (${response.status}).`);
+  const data = await response.json() as { items: UnipileSearchResult[]; cursor: string | null };
+  return { items: data.items, cursor: data.cursor ?? null };
+}
+
+// https://developer.unipile.com/reference/userscontroller_adduserbyidentifier
+// — the one call in this section with a real, irreversible external effect:
+// a real LinkedIn invitation to a real person. `message` is capped at 300
+// characters by LinkedIn itself; callers must truncate before calling this.
+export async function sendLinkedInInvitation(config: UnipileConfig, accountId: string, providerId: string, message?: string): Promise<string> {
+  const response = await fetch(`${config.apiUrl}/api/v1/users/invite`, {
+    method: "POST",
+    headers: { "X-API-KEY": config.apiKey, accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify({ account_id: accountId, provider_id: providerId, message: message?.slice(0, 300) }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error(`Unipile LinkedIn invitation failed (${response.status}).`);
+  const data = await response.json() as { object: string; invitation_id: string };
+  return data.invitation_id;
+}
+
 // https://developer.unipile.com/reference/messagescontroller_getattachment —
 // binary passthrough. Never expose UNIPILE_API_KEY to the browser, so the
 // frontend never talks to Unipile directly for media; this is proxied

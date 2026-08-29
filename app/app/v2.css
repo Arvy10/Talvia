@@ -49,3 +49,8 @@
 .inbox-older-loading{padding:8px 0;color:#948c99;font-size:9px;text-align:center}
 
 .inbox-new-message-pill{position:absolute;left:50%;bottom:96px;transform:translateX(-50%);padding:7px 14px;border:1px solid #ff6b4a55;border-radius:99px;background:#241a1f;color:#ffb199;font-size:10px;font-weight:600;box-shadow:0 6px 20px #00000040;cursor:pointer;z-index:4}
+
+/* --- LinkedIn prospecting panel (Campaigns) --- */
+.campaign-detail-panel__footer{margin-top:14px;padding-top:14px;border-top:1px solid #ffffff0e;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.campaign-detail-panel__footer p{margin:0;color:#c0b9c3;font-size:9px;flex:1}
+.campaign-detail-panel__footer small{color:#8a828e;font-size:8px}

@@ -13,6 +13,9 @@ function createFakeDatabase() {
   const participants: Array<Record<string, unknown>> = [];
   const messages: Array<Record<string, unknown>> = [];
   const activities: Array<Record<string, unknown>> = [];
+  const campaigns: Array<Record<string, unknown>> = [];
+  const campaignSteps: Array<Record<string, unknown>> = [];
+  const campaignParticipants: Array<Record<string, unknown>> = [];
   let seq = 0;
   const nextId = (prefix: string) => `${prefix}-${(seq += 1)}`;
 
@@ -175,10 +178,29 @@ function createFakeDatabase() {
       return { rows: [{ external_thread_id: conversation.external_thread_id, external_account_id: connection.external_account_id, status: connection.status }] };
     }
 
+    if (text.startsWith("update campaign_participants set invite_accepted_at=now()")) {
+      const [contactId, workspaceId] = params as string[];
+      const campaignIds = new Set(campaigns.filter((c) => c.workspace_id === workspaceId).map((c) => c.id));
+      const matches = campaignParticipants.filter((p) => p.contact_id === contactId && p.invite_sent_at && !p.invite_accepted_at && campaignIds.has(p.campaign_id));
+      for (const p of matches) p.invite_accepted_at = new Date().toISOString();
+      return { rows: matches.map((p) => ({ id: p.id, campaign_id: p.campaign_id })) };
+    }
+    if (text.startsWith("select id,message_template from campaign_steps where campaign_id=$1 and step_type='message'")) {
+      const [campaignId] = params as string[];
+      const row = campaignSteps.filter((s) => s.campaign_id === campaignId && s.step_type === "message").sort((a, b) => (a.position as number) - (b.position as number))[0];
+      return { rows: row ? [{ id: row.id, message_template: row.message_template }] : [] };
+    }
+    if (text.startsWith("update campaign_participants set current_step_id=$1,status='completed'")) {
+      const [stepId, participantId] = params as string[];
+      const row = campaignParticipants.find((p) => p.id === participantId);
+      if (row) { row.current_step_id = stepId; row.status = "completed"; }
+      return { rows: [] };
+    }
+
     throw new Error(`unhandled query in fake database: ${text}`);
   }
 
-  return { query, connect: async () => ({ query, release: () => {} }), connections, contacts, contactIdentities, conversations, participants, messages, activities };
+  return { query, connect: async () => ({ query, release: () => {} }), connections, contacts, contactIdentities, conversations, participants, messages, activities, campaigns, campaignSteps, campaignParticipants };
 }
 
 let fakeDatabase = createFakeDatabase();
@@ -476,6 +498,32 @@ describe("ingestMessage — attachments", () => {
     }));
 
     expect(fakeDatabase.messages[0]!.metadata).toEqual({});
+  });
+});
+
+describe("ingestMessage — LinkedIn prospecting acceptance detection", () => {
+  it("marks a pending invite accepted and sends the follow-up message when the prospect messages back", async () => {
+    await connectAccount();
+    fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe" });
+    fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
+    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId });
+    fakeDatabase.campaignSteps.push({ id: "step-invite", campaign_id: "camp-1", position: 0, step_type: "invite", message_template: null });
+    fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Ravi de vous compter parmi mes relations !" });
+    fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-jane", status: "active", current_step_id: "step-invite", invite_sent_at: new Date(Date.now() - 60_000).toISOString(), invite_accepted_at: null });
+
+    const result = await ingestMessage(messagePayload());
+
+    expect(result).toEqual({ status: "ingested" });
+    expect(fakeDatabase.campaignParticipants[0]).toMatchObject({ status: "completed", current_step_id: "step-message" });
+    expect(fakeDatabase.campaignParticipants[0]!.invite_accepted_at).not.toBeNull();
+    expect(sendChatMessageMock).toHaveBeenCalledWith(expect.anything(), "chat-1", "Ravi de vous compter parmi mes relations !");
+  });
+
+  it("does nothing for a contact with no pending prospecting invite", async () => {
+    await connectAccount();
+    const result = await ingestMessage(messagePayload());
+    expect(result).toEqual({ status: "ingested" });
+    expect(sendChatMessageMock).not.toHaveBeenCalled();
   });
 });
 
