@@ -196,6 +196,11 @@ function createFakeDatabase() {
       if (row) { row.current_step_id = stepId; row.status = "completed"; }
       return { rows: [] };
     }
+    if (text.startsWith("select ct.first_name,ct.last_name,co.name company from contacts")) {
+      const [workspaceId, contactId] = params as string[];
+      const row = contacts.find((c) => c.workspace_id === workspaceId && c.id === contactId);
+      return { rows: row ? [{ first_name: row.first_name ?? null, last_name: row.last_name ?? null, company: row.company ?? null }] : [] };
+    }
 
     throw new Error(`unhandled query in fake database: ${text}`);
   }
@@ -504,11 +509,11 @@ describe("ingestMessage — attachments", () => {
 describe("ingestMessage — LinkedIn prospecting acceptance detection", () => {
   it("marks a pending invite accepted and sends the follow-up message when the prospect messages back", async () => {
     await connectAccount();
-    fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe" });
+    fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe", first_name: "Jane", last_name: "Doe", company: "Acme Corp" });
     fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
     fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId });
     fakeDatabase.campaignSteps.push({ id: "step-invite", campaign_id: "camp-1", position: 0, step_type: "invite", message_template: null });
-    fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Ravi de vous compter parmi mes relations !" });
+    fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Bonjour {first_name}, ravi de vous compter parmi mes relations ! J'aimerais échanger sur ce que fait {company}." });
     fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-jane", status: "active", current_step_id: "step-invite", invite_sent_at: new Date(Date.now() - 60_000).toISOString(), invite_accepted_at: null });
 
     const result = await ingestMessage(messagePayload());
@@ -516,7 +521,9 @@ describe("ingestMessage — LinkedIn prospecting acceptance detection", () => {
     expect(result).toEqual({ status: "ingested" });
     expect(fakeDatabase.campaignParticipants[0]).toMatchObject({ status: "completed", current_step_id: "step-message" });
     expect(fakeDatabase.campaignParticipants[0]!.invite_accepted_at).not.toBeNull();
-    expect(sendChatMessageMock).toHaveBeenCalledWith(expect.anything(), "chat-1", "Ravi de vous compter parmi mes relations !");
+    // The template's {first_name}/{company} placeholders must be substituted
+    // with the real contact's data, not sent out as literal braces.
+    expect(sendChatMessageMock).toHaveBeenCalledWith(expect.anything(), "chat-1", "Bonjour Jane, ravi de vous compter parmi mes relations ! J'aimerais échanger sur ce que fait Acme Corp.");
   });
 
   it("does nothing for a contact with no pending prospecting invite", async () => {

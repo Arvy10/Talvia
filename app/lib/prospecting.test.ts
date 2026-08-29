@@ -258,7 +258,9 @@ describe("sendInviteBatch", () => {
     const result = await sendInviteBatch(context, "camp-1", undefined, { min: 0, spread: 0 });
 
     expect(result).toEqual({ sent: 1, failed: 0 });
-    expect(sendLinkedInInvitationMock).toHaveBeenCalledWith(expect.anything(), "acct-1", "prov-1", expect.any(String));
+    // The invitation note is personalized with the candidate's own first
+    // name, not a generic blast — even on the no-AI-provider fallback path.
+    expect(sendLinkedInInvitationMock).toHaveBeenCalledWith(expect.anything(), "acct-1", "prov-1", expect.stringContaining("Awa"));
     expect(fakeDatabase.campaignParticipants[0]!.invite_sent_at).not.toBeNull();
   });
 

@@ -290,7 +290,7 @@ export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<
     await client.query("commit");
     await dispatchCommittedActivity(activity);
     for (const participant of acceptedInvites) {
-      await sendProspectingFollowUp(workspaceId, participant.id, participant.campaign_id, conversationId);
+      await sendProspectingFollowUp(workspaceId, participant.id, participant.campaign_id, contactId, conversationId);
     }
     return { status: "ingested" };
   } catch (error) {
@@ -319,12 +319,24 @@ async function markProspectingInvitesAccepted(client: import("pg").PoolClient, w
   return result.rows;
 }
 
+// {first_name}/{last_name}/{company} are the placeholders the campaign
+// wizard's own helper text already promises the user ("Utilisez {first_name}
+// et {company} pour personnaliser vos messages") — this is what actually
+// makes good on that promise at send time, rather than the literal braces
+// going out untouched.
+function substitutePlaceholders(template: string, values: { firstName: string; lastName: string; company: string }): string {
+  return template
+    .replaceAll("{first_name}", values.firstName)
+    .replaceAll("{last_name}", values.lastName)
+    .replaceAll("{company}", values.company);
+}
+
 // Advances the participant to the sequence's message step (if one exists —
 // an invite-only sequence with no follow-up step is valid, just a no-op
-// here) and sends it. Runs after ingestMessage's own transaction commits: a
-// real Unipile send must never happen while still holding the row locks
-// from that transaction.
-async function sendProspectingFollowUp(workspaceId: string, participantId: string, campaignId: string, conversationId: string): Promise<void> {
+// here) and sends it, with the contact's own name/company substituted in.
+// Runs after ingestMessage's own transaction commits: a real Unipile send
+// must never happen while still holding the row locks from that transaction.
+async function sendProspectingFollowUp(workspaceId: string, participantId: string, campaignId: string, contactId: string, conversationId: string): Promise<void> {
   const step = await database.query<{ id: string; message_template: string | null }>(
     `select id,message_template from campaign_steps where campaign_id=$1 and step_type='message' order by position limit 1`,
     [campaignId],
@@ -332,8 +344,20 @@ async function sendProspectingFollowUp(workspaceId: string, participantId: strin
   const messageStep = step.rows[0];
   if (!messageStep?.message_template) return;
   await database.query(`update campaign_participants set current_step_id=$1,status='completed',updated_at=now() where id=$2`, [messageStep.id, participantId]);
+
+  const contact = await database.query<{ first_name: string | null; last_name: string | null; company: string | null }>(
+    `select ct.first_name,ct.last_name,co.name company from contacts ct left join companies co on co.id=ct.company_id and co.workspace_id=ct.workspace_id where ct.workspace_id=$1 and ct.id=$2`,
+    [workspaceId, contactId],
+  );
+  const person = contact.rows[0];
+  const message = substitutePlaceholders(messageStep.message_template, {
+    firstName: person?.first_name || "",
+    lastName: person?.last_name || "",
+    company: person?.company || "votre entreprise",
+  });
+
   try {
-    await sendMessage(workspaceId, conversationId, messageStep.message_template);
+    await sendMessage(workspaceId, conversationId, message);
   } catch (error) {
     console.error(`[prospecting] follow-up message failed for participant ${participantId}`, error);
   }
