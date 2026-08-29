@@ -116,6 +116,37 @@ function CampaignDetail({ campaign, contacts, channel, onBack, onDelete, onDupli
 
 type ProspectCandidate = { id: string; providerId: string; name: string; headline?: string; company?: string; profileUrl?: string; status: "suggested" | "approved" | "rejected" };
 
+// A visual "is this thing actually doing something" cue for prospecting —
+// deliberately tied to real state, not decorative motion for its own sake:
+// the sweep only spins fast/bright while `active` (a real search request is
+// in flight); otherwise it idles slowly. Blips are the candidates already
+// found, placed at a stable pseudo-random position derived from their id
+// (golden-angle spacing) so they don't jitter between renders.
+function ProspectingRadar({ active, candidateCount }: { active: boolean; candidateCount: number }) {
+  const blips = useMemo(() => {
+    const count = Math.min(candidateCount, 14);
+    return Array.from({ length: count }, (_, index) => {
+      const angle = (index * 137.507) % 360;
+      const radiusPct = 22 + ((index * 53) % 62);
+      const rad = (angle * Math.PI) / 180;
+      const r = (radiusPct / 100) * 88;
+      return { x: 100 + r * Math.cos(rad), y: 100 + r * Math.sin(rad), delay: (index % 6) * 0.3 };
+    });
+  }, [candidateCount]);
+
+  return <div className={`prospecting-radar${active ? " is-sweeping" : ""}`} role="img" aria-label={active ? "Recherche de prospects en cours" : `${candidateCount} prospect(s) repéré(s)`}>
+    <div className="prospecting-radar__sweep" />
+    <svg viewBox="0 0 200 200">
+      <circle className="prospecting-radar__ring" cx="100" cy="100" r="88" />
+      <circle className="prospecting-radar__ring" cx="100" cy="100" r="58" />
+      <circle className="prospecting-radar__ring" cx="100" cy="100" r="28" />
+      <line className="prospecting-radar__crosshair" x1="100" y1="8" x2="100" y2="192" />
+      <line className="prospecting-radar__crosshair" x1="8" y1="100" x2="192" y2="100" />
+      {blips.map((blip, index) => <circle className="prospecting-radar__blip" cx={blip.x} cy={blip.y} key={index} r="4" style={{ animationDelay: `${blip.delay}s` }} />)}
+    </svg>
+  </div>;
+}
+
 // Search → human review → approve → manually-triggered send, in that order.
 // Nothing here ever sends anything without an explicit click on a
 // previously-reviewed list — see app/lib/prospecting.ts for why.
@@ -174,7 +205,13 @@ function ProspectingPanel({ campaignId, campaignStatus }: { campaignId: string; 
   const approved = candidates.filter((item) => item.status === "approved");
 
   return <section className="campaign-detail-panel">
-    <h2>Prospects LinkedIn</h2>
+    <div className="prospecting-header">
+      <ProspectingRadar active={searching} candidateCount={candidates.length} />
+      <div>
+        <h2>Prospects LinkedIn</h2>
+        <p>{searching ? "Recherche de nouveaux profils en cours..." : campaignStatus === "active" ? "Campagne active — lancez une recherche quand vous le souhaitez." : "Activez la campagne pour envoyer les invitations une fois des prospects validés."}</p>
+      </div>
+    </div>
     {notice ? <p className="campaign-guardrail">{notice}</p> : null}
     <div className="campaign-audience-tools">
       <label><LuSearch /><input onChange={(event) => setKeywords(event.target.value)} placeholder="Mots-clés additionnels (optionnel — sinon basé sur votre Business Context)" value={keywords} /></label>
