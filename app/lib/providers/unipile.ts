@@ -66,6 +66,27 @@ export type UnipileAccountStatusPayload = {
   AccountStatus: { account_id: string; account_type: string; message: string };
 };
 
+// https://developer.unipile.com/docs/message-payload — same attachment shape
+// on both the historical listing and the live webhook. `type` covers plain
+// media (img/video/audio/file) and provider-specific share cards
+// (linkedin_post/video_meeting/media_share/profile/contact_card); `url` is
+// only sometimes present directly (and can expire per url_expires_at), so
+// callers should not assume it's always usable without the attachment-proxy
+// route falling back to GET /messages/{id}/attachments/{attachmentId}.
+export type UnipileAttachment = {
+  id: string;
+  type: "img" | "video" | "audio" | "file" | "linkedin_post" | "video_meeting" | "media_share" | "profile" | "contact_card";
+  unavailable?: boolean;
+  file_size?: number;
+  mimetype?: string;
+  url?: string;
+  url_expires_at?: number;
+  size?: { width?: number; height?: number };
+  duration?: number;
+  voice_note?: boolean;
+  file_name?: string;
+};
+
 // https://developer.unipile.com/docs/new-messages-webhook
 export type UnipileNewMessagePayload = {
   account_id: string;
@@ -77,6 +98,7 @@ export type UnipileNewMessagePayload = {
   webhook_name?: string;
   message_id: string;
   message?: string;
+  attachments?: UnipileAttachment[];
   sender?: { attendee_id: string; attendee_name?: string; attendee_provider_id: string; attendee_profile_url?: string };
   attendees?: Array<{ attendee_id: string; attendee_name?: string; attendee_provider_id: string; attendee_profile_url?: string }>;
 };
@@ -119,6 +141,7 @@ export type UnipileChatMessage = {
   id: string;
   chat_id: string;
   text: string;
+  attachments?: UnipileAttachment[];
   is_sender: 0 | 1;
   sender_id: string;
   timestamp: string;
@@ -196,4 +219,17 @@ export async function editChatMessage(config: UnipileConfig, messageId: string, 
     signal: AbortSignal.timeout(20_000),
   });
   if (!response.ok) throw new Error(`Unipile edit message failed (${response.status}).`);
+}
+
+// https://developer.unipile.com/reference/messagescontroller_getattachment —
+// binary passthrough. Never expose UNIPILE_API_KEY to the browser, so the
+// frontend never talks to Unipile directly for media; this is proxied
+// through our own attachment route instead (see api/inbox/attachments).
+export async function getMessageAttachment(config: UnipileConfig, messageId: string, attachmentId: string): Promise<{ body: ArrayBuffer; contentType: string | null }> {
+  const response = await fetch(`${config.apiUrl}/api/v1/messages/${messageId}/attachments/${attachmentId}`, {
+    headers: { "X-API-KEY": config.apiKey },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error(`Unipile get attachment failed (${response.status}).`);
+  return { body: await response.arrayBuffer(), contentType: response.headers.get("content-type") };
 }

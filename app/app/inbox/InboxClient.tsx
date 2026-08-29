@@ -2,15 +2,16 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   LuArrowLeft,
   LuArrowRight,
   LuBot,
   LuCheck,
   LuCheckCheck,
+  LuCircleAlert,
   LuClock,
-  LuEllipsis,
+  LuFile,
   LuInbox,
   LuMessageCircle,
   LuPencil,
@@ -29,12 +30,27 @@ import { generateReply, type ReplyMode } from "./talvia-ai";
 
 type ApiConnection = { channel_type: "linkedin" | "whatsapp" | "email"; status: string };
 
+type ApiAttachment = {
+  id: string;
+  type: string;
+  mimetype?: string;
+  fileSize?: number;
+  fileName?: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  voiceNote?: boolean;
+};
+
+type MessageStatusValue = "draft" | "pending" | "sent" | "delivered" | "failed" | "read" | "received" | "sending";
+
 type ApiMessage = {
   id: string;
   body: string;
   direction: "inbound" | "outbound";
-  status: string;
+  status: MessageStatusValue;
   createdAt: string;
+  attachments?: ApiAttachment[];
 };
 type ApiConversation = {
   id: string;
@@ -47,8 +63,21 @@ type ApiConversation = {
   unread: boolean;
   lastMessageAt?: string;
   messages: ApiMessage[];
+  hasMoreMessages?: boolean;
 };
 type Thread = ApiConversation & { key: string; latest?: ApiMessage };
+
+export type InboxInitialData = {
+  conversations: ApiConversation[];
+  contacts: Contact[];
+  opportunities: Opportunity[];
+  connections: ApiConnection[];
+  activeConversationId: string | null;
+};
+
+const NEAR_BOTTOM_THRESHOLD = 120;
+const LOAD_OLDER_THRESHOLD = 80;
+const POLL_INTERVAL_MS = 20_000;
 
 function isSameDay(a: string, b: string) {
   const dateA = new Date(a);
@@ -66,10 +95,49 @@ function dateSeparatorLabel(iso: string) {
   return date.toLocaleDateString("fr", { day: "numeric", month: "long", year: date.getFullYear() === today.getFullYear() ? undefined : "numeric" });
 }
 
-function MessageStatus({ status }: { status: ApiMessage["status"] }) {
+function formatFileSize(bytes?: number) {
+  if (!bytes) return "";
+  if (bytes < 1024) return `${bytes} o`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} Ko`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} Mo`;
+}
+
+function formatDuration(seconds?: number) {
+  if (seconds == null) return "";
+  const minutes = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60).toString().padStart(2, "0");
+  return `${minutes}:${secs}`;
+}
+
+// URLs become clickable without dangerouslySetInnerHTML: split() with a
+// capturing group always interleaves matched delimiters at odd indices, so
+// there's no need to re-run the (stateful, /g-flagged) pattern with .test()
+// against each part — a classic footgun when the same regex object is
+// reused across calls in a loop.
+const URL_PATTERN = /(https?:\/\/[^\s<]+)/g;
+const TRAILING_PUNCTUATION = /[.,;:!?)\]'"]+$/;
+
+function linkifyText(text: string): ReactNode[] {
+  if (!text) return [];
+  const parts = text.split(URL_PATTERN);
+  return parts.flatMap((part, index) => {
+    if (index % 2 === 0) return part ? [<Fragment key={index}>{part}</Fragment>] : [];
+    const trailingMatch = part.match(TRAILING_PUNCTUATION);
+    const trailing = trailingMatch ? trailingMatch[0] : "";
+    const url = trailing ? part.slice(0, -trailing.length) : part;
+    if (!url) return trailing ? [trailing] : [];
+    return [
+      <a href={url} key={index} rel="noopener noreferrer" target="_blank">{url}</a>,
+      trailing,
+    ].filter(Boolean);
+  });
+}
+
+function MessageStatus({ status }: { status: MessageStatusValue }) {
   if (status === "read") return <LuCheckCheck aria-label="Lu" className="inbox-message__status inbox-message__status--read" />;
   if (status === "delivered") return <LuCheckCheck aria-label="Distribué" className="inbox-message__status" />;
   if (status === "sent") return <LuCheck aria-label="Envoyé" className="inbox-message__status" />;
+  if (status === "failed") return <LuCircleAlert aria-label="Échec" className="inbox-message__status inbox-message__status--failed" />;
   return <LuClock aria-label="En cours" className="inbox-message__status" />;
 }
 
@@ -81,11 +149,76 @@ function ContactAvatar({ contact, large }: { contact?: Pick<Contact, "name" | "a
   return <span className={className}>{contact?.name.slice(0, 2).toUpperCase() ?? "?"}</span>;
 }
 
-export function InboxClient() {
+function MessageAttachment({ attachment, messageId }: { attachment: ApiAttachment; messageId: string }) {
+  // Real message ids only — an optimistic/temp id has nothing to proxy yet.
+  if (messageId.startsWith("temp-")) return null;
+  const src = `/api/inbox/attachments/${messageId}/${attachment.id}`;
+
+  if (attachment.type === "img") {
+    return (
+      <a className="inbox-attachment inbox-attachment--image" href={src} rel="noopener noreferrer" target="_blank">
+        <img alt="Image partagée" loading="lazy" src={src} />
+      </a>
+    );
+  }
+  if (attachment.type === "video") {
+    return <video className="inbox-attachment inbox-attachment--video" controls src={src} />;
+  }
+  if (attachment.type === "audio") {
+    return (
+      <div className="inbox-attachment inbox-attachment--audio">
+        <audio controls preload="none" src={src} />
+        {attachment.duration != null ? (
+          <span>{attachment.voiceNote ? "Note vocale · " : ""}{formatDuration(attachment.duration)}</span>
+        ) : null}
+      </div>
+    );
+  }
+  if (attachment.type === "file") {
+    return (
+      <a className="inbox-attachment inbox-attachment--file" download href={src} rel="noopener noreferrer">
+        <LuFile aria-hidden="true" />
+        <span>
+          <strong>{attachment.fileName ?? "Document"}</strong>
+          {attachment.fileSize ? <small>{formatFileSize(attachment.fileSize)}</small> : null}
+        </span>
+      </a>
+    );
+  }
+  return <span className="inbox-attachment inbox-attachment--unsupported">Pièce jointe non prise en charge</span>;
+}
+
+function ThreadListSkeleton() {
+  return (
+    <div className="inbox-dense-threads" aria-hidden="true">
+      {Array.from({ length: 6 }, (_, index) => (
+        <div className="inbox-dense-thread inbox-skeleton-row" key={index}>
+          <span className="inbox-skeleton inbox-skeleton--avatar" />
+          <span>
+            <span className="inbox-skeleton inbox-skeleton--line" style={{ width: "70%" }} />
+            <span className="inbox-skeleton inbox-skeleton--line" style={{ width: "45%" }} />
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function MessagesSkeleton() {
+  return (
+    <div className="inbox-messages-skeleton" aria-hidden="true">
+      {[38, 62, 30, 70, 48].map((width, index) => (
+        <span className={`inbox-skeleton inbox-skeleton--bubble ${index % 2 === 0 ? "is-inbound" : "is-outbound"}`} key={index} style={{ width: `${width}%` }} />
+      ))}
+    </div>
+  );
+}
+
+export function InboxClient({ initialData }: { initialData?: InboxInitialData }) {
   const router = useRouter();
-  const [conversations, setConversations] = useState<ApiConversation[]>([]);
-  const [contacts, setContacts] = useState<Contact[]>([]);
-  const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
+  const [conversations, setConversations] = useState<ApiConversation[]>(initialData?.conversations ?? []);
+  const [contacts, setContacts] = useState<Contact[]>(initialData?.contacts ?? []);
+  const [opportunities, setOpportunities] = useState<Opportunity[]>(initialData?.opportunities ?? []);
   const [newOpen, setNewOpen] = useState(false);
   const [aiOpen, setAiOpen] = useState(false);
   const [contactId, setContactId] = useState("");
@@ -93,7 +226,7 @@ export function InboxClient() {
   const [draft, setDraft] = useState("");
   const [filter, setFilter] = useState<ChannelId | "all">("all");
   const [search, setSearch] = useState("");
-  const [activeKey, setActiveKey] = useState<string | null>(null);
+  const [activeKey, setActiveKey] = useState<string | null>(initialData?.activeConversationId ?? null);
   const [mobileView, setMobileView] = useState<"list" | "chat" | "context">(
     "list",
   );
@@ -101,7 +234,25 @@ export function InboxClient() {
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingBody, setEditingBody] = useState("");
   const [editSaving, setEditSaving] = useState(false);
-  const [connectedChannels, setConnectedChannels] = useState<Set<ChannelId> | null>(null);
+  const [connectedChannels, setConnectedChannels] = useState<Set<ChannelId> | null>(
+    initialData ? new Set(initialData.connections.filter((item) => item.status === "connected").map((item) => apiChannelToUi(item.channel_type))) : null,
+  );
+  const [hasFetchedOnce, setHasFetchedOnce] = useState(Boolean(initialData));
+  const [openingConversationId, setOpeningConversationId] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [isNearBottom, setIsNearBottom] = useState(true);
+  const [showNewMessagePill, setShowNewMessagePill] = useState(false);
+  const [scrollToBottomToken, setScrollToBottomToken] = useState(0);
+
+  // Which conversations already hold a full, paginated message page —
+  // switching back to one of these must not refetch (tic-tac navigation,
+  // not a reload every time); a background poll keeps it fresh instead.
+  const loadedConversationsRef = useRef<Set<string>>(new Set(initialData?.activeConversationId ? [initialData.activeConversationId] : []));
+  const conversationsRef = useRef(conversations);
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  });
+
   const refresh = async (archived = false) => {
     const [a, b, c] = await Promise.all([
       fetch(`/api/inbox/conversations?archived=${archived}`),
@@ -112,18 +263,33 @@ export function InboxClient() {
       setError("Impossible de charger l’Inbox.");
       return;
     }
-    setConversations(
-      ((await a.json()) as { conversations: ApiConversation[] }).conversations,
+    const freshConversations = ((await a.json()) as { conversations: ApiConversation[] }).conversations;
+    // The list endpoint only carries a one-message preview per conversation
+    // — naively replacing state with it would erase any conversation whose
+    // full history is already loaded (every poll tick, every background
+    // refresh after sending). Keep the loaded messages/pagination cursor for
+    // anything already fetched; only the preview-only fields get refreshed.
+    setConversations((current) =>
+      freshConversations.map((fresh) => {
+        const existing = current.find((item) => item.id === fresh.id);
+        return existing && loadedConversationsRef.current.has(fresh.id)
+          ? { ...fresh, messages: existing.messages, hasMoreMessages: existing.hasMoreMessages }
+          : fresh;
+      }),
     );
     setContacts(((await b.json()) as { contacts: Contact[] }).contacts);
     setOpportunities(((await c.json()) as { opportunities: Opportunity[] }).opportunities);
+    setHasFetchedOnce(true);
   };
   useEffect(() => {
-    void refresh();
-    void fetch("/api/connections").then((response) => (response.ok ? response.json() : null)).then((data: { connections: ApiConnection[] } | null) => {
-      const connected = (data?.connections ?? []).filter((item) => item.status === "connected").map((item) => apiChannelToUi(item.channel_type));
-      setConnectedChannels(new Set(connected));
-    });
+    if (!initialData) void refresh();
+    if (!initialData) {
+      void fetch("/api/connections").then((response) => (response.ok ? response.json() : null)).then((data: { connections: ApiConnection[] } | null) => {
+        const connected = (data?.connections ?? []).filter((item) => item.status === "connected").map((item) => apiChannelToUi(item.channel_type));
+        setConnectedChannels(new Set(connected));
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const threads = useMemo(
@@ -153,36 +319,173 @@ export function InboxClient() {
     (contact) => contact.id === activeThread?.contactId,
   );
 
-  // The list endpoint only carries each conversation's latest message (for
-  // the preview line); the full history is fetched here once a thread is
-  // actually open, so the list stays cheap regardless of conversation length.
+  // Fetches the most recent message page for a conversation that hasn't
+  // been opened yet this session — never the full-conversation route (that
+  // one also rejoins contact/company metadata the list preview already
+  // has). Skips entirely for anything already cached.
   const loadThreadMessages = async (conversationId: string) => {
-    const response = await fetch(`/api/inbox/conversations/${conversationId}`);
-    if (!response.ok) return;
-    const data = (await response.json()) as { conversation?: ApiConversation };
-    if (!data.conversation) return;
-    setConversations((current) =>
-      current.map((conversation) =>
-        conversation.id === conversationId
-          ? { ...conversation, messages: data.conversation!.messages }
-          : conversation,
-      ),
-    );
+    setOpeningConversationId(conversationId);
+    try {
+      const response = await fetch(`/api/inbox/conversations/${conversationId}/messages`);
+      if (!response.ok) return;
+      const data = (await response.json()) as { messages: ApiMessage[]; hasMoreMessages: boolean };
+      setConversations((current) =>
+        current.map((conversation) =>
+          conversation.id === conversationId
+            ? { ...conversation, messages: data.messages, hasMoreMessages: data.hasMoreMessages }
+            : conversation,
+        ),
+      );
+      loadedConversationsRef.current.add(conversationId);
+    } finally {
+      setOpeningConversationId((current) => (current === conversationId ? null : current));
+    }
   };
   useEffect(() => {
-    if (activeThread) void loadThreadMessages(activeThread.id);
+    if (activeThread && !loadedConversationsRef.current.has(activeThread.id)) void loadThreadMessages(activeThread.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeThread?.id]);
-  const messageScrollRef = useRef<HTMLDivElement>(null);
-  // Oldest-to-newest top-to-bottom is the correct order (matches every real
-  // messaging app), but a long thread renders taller than the panel, and
-  // without this the browser leaves the scroll position at the top — so the
-  // first thing anyone sees on opening a conversation is months-old history
-  // instead of the latest message, which reads as "backwards".
-  useEffect(() => {
+
+  // A ref guard, not just the `loadingOlder` state: `onScroll` can fire
+  // several times before a state update from the first call has committed,
+  // and a state check alone wouldn't catch a call that starts in that gap —
+  // re-entering here would send two overlapping `before=` requests and
+  // prepend the same page of history twice.
+  const loadingOlderRef = useRef(false);
+  const loadOlderMessages = async () => {
+    if (!activeThread || loadingOlderRef.current || !activeThread.hasMoreMessages) return;
+    const oldest = activeThread.messages[0];
+    if (!oldest) return;
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
     const node = messageScrollRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
+    pendingOlderLoadRef.current = node ? { prevScrollHeight: node.scrollHeight } : null;
+    try {
+      const response = await fetch(`/api/inbox/conversations/${activeThread.id}/messages?before=${encodeURIComponent(oldest.createdAt)}`);
+      if (!response.ok) return;
+      const data = (await response.json()) as { messages: ApiMessage[]; hasMoreMessages: boolean };
+      setConversations((current) =>
+        current.map((conversation) =>
+          conversation.id === activeThread.id
+            ? { ...conversation, messages: [...data.messages, ...conversation.messages], hasMoreMessages: data.hasMoreMessages }
+            : conversation,
+        ),
+      );
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlder(false);
+    }
+  };
+
+  const messageScrollRef = useRef<HTMLDivElement>(null);
+  const pendingOlderLoadRef = useRef<{ prevScrollHeight: number } | null>(null);
+  const previousActiveIdRef = useRef<string | null>(initialData?.activeConversationId ?? null);
+  const prevMessageCountRef = useRef(threadMessages.length);
+
+  // Scroll handling is the make-or-break of a chat UI: open a thread and
+  // land on the newest message immediately (useLayoutEffect — runs before
+  // paint, so there's no visible flash-then-jump); load older history
+  // without ever teleporting the reader (restore scrollTop from the
+  // captured pre-load scrollHeight); and only auto-scroll a live incoming
+  // message if the reader is already near the bottom — otherwise surface a
+  // "nouveaux messages" pill instead of yanking them down mid-read.
+  useLayoutEffect(() => {
+    const node = messageScrollRef.current;
+    if (!node) return;
+
+    if (pendingOlderLoadRef.current) {
+      const { prevScrollHeight } = pendingOlderLoadRef.current;
+      node.scrollTop = node.scrollHeight - prevScrollHeight;
+      pendingOlderLoadRef.current = null;
+      prevMessageCountRef.current = threadMessages.length;
+      return;
+    }
+
+    if (activeThread?.id !== previousActiveIdRef.current) {
+      node.scrollTop = node.scrollHeight;
+      previousActiveIdRef.current = activeThread?.id ?? null;
+      prevMessageCountRef.current = threadMessages.length;
+      setIsNearBottom(true);
+      setShowNewMessagePill(false);
+      return;
+    }
+
+    if (threadMessages.length > prevMessageCountRef.current) {
+      if (isNearBottom) {
+        node.scrollTop = node.scrollHeight;
+      } else {
+        // Scroll position is imperative browser state that can only be read
+        // after the DOM has updated — there is no render-time-derivable
+        // substitute for "is the reader currently near the bottom", so this
+        // genuinely has to live in a layout effect rather than be computed
+        // during render.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setShowNewMessagePill(true);
+      }
+    }
+    prevMessageCountRef.current = threadMessages.length;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeThread?.id, threadMessages.length]);
+
+  // The "nouveaux messages" pill triggers this rather than writing to the
+  // scroll ref directly from a click handler — keeping every DOM/ref
+  // mutation inside an effect (not spread across event handlers too) is
+  // what the scroll-restore effect above already does for the open/older-
+  // load/live-append cases, so this stays the one place that owns it.
+  useEffect(() => {
+    if (scrollToBottomToken === 0) return;
+    const node = messageScrollRef.current;
+    // Scrolling a DOM node is exactly the kind of imperative, non-React-owned
+    // mutation effects exist for — there's no pure-render alternative to
+    // "move this element's scroll position".
+    // eslint-disable-next-line react-hooks/immutability
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [scrollToBottomToken]);
+
+  const handleMessageScroll = () => {
+    const node = messageScrollRef.current;
+    if (!node) return;
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+    const near = distanceFromBottom < NEAR_BOTTOM_THRESHOLD;
+    setIsNearBottom(near);
+    if (near) setShowNewMessagePill(false);
+    if (node.scrollTop < LOAD_OLDER_THRESHOLD) void loadOlderMessages();
+  };
+
+  const scrollToBottom = () => {
+    setScrollToBottomToken((token) => token + 1);
+    setShowNewMessagePill(false);
+  };
+
+  // Background sync for the currently-open thread and the conversation
+  // list — a new incoming message shows up without a manual refresh and
+  // without ever reloading the whole Inbox (only messages strictly after
+  // the last one already held client-side are fetched and appended).
+  useEffect(() => {
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      void refresh();
+      const id = previousActiveIdRef.current;
+      if (!id) return;
+      const conversation = conversationsRef.current.find((item) => item.id === id);
+      const last = conversation?.messages.at(-1);
+      if (!last || last.id.startsWith("temp-")) return;
+      const response = await fetch(`/api/inbox/conversations/${id}/messages?since=${encodeURIComponent(last.createdAt)}`).catch(() => null);
+      if (!response?.ok) return;
+      const data = (await response.json()) as { messages: ApiMessage[] };
+      if (!data.messages.length) return;
+      setConversations((current) =>
+        current.map((item) =>
+          item.id === id
+            ? { ...item, messages: [...item.messages, ...data.messages.filter((incoming) => !item.messages.some((existing) => existing.id === incoming.id))] }
+            : item,
+        ),
+      );
+    };
+    const interval = setInterval(() => void poll(), POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, []);
+
   // A conversation can only start on a channel Talvia is actually connected
   // to — otherwise nothing would ever be sent, even though the contact
   // happens to have a phone number or email on file.
@@ -216,6 +519,7 @@ export function InboxClient() {
       setError(data.error ?? "Création impossible.");
       return;
     }
+    loadedConversationsRef.current.add(data.conversation.id);
     setActiveKey(data.conversation.id);
     setNewOpen(false);
     setContactId("");
@@ -223,27 +527,76 @@ export function InboxClient() {
     setMobileView("chat");
     await refresh();
   };
-  const sendMessage = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!activeThread || !draft.trim()) return;
-    const response = await fetch(
-      `/api/inbox/conversations/${activeThread.id}/messages`,
-      {
+
+  // Sends optimistically: the composer clears and the message appears
+  // ("sending") in under a beat, well before the request round-trips —
+  // Talvia never makes the sender wait to see their own words land. Only a
+  // failure gets rewritten back, with a retry affordance, once the request
+  // actually resolves.
+  const postMessage = async (conversationId: string, text: string, tempId: string) => {
+    try {
+      const response = await fetch(`/api/inbox/conversations/${conversationId}/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ body: draft }),
-      },
-    );
-    if (!response.ok) {
-      const data = (await response.json().catch(() => null)) as { error?: string } | null;
-      setError(data?.error ?? "Impossible d’envoyer le message.");
-      return;
+        body: JSON.stringify({ body: text }),
+      });
+      if (!response.ok) throw new Error();
+      const data = (await response.json()) as { message: ApiMessage };
+      setConversations((current) =>
+        current.map((conversation) => {
+          if (conversation.id !== conversationId) return conversation;
+          // The background poll can independently pick up this same message
+          // (by its real id) via `since` before this response comes back —
+          // de-dupe by id rather than a plain replace, so it doesn't end up
+          // showing twice (the temp placeholder resolved here, plus a
+          // separate copy the poll already appended).
+          const replaced = conversation.messages.map((m) => (m.id === tempId ? data.message : m));
+          const deduped = Array.from(new Map(replaced.map((m) => [m.id, m])).values());
+          return { ...conversation, messages: deduped };
+        }),
+      );
+    } catch {
+      setConversations((current) =>
+        current.map((conversation) =>
+          conversation.id === conversationId
+            ? { ...conversation, messages: conversation.messages.map((m) => (m.id === tempId ? { ...m, status: "failed" as const } : m)) }
+            : conversation,
+        ),
+      );
     }
+  };
+
+  const performSend = async () => {
+    if (!activeThread || !draft.trim()) return;
+    const text = draft.trim();
+    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const optimisticMessage: ApiMessage = { id: tempId, body: text, direction: "outbound", status: "sending", createdAt: new Date().toISOString() };
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === activeThread.id ? { ...conversation, messages: [...conversation.messages, optimisticMessage] } : conversation,
+      ),
+    );
     setDraft("");
     setAiOpen(false);
-    await refresh();
-    await loadThreadMessages(activeThread.id);
+    await postMessage(activeThread.id, text, tempId);
   };
+  const sendMessage = (event: FormEvent) => {
+    event.preventDefault();
+    void performSend();
+  };
+
+  const retryMessage = async (message: ApiMessage) => {
+    if (!activeThread) return;
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === activeThread.id
+          ? { ...conversation, messages: conversation.messages.map((m) => (m.id === message.id ? { ...m, status: "sending" as const } : m)) }
+          : conversation,
+      ),
+    );
+    await postMessage(activeThread.id, message.body, message.id);
+  };
+
   const startEditingMessage = (message: ApiMessage) => {
     setEditingMessageId(message.id);
     setEditingBody(message.body);
@@ -267,9 +620,16 @@ export function InboxClient() {
         setError(data?.error ?? "Impossible de modifier ce message.");
         return;
       }
+      const edited = editingBody.trim();
       setEditingMessageId(null);
       setEditingBody("");
-      await loadThreadMessages(activeThread.id);
+      setConversations((current) =>
+        current.map((conversation) =>
+          conversation.id === activeThread.id
+            ? { ...conversation, messages: conversation.messages.map((m) => (m.id === editingMessageId ? { ...m, body: edited } : m)) }
+            : conversation,
+        ),
+      );
     } finally {
       setEditSaving(false);
     }
@@ -376,7 +736,9 @@ export function InboxClient() {
               </button>
             ))}
           </div>
-          {threads.length === 0 ? (
+          {!hasFetchedOnce ? (
+            <ThreadListSkeleton />
+          ) : threads.length === 0 ? (
             <EmptyState
               className="inbox-dense-empty"
               icon={<LuInbox />}
@@ -421,7 +783,7 @@ export function InboxClient() {
                             ?.label}
                       </small>
                       <p>
-                        {thread.latest?.body ?? "Aucun message pour le moment"}
+                        {thread.latest?.body || (thread.latest?.attachments?.length ? "Pièce jointe" : "Aucun message pour le moment")}
                       </p>
                     </span>
                     <span className="inbox-thread-meta">
@@ -483,13 +845,17 @@ export function InboxClient() {
               <strong>Conversation</strong>
             )}
           </header>
-          <div className="inbox-message-scroll" ref={messageScrollRef}>
-            {!activeThread ? (
+          <div className="inbox-message-scroll" onScroll={handleMessageScroll} ref={messageScrollRef}>
+            {!hasFetchedOnce ? (
+              <MessagesSkeleton />
+            ) : !activeThread ? (
               <EmptyState
                 icon={<LuMessageCircle />}
                 title="Sélectionnez une conversation"
                 description="Choisissez un échange ou démarrez une nouvelle conversation."
               />
+            ) : openingConversationId === activeThread.id ? (
+              <MessagesSkeleton />
             ) : threadMessages.length === 0 ? (
               <div className="inbox-conversation-empty">
                 <LuMessageCircle />
@@ -497,75 +863,101 @@ export function InboxClient() {
                 <p>Commencez la conversation avec ce contact.</p>
               </div>
             ) : (
-              threadMessages.map((message, index) => {
-                const previous = threadMessages[index - 1];
-                const showDateSeparator = !previous || !isSameDay(previous.createdAt, message.createdAt);
-                return (
-                  <Fragment key={message.id}>
-                    {showDateSeparator ? (
-                      <div className="inbox-date-separator">
-                        <span>{dateSeparatorLabel(message.createdAt)}</span>
-                      </div>
-                    ) : null}
-                    <div className={`inbox-message inbox-message--${message.direction}`}>
-                      {editingMessageId === message.id ? (
-                        <div className="inbox-message-edit">
-                          <textarea
-                            autoFocus
-                            onChange={(event) => setEditingBody(event.target.value)}
-                            rows={2}
-                            value={editingBody}
-                          />
-                          <div className="inbox-message-edit__actions">
-                            <button
-                              disabled={editSaving}
-                              onClick={cancelEditingMessage}
-                              type="button"
-                            >
-                              Annuler
-                            </button>
-                            <button
-                              className="is-primary"
-                              disabled={editSaving || !editingBody.trim()}
-                              onClick={() => void saveMessageEdit()}
-                              type="button"
-                            >
-                              {editSaving ? "Enregistrement..." : "Enregistrer"}
-                            </button>
-                          </div>
+              <>
+                {loadingOlder ? <div className="inbox-older-loading">Chargement des messages précédents...</div> : null}
+                {threadMessages.map((message, index) => {
+                  const previous = threadMessages[index - 1];
+                  const showDateSeparator = !previous || !isSameDay(previous.createdAt, message.createdAt);
+                  return (
+                    <Fragment key={message.id}>
+                      {showDateSeparator ? (
+                        <div className="inbox-date-separator">
+                          <span>{dateSeparatorLabel(message.createdAt)}</span>
                         </div>
-                      ) : (
-                        <>
-                          <p>{message.body}</p>
-                          {message.direction === "outbound" ? (
-                            <button
-                              aria-label="Modifier ce message"
-                              className="inbox-message__edit-trigger"
-                              onClick={() => startEditingMessage(message)}
-                              type="button"
-                            >
-                              <LuPencil aria-hidden="true" />
-                            </button>
-                          ) : null}
-                        </>
-                      )}
-                      <span>
-                        {new Date(message.createdAt).toLocaleTimeString("fr", {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                        {message.direction === "outbound" ? <MessageStatus status={message.status} /> : null}
-                      </span>
-                    </div>
-                  </Fragment>
-                );
-              })
+                      ) : null}
+                      <div className={`inbox-message inbox-message--${message.direction}`}>
+                        {editingMessageId === message.id ? (
+                          <div className="inbox-message-edit">
+                            <textarea
+                              autoFocus
+                              onChange={(event) => setEditingBody(event.target.value)}
+                              rows={2}
+                              value={editingBody}
+                            />
+                            <div className="inbox-message-edit__actions">
+                              <button
+                                disabled={editSaving}
+                                onClick={cancelEditingMessage}
+                                type="button"
+                              >
+                                Annuler
+                              </button>
+                              <button
+                                className="is-primary"
+                                disabled={editSaving || !editingBody.trim()}
+                                onClick={() => void saveMessageEdit()}
+                                type="button"
+                              >
+                                {editSaving ? "Enregistrement..." : "Enregistrer"}
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            {message.attachments?.length ? (
+                              <div className="inbox-message-attachments">
+                                {message.attachments.map((attachment) => (
+                                  <MessageAttachment attachment={attachment} key={attachment.id} messageId={message.id} />
+                                ))}
+                              </div>
+                            ) : null}
+                            {message.body ? <p>{linkifyText(message.body)}</p> : null}
+                            {message.direction === "outbound" && message.status !== "sending" && message.status !== "failed" ? (
+                              <button
+                                aria-label="Modifier ce message"
+                                className="inbox-message__edit-trigger"
+                                onClick={() => startEditingMessage(message)}
+                                type="button"
+                              >
+                                <LuPencil aria-hidden="true" />
+                              </button>
+                            ) : null}
+                          </>
+                        )}
+                        <span>
+                          {new Date(message.createdAt).toLocaleTimeString("fr", {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                          {message.direction === "outbound" ? <MessageStatus status={message.status} /> : null}
+                        </span>
+                        {message.status === "failed" ? (
+                          <button className="inbox-message__retry" onClick={() => void retryMessage(message)} type="button">
+                            Échec de l’envoi — Réessayer
+                          </button>
+                        ) : null}
+                      </div>
+                    </Fragment>
+                  );
+                })}
+              </>
             )}
           </div>
+          {showNewMessagePill ? (
+            <button className="inbox-new-message-pill" onClick={scrollToBottom} type="button">
+              Nouveaux messages ↓
+            </button>
+          ) : null}
           {activeThread ? (
             <form className="talvia-composer" onSubmit={sendMessage}>
               <textarea
                 onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void performSend();
+                  }
+                }}
                 placeholder="Écrivez votre message..."
                 rows={3}
                 value={draft}

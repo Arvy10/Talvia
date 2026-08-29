@@ -1,6 +1,6 @@
 import { database } from "../database";
 import { dispatchCommittedActivity, recordSystemActivity } from "../activities";
-import { normalizeLinkedIn } from "../../app/contacts/contact-utils";
+import { normalizeLinkedIn, normalizePhone } from "../../app/contacts/contact-utils";
 import {
   editChatMessage,
   getUnipileConfig,
@@ -10,9 +10,41 @@ import {
   sendChatMessage,
   toConnectionStatus,
   type UnipileAccountStatusPayload,
+  type UnipileAttachment,
   type UnipileHostedAuthNotifyPayload,
   type UnipileNewMessagePayload,
 } from "./unipile";
+
+// Compact, storage-shaped attachment record — never the raw Unipile `url`
+// (it can expire, and callers must always go through the attachment-proxy
+// route so UNIPILE_API_KEY never has to leave the server). One row per
+// attachment, keyed by messageId+attachmentId at render time.
+export type NormalizedAttachment = {
+  id: string;
+  type: UnipileAttachment["type"];
+  mimetype?: string;
+  fileSize?: number;
+  fileName?: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  voiceNote?: boolean;
+};
+
+function normalizeAttachments(raw: UnipileAttachment[] | undefined): NormalizedAttachment[] {
+  if (!raw?.length) return [];
+  return raw.filter((item) => !item.unavailable).map((item) => ({
+    id: item.id,
+    type: item.type,
+    mimetype: item.mimetype,
+    fileSize: item.file_size,
+    fileName: item.file_name,
+    width: item.size?.width,
+    height: item.size?.height,
+    duration: item.duration,
+    voiceNote: item.voice_note,
+  }));
+}
 
 // Normalizes raw Unipile webhook payloads into Talvia's own entities
 // (Connections, Contacts, Contact Identities, Conversations, Messages,
@@ -58,17 +90,39 @@ export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["
   );
 }
 
+// contact_identities.channel_type only accepts ('linkedin','whatsapp','email',
+// 'instagram','other') — connections.channel_type can only validly be
+// 'linkedin' or 'whatsapp' today (a 'gmail' hosted-auth connection fails its
+// own check constraint before it ever gets this far — a Connections-side
+// bug, out of scope for this pass). Anything unexpected falls back to
+// 'other' rather than crashing on a constraint violation.
+function toContactChannelType(channelType: string): "linkedin" | "whatsapp" | "other" {
+  return channelType === "linkedin" || channelType === "whatsapp" ? channelType : "other";
+}
+
 // Dedup key matches the one contacts.ts already uses for manually-entered
 // and CSV-imported contacts (workspace_id, channel_type, identifier_normalized)
 // — a LinkedIn profile discovered via Unipile resolves to the same Contact as
 // one a user already added by hand, instead of creating a duplicate.
-async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, providerId: string, profileUrl: string | undefined, displayName: string, avatarUrl?: string, occupation?: string) {
+//
+// channelType was previously hardcoded to 'linkedin' here regardless of the
+// connection's actual provider — since the webhook handler in ingestMessage
+// is shared across every provider, an incoming WhatsApp message was silently
+// filed under a 'linkedin' contact identity and run through LinkedIn's URL
+// normalizer on what's actually a phone number. Fixed by threading the real
+// channel type through from the connection row.
+async function findOrCreateContact(client: import("pg").PoolClient, workspaceId: string, channelType: string, providerId: string, profileUrl: string | undefined, displayName: string, avatarUrl?: string, occupation?: string) {
+  const contactChannelType = toContactChannelType(channelType);
   const identifier = profileUrl || providerId;
-  const identifierNormalized = profileUrl ? normalizeLinkedIn(profileUrl) : providerId;
+  const identifierNormalized = contactChannelType === "linkedin"
+    ? (profileUrl ? normalizeLinkedIn(profileUrl) : providerId)
+    : contactChannelType === "whatsapp"
+      ? normalizePhone(profileUrl || providerId)
+      : (profileUrl || providerId).trim().toLowerCase();
 
   const existing = await client.query<{ contact_id: string }>(
-    `select contact_id from contact_identities where workspace_id=$1 and channel_type='linkedin' and identifier_normalized=$2`,
-    [workspaceId, identifierNormalized],
+    `select contact_id from contact_identities where workspace_id=$1 and channel_type=$3 and identifier_normalized=$2`,
+    [workspaceId, identifierNormalized, contactChannelType],
   );
   if (existing.rows[0]) {
     // Contacts already imported before an avatar/headline was ever captured
@@ -76,8 +130,8 @@ async function findOrCreateContact(client: import("pg").PoolClient, workspaceId:
     // attached the next time a resync sees it, instead of staying blank.
     if (avatarUrl) {
       await client.query(
-        `update contact_identities set metadata=metadata||jsonb_build_object('avatarUrl',$3::text) where workspace_id=$1 and channel_type='linkedin' and identifier_normalized=$2`,
-        [workspaceId, identifierNormalized, avatarUrl],
+        `update contact_identities set metadata=metadata||jsonb_build_object('avatarUrl',$3::text) where workspace_id=$1 and channel_type=$4 and identifier_normalized=$2`,
+        [workspaceId, identifierNormalized, avatarUrl, contactChannelType],
       );
     }
     if (occupation) {
@@ -91,16 +145,16 @@ async function findOrCreateContact(client: import("pg").PoolClient, workspaceId:
     return existing.rows[0].contact_id;
   }
 
-  const { firstName, lastName } = splitDisplayName(displayName || "Contact LinkedIn");
+  const { firstName, lastName } = splitDisplayName(displayName || (contactChannelType === "whatsapp" ? "Contact WhatsApp" : "Contact"));
   const contact = await client.query<{ id: string }>(
     `insert into contacts(workspace_id,first_name,last_name,display_name,job_title,status) values($1,$2,$3,$4,$5,'new') returning id`,
     [workspaceId, firstName, lastName, displayName || "Contact sans nom", occupation ?? null],
   );
   const contactId = contact.rows[0]!.id;
   await client.query(
-    `insert into contact_identities(workspace_id,contact_id,channel_type,provider,identifier,identifier_normalized,profile_url,metadata) values($1,$2,'linkedin',$3,$4,$5,$6,$7)
+    `insert into contact_identities(workspace_id,contact_id,channel_type,provider,identifier,identifier_normalized,profile_url,metadata) values($1,$2,$8,$3,$4,$5,$6,$7)
      on conflict(workspace_id,channel_type,identifier_normalized) do nothing`,
-    [workspaceId, contactId, PROVIDER, identifier, identifierNormalized, profileUrl ?? null, JSON.stringify({ unipileProviderId: providerId, ...(avatarUrl ? { avatarUrl } : {}) })],
+    [workspaceId, contactId, PROVIDER, identifier, identifierNormalized, profileUrl ?? null, JSON.stringify({ unipileProviderId: providerId, ...(avatarUrl ? { avatarUrl } : {}) }), contactChannelType],
   );
   return contactId;
 }
@@ -204,17 +258,18 @@ export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<
     }
     const { id: connectionId, workspace_id: workspaceId, channel_type: channelType } = connection.rows[0];
 
-    const contactId = await findOrCreateContact(client, workspaceId, counterparty.attendee_provider_id, counterparty.attendee_profile_url, counterparty.attendee_name ?? "");
+    const contactId = await findOrCreateContact(client, workspaceId, channelType, counterparty.attendee_provider_id, counterparty.attendee_profile_url, counterparty.attendee_name ?? "");
     const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, channelType, payload.chat_id, contactId);
 
     const direction = isOutbound ? "outbound" : "inbound";
     const status = isOutbound ? "sent" : "received";
+    const attachments = normalizeAttachments(payload.attachments);
     const inserted = await client.query<{ id: string }>(
-      `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at)
-       values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then now() else null end,case when $3::varchar='inbound' then now() else null end)
+      `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at,metadata)
+       values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then now() else null end,case when $3::varchar='inbound' then now() else null end,$8)
        on conflict(conversation_id,provider_message_id) where provider_message_id is not null do nothing
        returning id`,
-      [workspaceId, conversationId, direction, isOutbound ? null : contactId, payload.message ?? "", status, payload.message_id],
+      [workspaceId, conversationId, direction, isOutbound ? null : contactId, payload.message ?? "", status, payload.message_id, JSON.stringify(attachments.length ? { attachments } : {})],
     );
     if (!inserted.rows[0]) {
       await client.query("rollback");
@@ -250,7 +305,7 @@ async function backfillChat(workspaceId: string, connectionId: string, config: N
   const client = await database.connect();
   try {
     await client.query("begin");
-    const contactId = await findOrCreateContact(client, workspaceId, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "", counterparty.picture_url, counterparty.specifics?.occupation);
+    const contactId = await findOrCreateContact(client, workspaceId, "linkedin", counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "", counterparty.picture_url, counterparty.specifics?.occupation);
     const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, "linkedin", chat.id, contactId);
 
     let messagesCursor: string | undefined;
@@ -260,18 +315,19 @@ async function backfillChat(workspaceId: string, connectionId: string, config: N
         if (message.deleted) continue;
         const direction = message.is_sender ? "outbound" : "inbound";
         const status = message.is_sender ? "sent" : "received";
+        const attachments = normalizeAttachments(message.attachments);
         // Upsert, not insert-or-skip: this is a resync against Unipile's
         // authoritative record, so a message a stale ingestion path already
         // stored with the wrong direction/contact (e.g. from a production
         // deploy that predates a bugfix) gets corrected here instead of
         // being silently left wrong forever.
         const upserted = await client.query<{ id: string }>(
-          `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at)
-           values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then $8::timestamptz else null end,case when $3::varchar='inbound' then $8::timestamptz else null end)
+          `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at,metadata)
+           values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then $8::timestamptz else null end,case when $3::varchar='inbound' then $8::timestamptz else null end,$9)
            on conflict(conversation_id,provider_message_id) where provider_message_id is not null do update set
-             direction=excluded.direction,sender_contact_id=excluded.sender_contact_id,body=excluded.body,status=excluded.status
+             direction=excluded.direction,sender_contact_id=excluded.sender_contact_id,body=excluded.body,status=excluded.status,metadata=excluded.metadata
            returning id`,
-          [workspaceId, conversationId, direction, message.is_sender ? null : contactId, message.text ?? "", status, message.id, message.timestamp],
+          [workspaceId, conversationId, direction, message.is_sender ? null : contactId, message.text ?? "", status, message.id, message.timestamp, JSON.stringify(attachments.length ? { attachments } : {})],
         );
         if (upserted.rows[0]) messagesInserted += 1;
       }

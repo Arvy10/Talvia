@@ -43,8 +43,8 @@ function createFakeDatabase() {
     }
 
     if (text.startsWith("select contact_id from contact_identities")) {
-      const [workspaceId, identifierNormalized] = params as string[];
-      const row = contactIdentities.find((c) => c.workspace_id === workspaceId && c.channel_type === "linkedin" && c.identifier_normalized === identifierNormalized);
+      const [workspaceId, identifierNormalized, channelType] = params as string[];
+      const row = contactIdentities.find((c) => c.workspace_id === workspaceId && c.channel_type === channelType && c.identifier_normalized === identifierNormalized);
       return { rows: row ? [{ contact_id: row.contact_id }] : [] };
     }
 
@@ -63,9 +63,9 @@ function createFakeDatabase() {
     }
 
     if (text.startsWith("insert into contact_identities")) {
-      const [workspaceId, contactId, provider, identifier, identifierNormalized, profileUrl] = params as string[];
-      if (!contactIdentities.some((c) => c.workspace_id === workspaceId && c.channel_type === "linkedin" && c.identifier_normalized === identifierNormalized)) {
-        contactIdentities.push({ workspace_id: workspaceId, contact_id: contactId, channel_type: "linkedin", provider, identifier, identifier_normalized: identifierNormalized, profile_url: profileUrl });
+      const [workspaceId, contactId, provider, identifier, identifierNormalized, profileUrl, , channelType] = params as string[];
+      if (!contactIdentities.some((c) => c.workspace_id === workspaceId && c.channel_type === channelType && c.identifier_normalized === identifierNormalized)) {
+        contactIdentities.push({ workspace_id: workspaceId, contact_id: contactId, channel_type: channelType, provider, identifier, identifier_normalized: identifierNormalized, profile_url: profileUrl });
       }
       return { rows: [] };
     }
@@ -123,11 +123,11 @@ function createFakeDatabase() {
     }
 
     if (text.startsWith("insert into messages")) {
-      const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId] = params as string[];
+      const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId, metadataJson] = params as string[];
       if (messages.some((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId)) {
         return { rows: [] }; // on conflict do nothing
       }
-      const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, direction, sender_contact_id: senderContactId, body, status, provider_message_id: providerMessageId };
+      const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, direction, sender_contact_id: senderContactId, body, status, provider_message_id: providerMessageId, metadata: metadataJson ? JSON.parse(metadataJson) : {} };
       messages.push(row);
       return { rows: [{ id: row.id }] };
     }
@@ -414,6 +414,68 @@ describe("ingestMessage — delivery/read receipts", () => {
     fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: "chat-1", last_message_at: null });
     const result = await ingestMessage({ ...messagePayload(), event: "message_read", chat_id: "chat-1", message_id: "never-sent" });
     expect(result).toEqual({ status: "duplicate" });
+  });
+});
+
+describe("ingestMessage — channel-aware contact identities", () => {
+  it("files an incoming WhatsApp message under a whatsapp contact identity, not a hardcoded linkedin one", async () => {
+    await ingestHostedAuthNotification({ status: "OK", account_id: "acct-whatsapp-1", name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload);
+    const result = await ingestMessage(messagePayload({
+      account_id: "acct-whatsapp-1",
+      account_info: { type: "WHATSAPP", user_id: selfUserId },
+      sender: { attendee_id: "att-wa-1", attendee_name: "Awa Traoré", attendee_provider_id: "33612345678" },
+    }));
+
+    expect(result).toEqual({ status: "ingested" });
+    expect(fakeDatabase.contactIdentities[0]).toMatchObject({ channel_type: "whatsapp" });
+    // Regression: this used to be hardcoded to channel_type='linkedin' and run
+    // the LinkedIn URL normalizer against a phone number, since the webhook
+    // handler is shared across every provider.
+    expect(fakeDatabase.contactIdentities[0]!.channel_type).not.toBe("linkedin");
+  });
+
+  it("keeps a LinkedIn message filed under a linkedin contact identity", async () => {
+    await connectAccount();
+    await ingestMessage(messagePayload());
+    expect(fakeDatabase.contactIdentities[0]).toMatchObject({ channel_type: "linkedin" });
+  });
+});
+
+describe("ingestMessage — attachments", () => {
+  it("stores a voice note even though the message has no text", async () => {
+    await connectAccount();
+    const result = await ingestMessage(messagePayload({
+      message: undefined,
+      attachments: [{ id: "att-voice-1", type: "audio", mimetype: "audio/ogg", duration: 12, voice_note: true }],
+    }));
+
+    expect(result).toEqual({ status: "ingested" });
+    expect(fakeDatabase.messages).toHaveLength(1);
+    // The mission's explicit failure mode this guards against: a message
+    // with no text getting filtered out (`if (!message.text) return null`)
+    // as if it were empty, when it actually carries a real attachment.
+    expect(fakeDatabase.messages[0]!.body).toBe("");
+    expect(fakeDatabase.messages[0]!.metadata).toEqual({ attachments: [{ id: "att-voice-1", type: "audio", mimetype: "audio/ogg", duration: 12, voiceNote: true }] });
+  });
+
+  it("stores an image attachment alongside message text", async () => {
+    await connectAccount();
+    await ingestMessage(messagePayload({
+      message: "Regarde cette capture",
+      attachments: [{ id: "att-img-1", type: "img", mimetype: "image/png", file_size: 40000, size: { width: 800, height: 600 } }],
+    }));
+
+    expect(fakeDatabase.messages[0]!.metadata).toMatchObject({ attachments: [{ id: "att-img-1", type: "img", width: 800, height: 600 }] });
+  });
+
+  it("drops an unavailable attachment instead of surfacing a dead reference", async () => {
+    await connectAccount();
+    await ingestMessage(messagePayload({
+      message: "Fichier expiré",
+      attachments: [{ id: "att-gone", type: "file", unavailable: true }],
+    }));
+
+    expect(fakeDatabase.messages[0]!.metadata).toEqual({});
   });
 });
 
