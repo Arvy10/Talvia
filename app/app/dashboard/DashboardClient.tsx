@@ -10,8 +10,11 @@ import MailIcon from "../components/icons/MailIcon";
 import PlugConnectedIcon from "../components/icons/PlugConnectedIcon";
 import UsersGroupIcon from "../components/icons/UsersGroupIcon";
 import { useSandbox } from "../state/SandboxProvider";
-import { channelMap, getConnectedChannelCount } from "../inbox/inbox-model";
+import { apiChannelToUi, channelMap, type InboxApiChannel } from "../inbox/inbox-model";
+import type { ChannelId, ConnectionStatus } from "../state/types";
 import { useUserIdentity } from "../components/useUserIdentity";
+
+type ApiConnection = { channel_type: InboxApiChannel; status: ConnectionStatus };
 
 const shortcuts = [
   { href: "/app/inbox", label: "Inbox", description: "Centralisez les conversations lorsqu’elles arriveront.", icon: MailIcon },
@@ -35,8 +38,12 @@ export function DashboardClient() {
   const identity = useUserIdentity();
   const [businessContextReady, setBusinessContextReady] = useState<boolean | null>(null);
   const [now, setNow] = useState<Date | null>(null);
+  // Real, database-backed connection status — the sandbox's `state.connections`
+  // is local demo state that never reflects an actual Unipile connection, which
+  // is why this widget could show "0 sur 3" for an account that's really connected.
+  const [connectionStatus, setConnectionStatus] = useState<Record<ChannelId, ConnectionStatus>>({ linkedin: "disconnected", whatsapp: "disconnected", gmail: "disconnected" });
 
-  const connectedCount = getConnectedChannelCount(state);
+  const connectedCount = channelMap.filter(({ id }) => connectionStatus[id] === "connected").length;
   const remainingCount = channelMap.length - connectedCount;
   const messages = state.messages ?? [];
   const activities = state.activities ?? [];
@@ -47,6 +54,14 @@ export function DashboardClient() {
     setNow(new Date());
     void fetch("/api/business-context").then((response) => (response.ok ? response.json() : null)).then((data: { businessContext: { status: string } | null } | null) => {
       setBusinessContextReady(data?.businessContext?.status === "ready");
+    });
+    void fetch("/api/connections").then((response) => (response.ok ? response.json() : null)).then((data: { connections: ApiConnection[] } | null) => {
+      if (!data) return;
+      setConnectionStatus((current) => {
+        const next = { ...current };
+        for (const connection of data.connections) next[apiChannelToUi(connection.channel_type)] = connection.status;
+        return next;
+      });
     });
   }, []);
 
@@ -86,7 +101,7 @@ export function DashboardClient() {
           {channelMap.map(({ id, label }) => <div className="dashboard-channel-status" key={id}>
             <ChannelLogo channel={id} />
             <span>{label}</span>
-            <StatusBadge status={state.connections[id].status} />
+            <StatusBadge status={connectionStatus[id]} />
           </div>)}
         </div>
       </div>
