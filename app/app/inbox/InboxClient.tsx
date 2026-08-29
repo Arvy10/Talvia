@@ -380,6 +380,7 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const pendingOlderLoadRef = useRef<{ prevScrollHeight: number } | null>(null);
   const previousActiveIdRef = useRef<string | null>(initialData?.activeConversationId ?? null);
+  const previousMobileViewRef = useRef(mobileView);
   const prevMessageCountRef = useRef(threadMessages.length);
 
   // Scroll handling is the make-or-break of a chat UI: open a thread and
@@ -401,7 +402,18 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
       return;
     }
 
-    if (activeThread?.id !== previousActiveIdRef.current) {
+    // Below 1100px the chat column is `display:none` while mobileView is
+    // "list" (see v2.css) — a hidden element measures scrollHeight as 0, so
+    // running this on mount (while the panel is still hidden) was a no-op,
+    // and nothing re-ran once the panel actually became visible on tap.
+    // That's why opening a conversation on a narrow viewport landed on the
+    // top instead of the bottom: the "scroll to bottom" never actually had
+    // anything to measure. Treating "the panel just became visible" the
+    // same as "the conversation just changed" fixes it.
+    const justBecameVisible = mobileView === "chat" && previousMobileViewRef.current !== "chat";
+    previousMobileViewRef.current = mobileView;
+
+    if (activeThread?.id !== previousActiveIdRef.current || justBecameVisible) {
       node.scrollTop = node.scrollHeight;
       previousActiveIdRef.current = activeThread?.id ?? null;
       prevMessageCountRef.current = threadMessages.length;
@@ -425,7 +437,7 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
     }
     prevMessageCountRef.current = threadMessages.length;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeThread?.id, threadMessages.length]);
+  }, [activeThread?.id, threadMessages.length, mobileView]);
 
   // The "nouveaux messages" pill triggers this rather than writing to the
   // scroll ref directly from a click handler — keeping every DOM/ref
