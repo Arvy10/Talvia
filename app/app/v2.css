@@ -68,3 +68,27 @@
 @keyframes prospecting-radar-blip{0%,100%{opacity:.4;r:3}50%{opacity:1;r:4.4}}
 @media(prefers-reduced-motion:reduce){.prospecting-radar__sweep{animation:none;opacity:.4}.prospecting-radar__blip{animation:none;opacity:.8}}
 @media(max-width:767px){.prospecting-header{align-items:flex-start}.prospecting-radar{width:58px;height:58px}}
+
+/* --- Campaign Strategy + candidate qualification (Phase 2) --- */
+.prospecting-strategy label{display:block;margin-bottom:10px}
+.prospecting-strategy label span{display:block;margin-bottom:4px;color:#948b99;font-size:9px}
+.prospecting-strategy__facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px 16px;margin:10px 0}
+.prospecting-strategy__facts dt{margin:0;color:#948b99;font-size:8px;text-transform:uppercase;letter-spacing:.04em}
+.prospecting-strategy__facts dd{margin:2px 0 0;color:#e5e0e7;font-size:10px}
+.prospecting-strategy__facts dd small{display:block;margin-top:2px;color:#8a828e;font-size:8px}
+.prospecting-strategy__badge{display:inline-block;margin-top:6px;padding:3px 8px;border-radius:99px;background:#8b5cf61f;color:#c7b8ff;font-size:8px}
+.prospecting-strategy__badge--validated{background:#5dd6a022;color:#5dd6a0}
+.prospecting-fit{display:block;margin-top:2px;font-size:8px}
+.prospecting-fit--strong{color:#5dd6a0}
+.prospecting-fit--moderate{color:#e0c775}
+.prospecting-fit--weak{color:#c0b9c3}
+.prospecting-fit--insufficient_data{color:#8a828e;font-style:italic}
+.prospecting-fit--disqualified{color:#ff6b4a}
+
+/* --- Per-participant personalization review (Phase 3) --- */
+.prospecting-personalization-list{margin-top:18px;padding-top:14px;border-top:1px solid #ffffff0e}
+.prospecting-personalization-list h3{margin:0 0 4px;font-size:12px}
+.prospecting-personalization{margin-top:14px;padding:12px;border:1px solid #ffffff12;border-radius:10px;background:#ffffff05}
+.prospecting-personalization__head{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.prospecting-personalization label{display:block;margin-top:8px}
+.prospecting-personalization label span{display:block;margin-bottom:4px;color:#948b99;font-size:9px}

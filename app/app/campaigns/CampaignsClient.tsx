@@ -79,11 +79,21 @@ export function CampaignsClient() {
     const campaignName = name.trim() || `${objective} via ${channels.find((item) => item.id === channel)?.label}`;
     // A prospecting campaign starts with zero participants — candidates are
     // searched and reviewed after creation (see CampaignDetail's prospecting
-    // panel), not selected here from existing Contacts. Its sequence is
-    // invite -> message rather than message -> wait -> follow_up.
+    // panel), not selected here from existing Contacts. A follow-up is just
+    // another 'message' step (see campaign-execution/step-progression.ts's
+    // WAIT handling) — never a distinct 'follow_up' mechanism — so the two
+    // relances below reuse the exact same step type as the first message.
     const stepsInput = isProspecting
-      ? [{ position: 0, stepType: "invite", channelType: "linkedin" }, { position: 1, stepType: "message", channelType: "linkedin", messageTemplate: initialMessage }, { position: 2, stepType: "end" }]
-      : [{ position: 0, stepType: "message", channelType: uiChannelToApi(channel), messageTemplate: initialMessage }, { position: 1, stepType: "wait", delayValue: waitDays, delayUnit: "days" }, { position: 2, stepType: "follow_up", channelType: uiChannelToApi(channel), messageTemplate: followUpMessage }, { position: 3, stepType: "end" }];
+      ? [
+          { position: 0, stepType: "invite", channelType: "linkedin" },
+          { position: 1, stepType: "message", channelType: "linkedin", messageTemplate: initialMessage },
+          { position: 2, stepType: "wait", delayValue: waitDays, delayUnit: "days" },
+          { position: 3, stepType: "message", channelType: "linkedin", messageTemplate: followUpMessage },
+          { position: 4, stepType: "wait", delayValue: waitDays, delayUnit: "days" },
+          { position: 5, stepType: "message", channelType: "linkedin" },
+          { position: 6, stepType: "end" },
+        ]
+      : [{ position: 0, stepType: "message", channelType: uiChannelToApi(channel), messageTemplate: initialMessage }, { position: 1, stepType: "wait", delayValue: waitDays, delayUnit: "days" }, { position: 2, stepType: "message", channelType: uiChannelToApi(channel), messageTemplate: followUpMessage }, { position: 3, stepType: "end" }];
     const response=await fetch("/api/campaigns",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({name:campaignName,objective:objectiveToApi(objective),channelType:uiChannelToApi(channel),participantIds:isProspecting?[]:selectedContacts,stopOnReply,steps:stepsInput})});
     const data=await response.json() as {campaign?:ApiCampaign;error?:string};if(!response.ok||!data.campaign){setError(data.error??"Impossible de créer la campagne.");return;}if(status==="active")await fetch(`/api/campaigns/${data.campaign.id}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({action:"activate"})});setSelectedCampaignId(data.campaign.id);resetWizard();await refresh();
   };
@@ -109,12 +119,120 @@ function WizardAudience({ contacts, search, selected, setSearch, setSelected }: 
 // exists (see CampaignDetail's prospecting panel), reviewed and approved one
 // by one before anything is sent.
 function WizardProspectingAudience() { return <><h3>Qui voulez-vous contacter ?</h3><p className="campaign-helper">Pour la prospection LinkedIn, Talvia proposera une liste de profils correspondant à votre Business Context une fois la campagne créée — vous choisirez ensuite qui contacter avant tout envoi.</p></>; }
-function WizardSequence({ channel, isProspecting, waitDays, setWaitDays, stopOnReply, setStopOnReply }: { channel: ChannelId; isProspecting: boolean; waitDays: number; setWaitDays: (v: number) => void; stopOnReply: boolean; setStopOnReply: (v: boolean) => void }) { const label = channels.find((item) => item.id === channel)?.label; if (isProspecting) return <><h3>Construisez votre séquence</h3><div className="campaign-sequence"><div>Invitation LinkedIn</div><i>↓</i><div>Si acceptée</div><i>↓</i><div>Message personnalisé</div><i>↓</i><div>Fin</div></div><p className="campaign-guardrail">Les invitations sont envoyées par petits lots que vous déclenchez vous-même, à un rythme sûr pour votre compte LinkedIn — jamais en continu automatiquement.</p></>; return <><h3>Construisez votre séquence</h3><div className="campaign-sequence"><div>Message {label}</div><i>↓</i><div className="campaign-wait">Attendre <input min={1} onChange={(event) => setWaitDays(Number(event.target.value))} type="number" value={waitDays} /> jours</div><i>↓</i><div>Si aucune réponse</div><i>↓</i><div>Relance {label}</div><i>↓</i><div>Fin</div></div><label className="campaign-stop-rule"><input checked={stopOnReply} onChange={(event) => setStopOnReply(event.target.checked)} type="checkbox" /><span><strong>Arrêter la séquence lorsqu’une réponse est reçue</strong><small>Activé par défaut pour respecter vos contacts.</small></span></label>{channel === "linkedin" ? <p className="campaign-guardrail">Cadence prudente — les messages seront répartis progressivement lorsque la connexion réelle sera disponible.</p> : channel === "whatsapp" ? <p className="campaign-guardrail">WhatsApp est recommandé pour les contacts avec lesquels vous avez déjà une relation commerciale.</p> : null}</>; }
+function WizardSequence({ channel, isProspecting, waitDays, setWaitDays, stopOnReply, setStopOnReply }: { channel: ChannelId; isProspecting: boolean; waitDays: number; setWaitDays: (v: number) => void; stopOnReply: boolean; setStopOnReply: (v: boolean) => void }) { const label = channels.find((item) => item.id === channel)?.label; if (isProspecting) return <><h3>Construisez votre séquence</h3><div className="campaign-sequence"><div>Invitation LinkedIn</div><i>↓</i><div>Si acceptée</div><i>↓</i><div>Message 1</div><i>↓</i><div className="campaign-wait">Attendre <input min={1} onChange={(event) => setWaitDays(Number(event.target.value))} type="number" value={waitDays} /> jours</div><i>↓</i><div>Relance 1 (si aucune réponse)</div><i>↓</i><div className="campaign-wait">Attendre {waitDays} jours</div><i>↓</i><div>Relance 2 (si aucune réponse)</div><i>↓</i><div>Fin</div></div><p className="campaign-guardrail">Les invitations sont envoyées par petits lots que vous déclenchez vous-même, à un rythme sûr pour votre compte LinkedIn — jamais en continu automatiquement. Une réponse du prospect, à tout moment, arrête immédiatement la suite de la séquence.</p></>; return <><h3>Construisez votre séquence</h3><div className="campaign-sequence"><div>Message {label}</div><i>↓</i><div className="campaign-wait">Attendre <input min={1} onChange={(event) => setWaitDays(Number(event.target.value))} type="number" value={waitDays} /> jours</div><i>↓</i><div>Si aucune réponse</div><i>↓</i><div>Relance {label}</div><i>↓</i><div>Fin</div></div><label className="campaign-stop-rule"><input checked={stopOnReply} onChange={(event) => setStopOnReply(event.target.checked)} type="checkbox" /><span><strong>Arrêter la séquence lorsqu’une réponse est reçue</strong><small>Activé par défaut pour respecter vos contacts.</small></span></label>{channel === "linkedin" ? <p className="campaign-guardrail">Cadence prudente — les messages seront répartis progressivement lorsque la connexion réelle sera disponible.</p> : channel === "whatsapp" ? <p className="campaign-guardrail">WhatsApp est recommandé pour les contacts avec lesquels vous avez déjà une relation commerciale.</p> : null}</>; }
 function WizardMessages({ channel, isProspecting, initial, followUp, setInitial, setFollowUp }: { channel: ChannelId; isProspecting: boolean; initial: string; followUp: string; setInitial: (v: string) => void; setFollowUp: (v: string) => void }) { const label = channels.find((item) => item.id === channel)?.label; if (isProspecting) return <><h3>Message envoyé une fois l’invitation acceptée</h3><p className="campaign-helper">La note d’invitation elle-même est personnalisée automatiquement par Talvia pour chaque profil. Ce message-ci part une fois la personne connectée.</p><label><span>Message</span><textarea onChange={(event) => setInitial(event.target.value)} rows={5} value={initial} /></label></>; return <><h3>Rédigez vos messages {label}</h3><p className="campaign-helper">Utilisez {"{first_name}"} et {"{company}"} pour personnaliser vos messages.</p><label><span>Message initial</span><textarea onChange={(event) => setInitial(event.target.value)} rows={5} value={initial} /><button className="campaign-ai-placeholder" onClick={() => setInitial("Bonjour {first_name}, je souhaite échanger avec vous au sujet de {company}.")} type="button">✨ Proposer un exemple</button></label><label><span>Relance</span><textarea onChange={(event) => setFollowUp(event.target.value)} rows={4} value={followUp} /></label></>; }
 function WizardReview({ name, objective, channel, contacts, waitDays }: { name: string; objective: string; channel: ChannelId; contacts?: number; waitDays: number }) { return <><h3>Vérifiez votre campagne</h3><dl className="campaign-review"><div><dt>Nom</dt><dd>{name || `${objective} via ${channels.find((item) => item.id === channel)?.label}`}</dd></div><div><dt>Objectif</dt><dd>{objective}</dd></div><div><dt>Canal</dt><dd>{channels.find((item) => item.id === channel)?.label}</dd></div><div><dt>Audience</dt><dd>{contacts === undefined ? "À choisir après création" : `${contacts} contacts`}</dd></div><div><dt>Séquence</dt><dd>{contacts === undefined ? "Invitation → Message" : `Message → ${waitDays} jours → Relance → Fin`}</dd></div></dl><p className="campaign-simulation-note">{contacts === undefined ? "Les invitations LinkedIn sont réelles une fois envoyées — rien ne part avant que vous ayez validé une liste de prospects." : "Aperçu local : aucun message n’est envoyé vers un canal externe."}</p></>; }
-function CampaignDetail({ campaign, contacts, channel, onBack, onDelete, onDuplicate, onToggle }: { campaign: SandboxCampaign; contacts: Contact[]; channel?: ChannelId; onBack: () => void; onDelete: () => void; onDuplicate: () => void; onToggle: () => void }) { const participants = contacts.filter((contact) => campaign.contactIds.includes(contact.id)); const replied = Object.values(campaign.participantStatuses ?? {}).filter((status) => status === "replied").length; const isProspecting = campaign.objective === "Prospecter" && channel === "linkedin"; return <div className="campaign-detail"><button className="campaign-back" onClick={onBack} type="button"><LuArrowLeft />Retour aux campagnes</button><header className="campaign-detail__header"><div><div className="campaign-detail__title"><h1>{campaign.name}</h1><i className={`campaign-status campaign-status--${campaign.status}`}>{campaign.status}</i></div><p>{campaign.objective} · {channel ? channels.find((item) => item.id === channel)?.label : "Canal non défini"}</p></div><div><button className="connection-button connection-button--secondary" onClick={onToggle} type="button">{campaign.status === "active" ? <><Pause aria-hidden="true" size={14} />Mettre en pause</> : <><Play aria-hidden="true" size={14} />Activer</>}</button><button className="connection-button connection-button--quiet" onClick={onDuplicate} type="button"><LuCopy />Dupliquer</button><button className="connection-button connection-button--quiet" onClick={onDelete} type="button"><LuTrash2 />Archiver</button></div></header>{!isProspecting ? <p className="campaign-simulation-note">Simulation Talvia : aucun message n’est envoyé vers un canal externe.</p> : null}<div className="campaign-metrics"><div><span>Contacts</span><strong>{participants.length}</strong></div><div><span>Préparés</span><strong>{campaign.status === "active" || campaign.status === "paused" ? participants.length : 0}</strong></div><div><span>Réponses</span><strong>{replied}</strong></div><div><span>Terminés</span><strong>{Object.values(campaign.participantStatuses ?? {}).filter((status) => status === "completed").length}</strong></div></div><section className="campaign-detail-panel"><h2>Séquence</h2><div className="campaign-detail-sequence">{campaign.sequence.map((item, index) => <span key={`${item}-${index}`}>{item}</span>)}</div>{campaign.stopOnReply ? <p><LuCheck />La séquence est préparée pour s’arrêter après une réponse future.</p> : null}</section>{isProspecting ? <ProspectingPanel campaignId={campaign.id} campaignStatus={campaign.status} /> : <section className="campaign-detail-panel"><h2>Audience</h2><div className="campaign-participants"><div className="campaign-participants__head"><span>Contact</span><span>Entreprise</span><span>Étape actuelle</span><span>Statut</span><span /></div>{participants.map((contact) => { const status = campaign.participantStatuses?.[contact.id] ?? "waiting"; return <div className="campaign-participant" key={contact.id}><span><b className="campaign-contact-avatar">{contact.name.slice(0, 2).toUpperCase()}</b><strong>{contact.name}</strong></span><span>{contact.company ?? "—"}</span><span>{status === "replied" ? "Séquence arrêtée" : "Message initial"}</span><span>{status === "replied" ? "Répondu" : campaign.status === "active" ? "En cours" : "En attente"}</span><span>Simulation</span></div>; })}</div></section>}</div>; }
+function CampaignDetail({ campaign, contacts, channel, onBack, onDelete, onDuplicate, onToggle }: { campaign: SandboxCampaign; contacts: Contact[]; channel?: ChannelId; onBack: () => void; onDelete: () => void; onDuplicate: () => void; onToggle: () => void }) { const participants = contacts.filter((contact) => campaign.contactIds.includes(contact.id)); const replied = Object.values(campaign.participantStatuses ?? {}).filter((status) => status === "replied").length; const isProspecting = campaign.objective === "Prospecter" && channel === "linkedin"; return <div className="campaign-detail"><button className="campaign-back" onClick={onBack} type="button"><LuArrowLeft />Retour aux campagnes</button><header className="campaign-detail__header"><div><div className="campaign-detail__title"><h1>{campaign.name}</h1><i className={`campaign-status campaign-status--${campaign.status}`}>{campaign.status}</i></div><p>{campaign.objective} · {channel ? channels.find((item) => item.id === channel)?.label : "Canal non défini"}</p></div><div><button className="connection-button connection-button--secondary" onClick={onToggle} type="button">{campaign.status === "active" ? <><Pause aria-hidden="true" size={14} />Mettre en pause</> : <><Play aria-hidden="true" size={14} />Activer</>}</button><button className="connection-button connection-button--quiet" onClick={onDuplicate} type="button"><LuCopy />Dupliquer</button><button className="connection-button connection-button--quiet" onClick={onDelete} type="button"><LuTrash2 />Archiver</button></div></header>{!isProspecting ? <p className="campaign-simulation-note">Simulation Talvia : aucun message n’est envoyé vers un canal externe.</p> : null}<div className="campaign-metrics"><div><span>Contacts</span><strong>{participants.length}</strong></div><div><span>Préparés</span><strong>{campaign.status === "active" || campaign.status === "paused" ? participants.length : 0}</strong></div><div><span>Réponses</span><strong>{replied}</strong></div><div><span>Terminés</span><strong>{Object.values(campaign.participantStatuses ?? {}).filter((status) => status === "completed").length}</strong></div></div><section className="campaign-detail-panel"><h2>Séquence</h2><div className="campaign-detail-sequence">{campaign.sequence.map((item, index) => <span key={`${item}-${index}`}>{item}</span>)}</div>{campaign.stopOnReply ? <p><LuCheck />La séquence est préparée pour s’arrêter après une réponse future.</p> : null}</section>{isProspecting ? <><StrategyCard campaignId={campaign.id} /><ProspectingPanel campaignId={campaign.id} campaignStatus={campaign.status} /></> : <section className="campaign-detail-panel"><h2>Audience</h2><div className="campaign-participants"><div className="campaign-participants__head"><span>Contact</span><span>Entreprise</span><span>Étape actuelle</span><span>Statut</span><span /></div>{participants.map((contact) => { const status = campaign.participantStatuses?.[contact.id] ?? "waiting"; return <div className="campaign-participant" key={contact.id}><span><b className="campaign-contact-avatar">{contact.name.slice(0, 2).toUpperCase()}</b><strong>{contact.name}</strong></span><span>{contact.company ?? "—"}</span><span>{status === "replied" ? "Séquence arrêtée" : "Message initial"}</span><span>{status === "replied" ? "Répondu" : campaign.status === "active" ? "En cours" : "En attente"}</span><span>Simulation</span></div>; })}</div></section>}</div>; }
 
-type ProspectCandidate = { id: string; providerId: string; name: string; headline?: string; company?: string; profileUrl?: string; status: "suggested" | "approved" | "rejected" };
+type CandidateQualification = { score: number; fit: "strong" | "moderate" | "weak" | "insufficient_data"; reasons: string[]; uncertainties: string[]; disqualified: boolean; disqualificationReasons: string[] };
+type ProspectCandidate = { id: string; providerId: string; name: string; headline?: string; company?: string; location?: string; role?: string; profileUrl?: string; status: "suggested" | "approved" | "rejected"; qualification?: CandidateQualification; participantId?: string };
+type CampaignStrategy = { objective: string; targetDescription: string; targetRoles: string[]; companyTypes: string[]; industries: string[]; geography: string[]; qualificationCriteria: string[]; exclusionCriteria: string[]; reasoning: string; source: "ai_generated" | "user_edited"; validatedAt: string | null };
+const FIT_LABEL: Record<CandidateQualification["fit"], string> = { strong: "Excellent fit", moderate: "Fit correct", weak: "Fit faible", insufficient_data: "Données insuffisantes" };
+
+// "Qui cibler et pourquoi" pour CETTE campagne, proposé par Talvia à partir
+// du Business Context (app/lib/campaign-strategy.ts), validé/corrigé ici
+// avant que la recherche LinkedIn ne s'en serve.
+function StrategyCard({ campaignId }: { campaignId: string }) {
+  const [strategy, setStrategy] = useState<CampaignStrategy | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [validating, setValidating] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState({ targetDescription: "", targetRoles: "", industries: "", geography: "", qualificationCriteria: "", exclusionCriteria: "" });
+  const [notice, setNotice] = useState("");
+
+  const toDraft = (value: CampaignStrategy) => ({ targetDescription: value.targetDescription, targetRoles: value.targetRoles.join(", "), industries: value.industries.join(", "), geography: value.geography.join(", "), qualificationCriteria: value.qualificationCriteria.join(", "), exclusionCriteria: value.exclusionCriteria.join(", ") });
+
+  const load = async () => {
+    const response = await fetch(`/api/campaigns/${campaignId}/strategy`);
+    if (response.ok) { const data = (await response.json()) as { strategy: CampaignStrategy | null }; setStrategy(data.strategy); if (data.strategy) setDraft(toDraft(data.strategy)); }
+    setLoaded(true);
+  };
+  useEffect(() => {
+    // Fetch-on-mount, same accepted pattern as ProspectingPanel's own load().
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [campaignId]);
+
+  const generate = async () => {
+    setGenerating(true); setNotice("");
+    try {
+      const response = await fetch(`/api/campaigns/${campaignId}/strategy`, { method: "POST" });
+      const data = (await response.json()) as { strategy?: CampaignStrategy; error?: string };
+      if (!response.ok) { setNotice(data.error ?? "Génération impossible."); return; }
+      setStrategy(data.strategy ?? null);
+      if (data.strategy) setDraft(toDraft(data.strategy));
+    } finally { setGenerating(false); }
+  };
+  const saveEdits = async () => {
+    setSaving(true); setNotice("");
+    try {
+      const body = {
+        targetDescription: draft.targetDescription,
+        targetRoles: draft.targetRoles.split(",").map((value) => value.trim()).filter(Boolean),
+        industries: draft.industries.split(",").map((value) => value.trim()).filter(Boolean),
+        geography: draft.geography.split(",").map((value) => value.trim()).filter(Boolean),
+        qualificationCriteria: draft.qualificationCriteria.split(",").map((value) => value.trim()).filter(Boolean),
+        exclusionCriteria: draft.exclusionCriteria.split(",").map((value) => value.trim()).filter(Boolean),
+      };
+      const response = await fetch(`/api/campaigns/${campaignId}/strategy`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const data = (await response.json()) as { strategy?: CampaignStrategy; error?: string };
+      if (!response.ok) { setNotice(data.error ?? "Enregistrement impossible."); return; }
+      setStrategy(data.strategy ?? null);
+      setEditing(false);
+    } finally { setSaving(false); }
+  };
+  const validate = async () => {
+    setValidating(true); setNotice("");
+    try {
+      const response = await fetch(`/api/campaigns/${campaignId}/strategy/validate`, { method: "POST" });
+      const data = (await response.json()) as { strategy?: CampaignStrategy; error?: string };
+      if (!response.ok) { setNotice(data.error ?? "Validation impossible."); return; }
+      setStrategy(data.strategy ?? null);
+    } finally { setValidating(false); }
+  };
+
+  if (!loaded) return null;
+
+  return <section className="campaign-detail-panel prospecting-strategy">
+    <h2>Cible proposée par Talvia</h2>
+    {notice ? <p className="campaign-guardrail">{notice}</p> : null}
+    {!strategy ? <>
+      <p className="campaign-helper">Talvia peut proposer une cible de prospection à partir de votre Business Context — vous pourrez la corriger avant toute recherche.</p>
+      <button className="connection-button" disabled={generating} onClick={() => void generate()} type="button">{generating ? "Génération..." : "Proposer une cible"}</button>
+    </> : editing ? <>
+      <label><span>Description de la cible</span><textarea onChange={(event) => setDraft({ ...draft, targetDescription: event.target.value })} rows={3} value={draft.targetDescription} /></label>
+      <label><span>Rôles recherchés (séparés par des virgules)</span><input onChange={(event) => setDraft({ ...draft, targetRoles: event.target.value })} value={draft.targetRoles} /></label>
+      <label><span>Secteurs</span><input onChange={(event) => setDraft({ ...draft, industries: event.target.value })} value={draft.industries} /></label>
+      <label><span>Géographie</span><input onChange={(event) => setDraft({ ...draft, geography: event.target.value })} value={draft.geography} /></label>
+      <label><span>Critères de qualification</span><input onChange={(event) => setDraft({ ...draft, qualificationCriteria: event.target.value })} value={draft.qualificationCriteria} /></label>
+      <label><span>Exclusions</span><input onChange={(event) => setDraft({ ...draft, exclusionCriteria: event.target.value })} value={draft.exclusionCriteria} /></label>
+      <div className="campaign-wizard__actions">
+        <button className="connection-button connection-button--secondary" onClick={() => setEditing(false)} type="button">Annuler</button>
+        <button className="connection-button" disabled={saving} onClick={() => void saveEdits()} type="button">{saving ? "Enregistrement..." : "Enregistrer"}</button>
+      </div>
+    </> : <>
+      <p>{strategy.targetDescription || strategy.objective}</p>
+      <dl className="prospecting-strategy__facts">
+        {strategy.targetRoles.length ? <div><dt>Rôles</dt><dd>{strategy.targetRoles.join(", ")}</dd></div> : null}
+        {strategy.industries.length ? <div><dt>Secteurs</dt><dd>{strategy.industries.join(", ")}</dd></div> : null}
+        {strategy.geography.length ? <div><dt>Géographie</dt><dd>{strategy.geography.join(", ")}<small> — utilisée pour évaluer les prospects trouvés, pas pour filtrer la recherche LinkedIn elle-même.</small></dd></div> : null}
+        {strategy.qualificationCriteria.length ? <div><dt>Qualification</dt><dd>{strategy.qualificationCriteria.join(", ")}</dd></div> : null}
+        {strategy.exclusionCriteria.length ? <div><dt>Exclusions</dt><dd>{strategy.exclusionCriteria.join(", ")}</dd></div> : null}
+      </dl>
+      {strategy.source === "user_edited" ? <small className="prospecting-strategy__badge">Corrigée par vous</small> : null}
+      {strategy.validatedAt
+        ? <small className="prospecting-strategy__badge prospecting-strategy__badge--validated">Stratégie validée — la recherche est autorisée</small>
+        : <p className="campaign-guardrail">Cette stratégie doit être validée avant de pouvoir lancer une recherche.</p>}
+      <div className="campaign-wizard__actions">
+        <button className="connection-button connection-button--secondary" onClick={() => setEditing(true)} type="button">Corriger la cible</button>
+        {!strategy.validatedAt ? <button className="connection-button" disabled={validating} onClick={() => void validate()} type="button">{validating ? "Validation..." : "Valider cette cible"}</button> : null}
+      </div>
+    </>}
+  </section>;
+}
 
 // A visual "is this thing actually doing something" cue for prospecting —
 // deliberately tied to real state, not decorative motion for its own sake:
@@ -147,6 +265,123 @@ function ProspectingRadar({ active, candidateCount }: { active: boolean; candida
   </div>;
 }
 
+type GeneratedTextState = { status: "not_generated" | "generated" | "edited" | "approved"; generatedText: string | null; editedText: string | null; approvedText: string | null; approvedAt: string | null };
+type PersonalizationState = {
+  evidence: { observedFacts: Array<{ type: string; value: string; source: string }>; uncertainties: string[] };
+  outreachAngle: { whyContactThisPerson: string; relevantOffer: string; evidenceUsed: string[]; conversationGoal: string; tone: string } | null;
+  invitation: GeneratedTextState;
+  messages: Array<GeneratedTextState & { stepId: string }>;
+  generatedAt: string | null;
+  aiModel: string | null;
+};
+const TEXT_STATUS_LABEL: Record<GeneratedTextState["status"], string> = { not_generated: "non générée", generated: "générée", edited: "modifiée", approved: "approuvée" };
+
+// Qualified Candidate -> Evidence -> Outreach Angle -> Generated text ->
+// Human review -> Approved text (docs spec §1) — the executor only ever
+// sends `approvedText`, never anything generated here directly (see
+// app/lib/campaign-personalization.ts).
+function PersonalizationCard({ campaignId, candidate }: { campaignId: string; candidate: ProspectCandidate }) {
+  const participantId = candidate.participantId;
+  const [personalization, setPersonalization] = useState<PersonalizationState | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [invitationDraft, setInvitationDraft] = useState("");
+  const [messageDrafts, setMessageDrafts] = useState<Record<string, string>>({});
+  const [notice, setNotice] = useState("");
+
+  const applyPersonalization = (value: PersonalizationState) => {
+    setPersonalization(value);
+    setInvitationDraft(value.invitation.editedText ?? value.invitation.generatedText ?? "");
+    setMessageDrafts(Object.fromEntries(value.messages.map((entry) => [entry.stepId, entry.editedText ?? entry.generatedText ?? ""])));
+  };
+
+  const load = async () => {
+    if (!participantId) { setLoaded(true); return; }
+    const response = await fetch(`/api/campaigns/${campaignId}/participants/${participantId}/personalization`);
+    if (response.ok) applyPersonalization((await response.json() as { personalization: PersonalizationState }).personalization);
+    setLoaded(true);
+  };
+  useEffect(() => {
+    // Fetch-on-mount, same accepted pattern as ProspectingPanel's own load().
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [participantId]);
+
+  const generate = async () => {
+    if (!participantId) return;
+    setGenerating(true); setNotice("");
+    try {
+      const response = await fetch(`/api/campaigns/${campaignId}/participants/${participantId}/personalization`, { method: "POST" });
+      const data = (await response.json()) as { personalization?: PersonalizationState; error?: string };
+      if (!response.ok) { setNotice(data.error ?? "Génération impossible."); return; }
+      if (data.personalization) applyPersonalization(data.personalization);
+    } finally { setGenerating(false); }
+  };
+
+  const editField = async (field: "invitation" | "message", text: string, stepId?: string) => {
+    if (!participantId) return;
+    setBusy(true); setNotice("");
+    try {
+      const response = await fetch(`/api/campaigns/${campaignId}/participants/${participantId}/personalization`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ field, stepId, text }) });
+      const data = (await response.json()) as { personalization?: PersonalizationState; error?: string };
+      if (!response.ok) { setNotice(data.error ?? "Enregistrement impossible."); return; }
+      if (data.personalization) applyPersonalization(data.personalization);
+    } finally { setBusy(false); }
+  };
+  const approveField = async (field: "invitation" | "message", stepId?: string) => {
+    if (!participantId) return;
+    setBusy(true); setNotice("");
+    try {
+      const response = await fetch(`/api/campaigns/${campaignId}/participants/${participantId}/personalization/approve`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ field, stepId }) });
+      const data = (await response.json()) as { personalization?: PersonalizationState; error?: string };
+      if (!response.ok) { setNotice(data.error ?? "Approbation impossible."); return; }
+      if (data.personalization) applyPersonalization(data.personalization);
+    } finally { setBusy(false); }
+  };
+
+  if (!loaded) return null;
+  // messages[] is already ordered by step position (see
+  // getParticipantPersonalization) — index 0 is the first post-acceptance
+  // message, every entry after it is a follow-up in send order.
+  const messageLabel = (index: number) => index === 0 ? "Message une fois l’invitation acceptée" : `Relance ${index}`;
+
+  return <div className="prospecting-personalization">
+    <div className="prospecting-personalization__head"><span className="campaign-contact-avatar">{candidate.name.slice(0, 2).toUpperCase()}</span><strong>{candidate.name}</strong></div>
+    {notice ? <p className="campaign-guardrail">{notice}</p> : null}
+    {!personalization || personalization.invitation.status === "not_generated" ? (
+      <button className="connection-button connection-button--secondary" disabled={generating || !participantId} onClick={() => void generate()} type="button">{generating ? "Génération..." : "Générer la personnalisation"}</button>
+    ) : <>
+      {personalization.evidence.observedFacts.length ? <p className="campaign-helper">Fondé sur : {personalization.evidence.observedFacts.map((fact) => fact.value).join(", ")}</p> : null}
+      {personalization.evidence.uncertainties.length ? <p className="campaign-helper">Non vérifié : {personalization.evidence.uncertainties.join(" ")}</p> : null}
+      {personalization.outreachAngle ? <p className="campaign-helper">Angle proposé : {personalization.outreachAngle.whyContactThisPerson}</p> : null}
+
+      <label><span>Note d’invitation ({TEXT_STATUS_LABEL[personalization.invitation.status]})</span>
+        <textarea disabled={personalization.invitation.status === "approved"} onChange={(event) => setInvitationDraft(event.target.value)} rows={2} value={invitationDraft} />
+      </label>
+      <div className="campaign-wizard__actions">
+        {personalization.invitation.status === "approved"
+          ? <small className="prospecting-strategy__badge prospecting-strategy__badge--validated">Invitation approuvée — c’est exactement ce texte qui sera envoyé</small>
+          : <><button className="connection-button connection-button--secondary" disabled={busy} onClick={() => void editField("invitation", invitationDraft)} type="button">Enregistrer</button><button className="connection-button" disabled={busy} onClick={() => void approveField("invitation")} type="button">Approuver l’invitation</button></>}
+      </div>
+
+      {personalization.messages.map((message, index) => <div key={message.stepId}>
+        <label><span>{messageLabel(index)} ({TEXT_STATUS_LABEL[message.status]})</span>
+          <textarea disabled={message.status === "approved"} onChange={(event) => setMessageDrafts((drafts) => ({ ...drafts, [message.stepId]: event.target.value }))} rows={3} value={messageDrafts[message.stepId] ?? ""} />
+        </label>
+        <div className="campaign-wizard__actions">
+          {message.status === "approved"
+            ? <small className="prospecting-strategy__badge prospecting-strategy__badge--validated">{index === 0 ? "Message" : "Relance"} approuvé — c’est exactement ce texte qui sera envoyé</small>
+            : <><button className="connection-button connection-button--secondary" disabled={busy} onClick={() => void editField("message", messageDrafts[message.stepId] ?? "", message.stepId)} type="button">Enregistrer</button><button className="connection-button" disabled={busy} onClick={() => void approveField("message", message.stepId)} type="button">Approuver</button></>}
+        </div>
+      </div>)}
+
+      <button className="connection-button connection-button--quiet" disabled={generating} onClick={() => void generate()} type="button">{generating ? "Régénération..." : "Régénérer une proposition"}</button>
+    </>}
+  </div>;
+}
+
 // Search → human review → approve → manually-triggered send, in that order.
 // Nothing here ever sends anything without an explicit click on a
 // previously-reviewed list — see app/lib/prospecting.ts for why.
@@ -158,8 +393,9 @@ function ProspectingPanel({ campaignId, campaignStatus }: { campaignId: string; 
   const [approving, setApproving] = useState(false);
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState("");
+  const [hasSearched, setHasSearched] = useState(false);
 
-  const load = async () => { const response = await fetch(`/api/campaigns/${campaignId}/prospecting/search`); if (response.ok) setCandidates((await response.json() as { candidates: ProspectCandidate[] }).candidates); };
+  const load = async () => { const response = await fetch(`/api/campaigns/${campaignId}/prospecting/search`); if (response.ok) { const data = await response.json() as { candidates: ProspectCandidate[] }; setCandidates(data.candidates); if (data.candidates.length) setHasSearched(true); } };
   useEffect(() => {
     // Fetch-on-mount/prop-change, same accepted pattern already used
     // throughout this codebase's other client components (e.g.
@@ -176,6 +412,7 @@ function ProspectingPanel({ campaignId, campaignStatus }: { campaignId: string; 
       const data = await response.json() as { candidates?: ProspectCandidate[]; error?: string };
       if (!response.ok) { setNotice(data.error ?? "Recherche impossible."); return; }
       setCandidates(data.candidates ?? []);
+      setHasSearched(true);
     } finally { setSearching(false); }
   };
   const toggle = (id: string) => setSelected(selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id]);
@@ -222,16 +459,27 @@ function ProspectingPanel({ campaignId, campaignStatus }: { campaignId: string; 
         {suggested.map((candidate) => <label key={candidate.id}>
           <input checked={selected.includes(candidate.id)} onChange={() => toggle(candidate.id)} type="checkbox" />
           <span className="campaign-contact-avatar">{candidate.name.slice(0, 2).toUpperCase()}</span>
-          <span><strong>{candidate.name}</strong><small>{candidate.headline ?? "Profil LinkedIn"}{candidate.company ? ` · ${candidate.company}` : ""}</small></span>
+          <span>
+            <strong>{candidate.name}</strong>
+            <small>{candidate.headline ?? "Profil LinkedIn"}{candidate.company ? ` · ${candidate.company}` : ""}{candidate.location ? ` · ${candidate.location}` : ""}</small>
+            {candidate.qualification?.disqualified
+              ? <small className="prospecting-fit prospecting-fit--disqualified">Ne correspond pas à la cible{candidate.qualification.disqualificationReasons[0] ? ` — ${candidate.qualification.disqualificationReasons[0]}` : ""}</small>
+              : candidate.qualification ? <small className={`prospecting-fit prospecting-fit--${candidate.qualification.fit}`}>{FIT_LABEL[candidate.qualification.fit]}{candidate.qualification.reasons[0] ? ` — ${candidate.qualification.reasons[0]}` : candidate.qualification.uncertainties[0] ? ` — ${candidate.qualification.uncertainties[0]}` : ""}</small> : null}
+          </span>
         </label>)}
       </div>
       <p className="campaign-selected-count">{selected.length} prospect(s) sélectionné(s)</p>
       <button className="connection-button" disabled={approving || !selected.length} onClick={() => void approve()} type="button">{approving ? "Validation..." : "Valider cette sélection"}</button>
-    </> : <p>Aucun prospect suggéré pour l’instant — lancez une recherche.</p>}
+    </> : <p>{hasSearched ? "Aucun prospect trouvé pour cette recherche — essayez d’élargir vos critères." : "Aucun prospect suggéré pour l’instant — lancez une recherche."}</p>}
     {approved.length ? <div className="campaign-detail-panel__footer">
       <p>{approved.length} prospect(s) validé(s), prêt(s) à recevoir une invitation.</p>
       <button className="connection-button" disabled={sending || campaignStatus !== "active"} onClick={() => void sendBatch()} type="button"><LuSend />{sending ? "Envoi..." : "Envoyer ce lot"}</button>
       {campaignStatus !== "active" ? <small>Activez la campagne avant d’envoyer des invitations.</small> : null}
+    </div> : null}
+    {approved.length ? <div className="prospecting-personalization-list">
+      <h3>Personnalisation par prospect</h3>
+      <p className="campaign-helper">Ce qui est envoyé à chaque prospect est exactement le texte approuvé ci-dessous — jamais un texte régénéré au moment de l’envoi.</p>
+      {approved.map((candidate) => <PersonalizationCard campaignId={campaignId} candidate={candidate} key={candidate.id} />)}
     </div> : null}
   </section>;
 }

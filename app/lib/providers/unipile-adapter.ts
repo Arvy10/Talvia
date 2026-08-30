@@ -1,6 +1,8 @@
 import { database } from "../database";
 import { dispatchCommittedActivity, recordSystemActivity } from "../activities";
 import { normalizeLinkedIn, normalizePhone } from "../../app/contacts/contact-utils";
+import { advanceParticipantToNextStep } from "../campaign-execution/step-progression";
+import type { WorkspaceContext } from "../workspace-context";
 import {
   editChatMessage,
   getUnipileConfig,
@@ -281,6 +283,24 @@ export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<
 
     await client.query(`update conversations set last_message_at=now(),updated_at=now() where id=$1`, [conversationId]);
     const acceptedInvites = await markProspectingInvitesAccepted(client, workspaceId, contactId);
+    // A genuine inbound reply — as opposed to the invitation-acceptance
+    // message itself, which is excluded via acceptedInvites' ids — stops any
+    // further automated Campaign action for this participant immediately,
+    // server-side, regardless of whether the user has Inbox open
+    // (docs/product/ARCHITECTURE.md §6, DECISIONS.md "LinkedIn campaign
+    // behavior").
+    const stoppedParticipants = isOutbound ? [] : await stopParticipantsOnReply(client, workspaceId, contactId, acceptedInvites.map((p) => p.id));
+    // The acceptance advances the participant off the invite step, in the
+    // SAME transaction as invite_accepted_at itself — a crash between the
+    // two would otherwise leave a participant permanently stuck (accepted,
+    // but never advanced). This is domain-state progression only, no
+    // provider call: see step-progression.ts.
+    const pendingActivities = [];
+    for (const participant of acceptedInvites) {
+      const advance = await advanceParticipantToNextStep(workspaceId, participant.campaign_id, participant.id, participant.current_step_id, client);
+      if (advance.activity) pendingActivities.push(advance.activity);
+      pendingActivities.push(await recordSystemActivity(workspaceId, { eventType: "campaign.invite_accepted", entityType: "campaign", entityId: participant.campaign_id, metadata: { campaignId: participant.campaign_id, participantId: participant.id } }, client));
+    }
     const activity = await recordSystemActivity(workspaceId, {
       eventType: isOutbound ? "message.sent" : "message.received",
       entityType: "conversation",
@@ -289,8 +309,30 @@ export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<
     }, client);
     await client.query("commit");
     await dispatchCommittedActivity(activity);
-    for (const participant of acceptedInvites) {
-      await sendProspectingFollowUp(workspaceId, participant.id, participant.campaign_id, contactId, conversationId);
+    for (const pending of pendingActivities) await dispatchCommittedActivity(pending);
+    // Ingestion's own job stops here — it updated domain state
+    // (invite_accepted_at, current_step_id) and nothing more. Whether and
+    // when the message actually goes out is entirely the Campaign Engine's
+    // decision (docs spec §1/§4), triggered — not performed — from here.
+    // Dynamic import: unipile-adapter.ts -> engine.ts -> linkedin-executor.ts
+    // -> prospecting.ts -> unipile-adapter.ts (findOrCreateContact) would
+    // otherwise be a circular static import; same fix activities.ts already
+    // uses for automations.ts.
+    const campaignsToRun = new Set(acceptedInvites.map((p) => p.campaign_id));
+    if (campaignsToRun.size > 0) {
+      const { runDueCampaignActions } = await import("../campaign-execution/engine");
+      const systemContext: WorkspaceContext = { workspaceId, userId: "", authUserId: "webhook", role: "owner" };
+      for (const campaignId of campaignsToRun) {
+        try {
+          await runDueCampaignActions(systemContext, campaignId);
+        } catch (error) {
+          console.error(`[unipile-adapter] campaign engine trigger failed for campaign ${campaignId}`, error);
+        }
+      }
+    }
+    for (const participant of stoppedParticipants) {
+      const stopActivity = await recordSystemActivity(workspaceId, { eventType: "campaign.participant_stopped", entityType: "campaign", entityId: participant.campaign_id, metadata: { campaignId: participant.campaign_id, participantId: participant.id, reason: "replied" } });
+      await dispatchCommittedActivity(stopActivity);
     }
     return { status: "ingested" };
   } catch (error) {
@@ -308,59 +350,37 @@ export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<
 // 'new_relation' webhook subscription (which can lag up to 8 hours since
 // LinkedIn has no real-time support for it). See app/lib/prospecting.ts for
 // the sending side of this flow.
-async function markProspectingInvitesAccepted(client: import("pg").PoolClient, workspaceId: string, contactId: string): Promise<Array<{ id: string; campaign_id: string }>> {
-  const result = await client.query<{ id: string; campaign_id: string }>(
+async function markProspectingInvitesAccepted(client: import("pg").PoolClient, workspaceId: string, contactId: string): Promise<Array<{ id: string; campaign_id: string; current_step_id: string }>> {
+  const result = await client.query<{ id: string; campaign_id: string; current_step_id: string }>(
     `update campaign_participants set invite_accepted_at=now(),updated_at=now()
      where contact_id=$1 and invite_sent_at is not null and invite_accepted_at is null
        and campaign_id in (select id from campaigns where workspace_id=$2)
-     returning id,campaign_id`,
+     returning id,campaign_id,current_step_id`,
     [contactId, workspaceId],
   );
   return result.rows;
 }
 
-// {first_name}/{last_name}/{company} are the placeholders the campaign
-// wizard's own helper text already promises the user ("Utilisez {first_name}
-// et {company} pour personnaliser vos messages") — this is what actually
-// makes good on that promise at send time, rather than the literal braces
-// going out untouched.
-function substitutePlaceholders(template: string, values: { firstName: string; lastName: string; company: string }): string {
-  return template
-    .replaceAll("{first_name}", values.firstName)
-    .replaceAll("{last_name}", values.lastName)
-    .replaceAll("{company}", values.company);
-}
-
-// Advances the participant to the sequence's message step (if one exists —
-// an invite-only sequence with no follow-up step is valid, just a no-op
-// here) and sends it, with the contact's own name/company substituted in.
-// Runs after ingestMessage's own transaction commits: a real Unipile send
-// must never happen while still holding the row locks from that transaction.
-async function sendProspectingFollowUp(workspaceId: string, participantId: string, campaignId: string, contactId: string, conversationId: string): Promise<void> {
-  const step = await database.query<{ id: string; message_template: string | null }>(
-    `select id,message_template from campaign_steps where campaign_id=$1 and step_type='message' order by position limit 1`,
-    [campaignId],
+// docs/product/ARCHITECTURE.md §6 point 5 / DECISIONS.md "LinkedIn campaign
+// behavior": a real reply stops only that participant's future automated
+// steps, never the whole campaign. `excludeParticipantIds` keeps the
+// invitation-acceptance message (which IS this contact's first inbound
+// message, handled above by markProspectingInvitesAccepted) from
+// immediately self-stopping before its own follow-up message can send.
+// Matches both 'active' (a future wait/follow_up step exists and must never
+// fire) and 'completed' (nothing left to stop, but the participant should
+// still reflect that the prospect actually engaged). Idempotent via
+// `replied_at is null` — a second reply is a no-op here, not a second stop.
+async function stopParticipantsOnReply(client: import("pg").PoolClient, workspaceId: string, contactId: string, excludeParticipantIds: string[]): Promise<Array<{ id: string; campaign_id: string }>> {
+  const result = await client.query<{ id: string; campaign_id: string }>(
+    `update campaign_participants set status='replied',replied_at=now(),updated_at=now()
+     where contact_id=$1 and status in ('active','completed') and invite_accepted_at is not null and replied_at is null
+       and campaign_id in (select id from campaigns where workspace_id=$2)
+       and not (id = any($3::uuid[]))
+     returning id,campaign_id`,
+    [contactId, workspaceId, excludeParticipantIds],
   );
-  const messageStep = step.rows[0];
-  if (!messageStep?.message_template) return;
-  await database.query(`update campaign_participants set current_step_id=$1,status='completed',updated_at=now() where id=$2`, [messageStep.id, participantId]);
-
-  const contact = await database.query<{ first_name: string | null; last_name: string | null; company: string | null }>(
-    `select ct.first_name,ct.last_name,co.name company from contacts ct left join companies co on co.id=ct.company_id and co.workspace_id=ct.workspace_id where ct.workspace_id=$1 and ct.id=$2`,
-    [workspaceId, contactId],
-  );
-  const person = contact.rows[0];
-  const message = substitutePlaceholders(messageStep.message_template, {
-    firstName: person?.first_name || "",
-    lastName: person?.last_name || "",
-    company: person?.company || "votre entreprise",
-  });
-
-  try {
-    await sendMessage(workspaceId, conversationId, message);
-  } catch (error) {
-    console.error(`[prospecting] follow-up message failed for participant ${participantId}`, error);
-  }
+  return result.rows;
 }
 
 export type BackfillSummary = { chatsProcessed: number; messagesInserted: number; chatsFailed: number };

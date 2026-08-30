@@ -1,18 +1,31 @@
 import { NextResponse } from "next/server";
-import { sendInviteBatch } from "../../../../../lib/prospecting";
+import { runDueCampaignActions } from "../../../../../lib/campaign-execution/engine";
 import { getCurrentWorkspace, UnauthorizedError } from "../../../../../lib/workspace-context";
 export const runtime = "nodejs";
 type Context = { params: Promise<{ campaignId: string }> };
 function fail(error: unknown) { if (error instanceof UnauthorizedError) return NextResponse.json({ error: "Non authentifié." }, { status: 401 }); return NextResponse.json({ error: error instanceof Error ? error.message : "Erreur serveur." }, { status: 400 }); }
 
-// The manually-triggered "Envoyer ce lot" button — see app/lib/prospecting.ts
-// for the safe-pacing/claim logic. Each click sends at most one capped batch;
-// spreading invitations across the day happens by clicking again later, not
-// by a scheduled job (deliberately no cron for V1).
+const BLOCKED_REASON_MESSAGES: Partial<Record<string, string>> = {
+  NO_LINKEDIN_CONNECTION: "Aucun compte LinkedIn connecté.",
+  NOT_ELIGIBLE: "Campagne introuvable.",
+  CAMPAIGN_PAUSED: "La campagne doit être activée avant d'envoyer des invitations.",
+  NO_STEP_CONFIGURED: "Cette campagne n'a pas d'étape d'invitation.",
+  DAILY_LIMIT_REACHED: "La limite quotidienne d'invitations est atteinte — réessayez demain.",
+};
+
+// The manually-triggered "Envoyer ce lot" button. Runs through the exact
+// same runDueCampaignActions() the cron-triggered engine sweep uses (see
+// app/lib/campaign-execution/engine.ts and api/campaigns/engine/run) — this
+// button is a manual invocation of the engine, not a separate send path.
 export async function POST(request: Request, { params }: Context) {
   try {
     const body = await request.json().catch(() => ({})) as { limit?: number };
-    const result = await sendInviteBatch(await getCurrentWorkspace(), (await params).campaignId, body.limit);
+    const context = await getCurrentWorkspace();
+    const campaignId = (await params).campaignId;
+    const result = await runDueCampaignActions(context, campaignId, { limit: body.limit });
+    if (result.blockedReason) {
+      return NextResponse.json({ error: BLOCKED_REASON_MESSAGES[result.blockedReason] ?? "Envoi impossible." }, { status: 400 });
+    }
     return NextResponse.json(result);
   } catch (error) {
     return fail(error);

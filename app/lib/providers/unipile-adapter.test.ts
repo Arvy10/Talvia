@@ -183,23 +183,40 @@ function createFakeDatabase() {
       const campaignIds = new Set(campaigns.filter((c) => c.workspace_id === workspaceId).map((c) => c.id));
       const matches = campaignParticipants.filter((p) => p.contact_id === contactId && p.invite_sent_at && !p.invite_accepted_at && campaignIds.has(p.campaign_id));
       for (const p of matches) p.invite_accepted_at = new Date().toISOString();
+      return { rows: matches.map((p) => ({ id: p.id, campaign_id: p.campaign_id, current_step_id: p.current_step_id })) };
+    }
+    if (text.startsWith("update campaign_participants set status='replied'")) {
+      const [contactId, workspaceId, excludeIds] = params as [string, string, string[]];
+      const campaignIds = new Set(campaigns.filter((c) => c.workspace_id === workspaceId).map((c) => c.id));
+      const matches = campaignParticipants.filter((p) => p.contact_id === contactId && (p.status === "active" || p.status === "completed") && p.invite_accepted_at && !p.replied_at && campaignIds.has(p.campaign_id) && !excludeIds.includes(p.id as string));
+      for (const p of matches) { p.status = "replied"; p.replied_at = new Date().toISOString(); }
       return { rows: matches.map((p) => ({ id: p.id, campaign_id: p.campaign_id })) };
     }
-    if (text.startsWith("select id,message_template from campaign_steps where campaign_id=$1 and step_type='message'")) {
-      const [campaignId] = params as string[];
-      const row = campaignSteps.filter((s) => s.campaign_id === campaignId && s.step_type === "message").sort((a, b) => (a.position as number) - (b.position as number))[0];
-      return { rows: row ? [{ id: row.id, message_template: row.message_template }] : [] };
+
+    // --- step-progression.ts (advanceParticipantToNextStep), exercised for
+    // real here — proving the adapter actually advances current_step_id,
+    // not just records invite_accepted_at.
+    if (text.startsWith("select position from campaign_steps where campaign_id=$1 and id=$2")) {
+      const [campaignId, stepId] = params as string[];
+      const row = campaignSteps.find((s) => s.campaign_id === campaignId && s.id === stepId);
+      return { rows: row ? [{ position: row.position }] : [] };
     }
-    if (text.startsWith("update campaign_participants set current_step_id=$1,status='completed'")) {
-      const [stepId, participantId] = params as string[];
-      const row = campaignParticipants.find((p) => p.id === participantId);
-      if (row) { row.current_step_id = stepId; row.status = "completed"; }
+    if (text.startsWith("select id,position,step_type,message_template from campaign_steps where campaign_id=$1 and position>$2")) {
+      const [campaignId, position] = params as [string, number];
+      const row = campaignSteps.filter((s) => s.campaign_id === campaignId && (s.position as number) > Number(position)).sort((a, b) => (a.position as number) - (b.position as number))[0];
+      return { rows: row ? [{ id: row.id, position: row.position, step_type: row.step_type, message_template: row.message_template ?? null }] : [] };
+    }
+    if (text.startsWith("update campaign_participants set current_step_id=coalesce($1,current_step_id),status='completed'")) {
+      const [nextStepId, id] = params as [string | null, string];
+      const row = campaignParticipants.find((p) => p.id === id);
+      if (row) { row.current_step_id = nextStepId ?? row.current_step_id; row.status = "completed"; }
       return { rows: [] };
     }
-    if (text.startsWith("select ct.first_name,ct.last_name,co.name company from contacts")) {
-      const [workspaceId, contactId] = params as string[];
-      const row = contacts.find((c) => c.workspace_id === workspaceId && c.id === contactId);
-      return { rows: row ? [{ first_name: row.first_name ?? null, last_name: row.last_name ?? null, company: row.company ?? null }] : [] };
+    if (text.startsWith("update campaign_participants set current_step_id=$1,step_claimed_at=null")) {
+      const [nextStepId, id] = params as string[];
+      const row = campaignParticipants.find((p) => p.id === id);
+      if (row) row.current_step_id = nextStepId;
+      return { rows: [] };
     }
 
     throw new Error(`unhandled query in fake database: ${text}`);
@@ -222,9 +239,16 @@ vi.mock("./unipile", async (importOriginal) => ({
   editChatMessage: editChatMessageMock,
 }));
 
+// ingestMessage only *triggers* the Campaign Engine after an acceptance
+// (dynamic import, see unipile-adapter.ts's comment on why) — it must never
+// send anything itself. Mocking the engine module lets these tests prove
+// exactly that boundary: the adapter delegates, it does not execute.
+const runDueCampaignActionsMock = vi.hoisted(() => vi.fn(async () => ({ attempted: 0, sent: 0, skipped: 0, failed: 0 })));
+vi.mock("../campaign-execution/engine", () => ({ runDueCampaignActions: runDueCampaignActionsMock }));
+
 const { editMessage, ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, sendMessage } = await import("./unipile-adapter");
 
-beforeEach(() => { fakeDatabase = createFakeDatabase(); sendChatMessageMock.mockClear(); editChatMessageMock.mockClear(); });
+beforeEach(() => { fakeDatabase = createFakeDatabase(); sendChatMessageMock.mockClear(); editChatMessageMock.mockClear(); runDueCampaignActionsMock.mockClear(); });
 
 const workspaceId = "ws-1";
 const accountId = "acct-unipile-1";
@@ -507,23 +531,32 @@ describe("ingestMessage — attachments", () => {
 });
 
 describe("ingestMessage — LinkedIn prospecting acceptance detection", () => {
-  it("marks a pending invite accepted and sends the follow-up message when the prospect messages back", async () => {
+  it("(B) marks the invite accepted and advances the participant to the message step — never sends anything itself, only triggers the Campaign Engine", async () => {
     await connectAccount();
     fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe", first_name: "Jane", last_name: "Doe", company: "Acme Corp" });
     fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
-    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId });
+    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId, status: "active" });
     fakeDatabase.campaignSteps.push({ id: "step-invite", campaign_id: "camp-1", position: 0, step_type: "invite", message_template: null });
-    fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Bonjour {first_name}, ravi de vous compter parmi mes relations ! J'aimerais échanger sur ce que fait {company}." });
+    fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Bonjour {first_name} !" });
     fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-jane", status: "active", current_step_id: "step-invite", invite_sent_at: new Date(Date.now() - 60_000).toISOString(), invite_accepted_at: null });
 
     const result = await ingestMessage(messagePayload());
 
     expect(result).toEqual({ status: "ingested" });
-    expect(fakeDatabase.campaignParticipants[0]).toMatchObject({ status: "completed", current_step_id: "step-message" });
+    // Domain state advanced (current_step_id moved to the message step) —
+    // status stays 'active', NOT 'completed': sending — and therefore
+    // completing — is the executor's job, not the adapter's.
+    expect(fakeDatabase.campaignParticipants[0]).toMatchObject({ status: "active", current_step_id: "step-message" });
     expect(fakeDatabase.campaignParticipants[0]!.invite_accepted_at).not.toBeNull();
-    // The template's {first_name}/{company} placeholders must be substituted
-    // with the real contact's data, not sent out as literal braces.
-    expect(sendChatMessageMock).toHaveBeenCalledWith(expect.anything(), "chat-1", "Bonjour Jane, ravi de vous compter parmi mes relations ! J'aimerais échanger sur ce que fait Acme Corp.");
+    // The acceptance message itself must never immediately self-stop the
+    // participant it just advanced — only a later, genuine reply should.
+    expect(fakeDatabase.campaignParticipants[0]!.replied_at).toBeFalsy();
+    // No direct provider call from the adapter for the message step.
+    expect(sendChatMessageMock).not.toHaveBeenCalled();
+    // The Campaign Engine is triggered — scoped to this workspace and
+    // campaign — to actually execute the now-due message step.
+    expect(runDueCampaignActionsMock).toHaveBeenCalledWith(expect.objectContaining({ workspaceId }), "camp-1");
+    expect(fakeDatabase.activities.some((a) => a.event_type === "campaign.invite_accepted")).toBe(true);
   });
 
   it("does nothing for a contact with no pending prospecting invite", async () => {
@@ -531,6 +564,57 @@ describe("ingestMessage — LinkedIn prospecting acceptance detection", () => {
     const result = await ingestMessage(messagePayload());
     expect(result).toEqual({ status: "ingested" });
     expect(sendChatMessageMock).not.toHaveBeenCalled();
+    expect(runDueCampaignActionsMock).not.toHaveBeenCalled();
+  });
+
+  it("(I) a duplicated acceptance webhook (same provider_message_id redelivered) never triggers the engine twice", async () => {
+    await connectAccount();
+    fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe", first_name: "Jane", last_name: "Doe" });
+    fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
+    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId, status: "active" });
+    fakeDatabase.campaignSteps.push({ id: "step-invite", campaign_id: "camp-1", position: 0, step_type: "invite", message_template: null });
+    fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Bonjour {first_name} !" });
+    fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-jane", status: "active", current_step_id: "step-invite", invite_sent_at: new Date(Date.now() - 60_000).toISOString(), invite_accepted_at: null });
+
+    const first = await ingestMessage(messagePayload());
+    const second = await ingestMessage(messagePayload()); // same message_id -> a redelivered webhook
+
+    expect(first).toEqual({ status: "ingested" });
+    expect(second).toEqual({ status: "duplicate" });
+    expect(runDueCampaignActionsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops the participant's sequence — server-side — the moment a genuine reply arrives after acceptance", async () => {
+    await connectAccount();
+    fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe", first_name: "Jane", last_name: "Doe", company: "Acme Corp" });
+    fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
+    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId });
+    fakeDatabase.campaignSteps.push({ id: "step-invite", campaign_id: "camp-1", position: 0, step_type: "invite", message_template: null });
+    fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Bonjour {first_name} !" });
+    // Already past acceptance and follow-up (as the previous test proves
+    // that transition works) — this is the resting state a real reply
+    // arrives into.
+    fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-jane", status: "completed", current_step_id: "step-message", invite_sent_at: new Date(Date.now() - 120_000).toISOString(), invite_accepted_at: new Date(Date.now() - 60_000).toISOString(), replied_at: null });
+
+    const result = await ingestMessage(messagePayload({ message_id: "msg-provider-reply-1", message: "En fait je ne suis pas intéressé, merci." }));
+
+    expect(result).toEqual({ status: "ingested" });
+    expect(fakeDatabase.campaignParticipants[0]).toMatchObject({ status: "replied" });
+    expect(fakeDatabase.campaignParticipants[0]!.replied_at).not.toBeNull();
+    expect(fakeDatabase.activities.some((a) => a.event_type === "campaign.participant_stopped")).toBe(true);
+  });
+
+  it("is idempotent — a duplicate reply webhook does not re-stop an already-replied participant", async () => {
+    await connectAccount();
+    fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe", first_name: "Jane", last_name: "Doe" });
+    fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
+    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId });
+    const repliedAt = new Date(Date.now() - 30_000).toISOString();
+    fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-jane", status: "replied", current_step_id: "step-message", invite_sent_at: new Date(Date.now() - 120_000).toISOString(), invite_accepted_at: new Date(Date.now() - 60_000).toISOString(), replied_at: repliedAt });
+
+    await ingestMessage(messagePayload({ message_id: "msg-provider-reply-2", message: "Un second message." }));
+
+    expect(fakeDatabase.campaignParticipants[0]!.replied_at).toBe(repliedAt);
   });
 });
 
