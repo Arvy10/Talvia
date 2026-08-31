@@ -4,14 +4,20 @@ import type { WorkspaceContext } from "../workspace-context";
 import { linkedInExecutor } from "./linkedin-executor";
 import { consumeDueWaitSteps } from "./step-progression";
 import type { ChannelExecutor, EngineRunSummary } from "./types";
+import { whatsAppExecutor } from "./whatsapp-executor";
 
 // The one place that knows which executor handles which
 // (channel, objective) pair (docs/product spec §2's "TALVIA CAMPAIGN DOMAIN
 // → [LinkedIn | WhatsApp | Email] Executor" diagram). Adding a channel later
 // means adding one entry here, not touching campaigns.ts, participants,
-// scheduling, or workspace isolation.
+// scheduling, or workspace isolation. WhatsApp campaigns are only ever
+// created with objective 'follow_up' or 'reactivation' (see
+// CampaignsClient.tsx's objectiveToApi — 'prospecting' is LinkedIn-only),
+// hence two entries sharing the same executor.
 const EXECUTORS: Array<{ channel: CampaignChannel; objective: CampaignObjective; executor: ChannelExecutor }> = [
   { channel: "linkedin", objective: "prospecting", executor: linkedInExecutor },
+  { channel: "whatsapp", objective: "follow_up", executor: whatsAppExecutor },
+  { channel: "whatsapp", objective: "reactivation", executor: whatsAppExecutor },
 ];
 
 function pickExecutor(channel: CampaignChannel, objective: CampaignObjective): ChannelExecutor | null {

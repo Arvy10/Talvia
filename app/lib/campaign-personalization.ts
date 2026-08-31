@@ -556,6 +556,77 @@ export async function generateParticipantPersonalization(context: WorkspaceConte
   return { ok: true, personalization: next };
 }
 
+// WhatsApp minimal executor spec §3: a WhatsApp participant is an existing
+// Contact, never a row in campaign_prospect_candidates (that table is
+// LinkedIn-search-specific) — so this never touches it, and never calls the
+// AI evidence-grounding pipeline above at all. There is nothing to
+// hallucinate because there is nothing generated beyond substituting the
+// Contact's own real, already-known fields into the step's own
+// human-authored message_template; an unknown field degrades to a safe,
+// generic phrase, never an invented company/problem/intent. Storage,
+// mergeMessageArtifact's never-overwrite-approved rule, and the human
+// approval requirement are all reused unchanged from the pipeline above.
+type WhatsAppContactFacts = { name: string; firstName: string; company: string | null };
+
+function substituteContactPlaceholders(template: string, contact: WhatsAppContactFacts): string {
+  return template
+    .replaceAll("{first_name}", contact.firstName || contact.name)
+    .replaceAll("{company}", contact.company || "votre entreprise");
+}
+
+function deterministicWhatsAppMessage(contact: WhatsAppContactFacts): string {
+  return `Bonjour ${contact.firstName || contact.name}, je me permets de revenir vers vous.`;
+}
+
+export async function generateWhatsAppParticipantPersonalization(context: WorkspaceContext, campaignId: string, participantId: string): Promise<GenerateOutcome> {
+  const participantRow = await database.query<{ contact_id: string }>(
+    `select p.contact_id from campaign_participants p join campaigns c on c.id=p.campaign_id where c.workspace_id=$1 and c.id=$2 and p.id=$3`,
+    [context.workspaceId, campaignId, participantId],
+  );
+  const participant = participantRow.rows[0];
+  if (!participant) return { ok: false, reason: "NOT_ELIGIBLE" };
+
+  const contactRow = await database.query<{ first_name: string; display_name: string; company: string | null }>(
+    `select ct.first_name,ct.display_name,co.name company from contacts ct left join companies co on co.id=ct.company_id and co.workspace_id=ct.workspace_id where ct.workspace_id=$1 and ct.id=$2`,
+    [context.workspaceId, participant.contact_id],
+  );
+  const contactData = contactRow.rows[0];
+  if (!contactData) return { ok: false, reason: "NOT_ELIGIBLE" };
+  const contact: WhatsAppContactFacts = { name: contactData.display_name, firstName: contactData.first_name, company: contactData.company };
+
+  const messageSteps = await database.query<{ id: string; message_template: string | null }>(
+    `select id,message_template from campaign_steps where campaign_id=$1 and step_type='message' order by position`,
+    [campaignId],
+  );
+  if (messageSteps.rows.length === 0) return { ok: false, reason: "NO_STEP_CONFIGURED" };
+
+  const observedFacts: ObservedFact[] = [{ type: "name", value: contact.name, source: "contact" }];
+  if (contact.company) observedFacts.push({ type: "company", value: contact.company, source: "contact" });
+
+  const existing = (await getParticipantPersonalization(context, campaignId, participantId)) ?? emptyPersonalization();
+  let messages = existing.messages;
+  for (const step of messageSteps.rows) {
+    const current = messages.find((entry) => entry.stepId === step.id);
+    if (current?.status === "approved") continue; // never silently overwrite an approved message (docs spec §9/§16)
+    const text = step.message_template?.trim()
+      ? substituteContactPlaceholders(step.message_template, contact).slice(0, 1000)
+      : deterministicWhatsAppMessage(contact);
+    messages = mergeMessageArtifact(messages, step.id, text);
+  }
+
+  const next: ParticipantPersonalization = {
+    evidence: { observedFacts, qualificationContext: null, strategyContext: null, uncertainties: [] },
+    outreachAngle: existing.outreachAngle,
+    invitation: existing.invitation,
+    messages,
+    generatedAt: new Date().toISOString(),
+    aiModel: null,
+  };
+  const ok = await savePersonalization(context, campaignId, participantId, next);
+  if (!ok) return { ok: false, reason: "NOT_ELIGIBLE" };
+  return { ok: true, personalization: next };
+}
+
 const GENERATION_CONCURRENCY = 3;
 
 // Controlled concurrency, not a sequential cascade, not a distributed job

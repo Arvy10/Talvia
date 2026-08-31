@@ -6,6 +6,10 @@
 // an explanation for its absence).
 export type ReasonCode =
   | "NO_LINKEDIN_CONNECTION"
+  // WhatsApp minimal executor — parallel to NO_LINKEDIN_CONNECTION above,
+  // never reused across channels so a diagnostic always names the actual
+  // channel that's missing a connection.
+  | "NO_WHATSAPP_CONNECTION"
   | "INVALID_IDENTITY"
   | "NOT_ELIGIBLE"
   | "WAITING_FOR_ACCEPTANCE"

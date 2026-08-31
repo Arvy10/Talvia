@@ -8,6 +8,7 @@ function createFakeDatabase() {
   const campaignParticipants: Array<Record<string, unknown>> = [];
   const campaignSteps: Array<Record<string, unknown>> = [];
   const candidates: Array<Record<string, unknown>> = [];
+  const contacts: Array<Record<string, unknown>> = [];
 
   async function query(sql: string, params: unknown[] = []) {
     const text = sql.replace(/\s+/g, " ").trim();
@@ -53,11 +54,16 @@ function createFakeDatabase() {
       const [workspaceId, campaignId] = params as string[];
       return { rows: campaignParticipants.filter((p) => p.campaign_id === campaignId && campaigns.some((c) => c.id === campaignId && c.workspace_id === workspaceId) && (!p.personalization || (p.personalization as { invitation: { status: string } }).invitation.status === "not_generated")).map((p) => ({ id: p.id })) };
     }
+    if (text.startsWith("select ct.first_name,ct.display_name,co.name company from contacts ct")) {
+      const [workspaceId, contactId] = params as string[];
+      const row = contacts.find((c) => c.workspace_id === workspaceId && c.id === contactId);
+      return { rows: row ? [{ first_name: row.first_name, display_name: row.display_name, company: row.company ?? null }] : [] };
+    }
 
     throw new Error(`unhandled query in fake database: ${text}`);
   }
 
-  return { query, connect: async () => ({ query, release: () => {} }), campaigns, campaignParticipants, campaignSteps, candidates };
+  return { query, connect: async () => ({ query, release: () => {} }), campaigns, campaignParticipants, campaignSteps, candidates, contacts };
 }
 
 let fakeDatabase = createFakeDatabase();
@@ -77,6 +83,7 @@ const {
   buildPersonalizationEvidence,
   getParticipantPersonalization,
   generateParticipantPersonalization,
+  generateWhatsAppParticipantPersonalization,
   generatePersonalizationForCampaign,
   editParticipantInvitation,
   approveParticipantInvitation,
@@ -116,6 +123,17 @@ function seedParticipant(campaignId: string, participantId: string, contactId: s
 }
 function seedCandidate(campaignId: string, contactId: string, overrides: Partial<Record<string, unknown>> = {}) {
   fakeDatabase.candidates.push({ workspace_id: workspaceId, campaign_id: campaignId, contact_id: contactId, name: "Awa Traoré", status: "approved", ...overrides });
+}
+function seedContact(contactId: string, overrides: Partial<Record<string, unknown>> = {}) {
+  fakeDatabase.contacts.push({ workspace_id: workspaceId, id: contactId, first_name: "Jean", display_name: "Jean Dupont", company: null, ...overrides });
+}
+// message(0) -> wait(1) -> message(2) — WhatsApp's own canonical shape
+// (no invite step, matching CampaignsClient.tsx's non-prospecting wizard).
+function seedWhatsAppCampaign(campaignId: string, forWorkspaceId = workspaceId) {
+  fakeDatabase.campaigns.push({ id: campaignId, workspace_id: forWorkspaceId });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-msg1`, campaign_id: campaignId, position: 0, step_type: "message", message_template: "Bonjour {first_name}, ravi d'échanger avec {company} !" });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-wait`, campaign_id: campaignId, position: 1, step_type: "wait", delay_value: 3, delay_unit: "days" });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-msg2`, campaign_id: campaignId, position: 2, step_type: "message", message_template: null });
 }
 
 const sampleStrategy = {
@@ -608,5 +626,96 @@ describe("backward compatibility — old-shape stored evidence (J, K)", () => {
 
     expect(personalization?.invitation.status).toBe("approved");
     expect(personalization?.invitation.approvedText).toBe("Texte déjà approuvé et prêt à être envoyé.");
+  });
+});
+
+describe("generateWhatsAppParticipantPersonalization — Contact-sourced, no campaign_prospect_candidates", () => {
+  it("substitutes the Contact's real first_name/company into the step's own template", async () => {
+    seedWhatsAppCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré", company: "Nova Studio" });
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const first = result.personalization.messages.find((m) => m.stepId === "camp-1-msg1")!;
+    expect(first.generatedText).toBe("Bonjour Awa, ravi d'échanger avec Nova Studio !");
+    expect(result.personalization.aiModel).toBeNull(); // no AI call, ever
+  });
+
+  it("never touches campaign_prospect_candidates — no candidate seeded, generation still succeeds", async () => {
+    seedWhatsAppCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    // Deliberately no seedCandidate() call — proves this path never queries
+    // campaign_prospect_candidates at all (the fake DB would throw
+    // "unhandled query" if it tried).
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("falls back to a safe, generic greeting when the step has no template and company is unknown — never invents a company", async () => {
+    seedWhatsAppCampaign("camp-1");
+    fakeDatabase.campaignSteps.find((s) => s.id === "camp-1-msg1")!.message_template = null;
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré", company: null });
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const first = result.personalization.messages.find((m) => m.stepId === "camp-1-msg1")!;
+    expect(first.generatedText).toBe("Bonjour Awa, je me permets de revenir vers vous.");
+    expect(first.generatedText).not.toMatch(/nova|entreprise inconnue/i);
+  });
+
+  it("populates observedFacts from the real Contact fields, never from qualification/strategy", async () => {
+    seedWhatsAppCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré", company: "Nova Studio" });
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.personalization.evidence.observedFacts).toContainEqual({ type: "name", value: "Awa Traoré", source: "contact" });
+    expect(result.personalization.evidence.observedFacts).toContainEqual({ type: "company", value: "Nova Studio", source: "contact" });
+    expect(result.personalization.evidence.qualificationContext).toBeNull();
+    expect(result.personalization.evidence.strategyContext).toBeNull();
+  });
+
+  it("never overwrites an already-approved message, but still fills a not-yet-approved second step", async () => {
+    seedWhatsAppCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré" });
+    await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+    await approveParticipantMessage(context, "camp-1", "part-1", "camp-1-msg1");
+    const approvedBefore = (await getParticipantPersonalization(context, "camp-1", "part-1"))!.messages.find((m) => m.stepId === "camp-1-msg1")!.approvedText;
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const first = result.personalization.messages.find((m) => m.stepId === "camp-1-msg1")!;
+    const second = result.personalization.messages.find((m) => m.stepId === "camp-1-msg2")!;
+    expect(first.status).toBe("approved");
+    expect(first.approvedText).toBe(approvedBefore);
+    expect(second.status).toBe("generated");
+    expect(second.generatedText).not.toBeNull();
+  });
+
+  it("requires human approval — generation alone never produces an approvedText", async () => {
+    seedWhatsAppCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    for (const message of result.personalization.messages) expect(message.approvedText).toBeNull();
   });
 });

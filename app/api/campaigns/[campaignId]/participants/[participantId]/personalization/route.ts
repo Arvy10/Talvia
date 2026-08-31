@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { editParticipantInvitation, editParticipantMessage, generateParticipantPersonalization, getParticipantPersonalization } from "../../../../../../lib/campaign-personalization";
+import { database } from "../../../../../../lib/database";
+import { editParticipantInvitation, editParticipantMessage, generateParticipantPersonalization, generateWhatsAppParticipantPersonalization, getParticipantPersonalization } from "../../../../../../lib/campaign-personalization";
 import { getCurrentWorkspace, UnauthorizedError } from "../../../../../../lib/workspace-context";
 export const runtime = "nodejs";
 type Context = { params: Promise<{ campaignId: string; participantId: string }> };
@@ -21,11 +22,17 @@ export async function GET(_: Request, { params }: Context) {
   }
 }
 
+// WhatsApp participants are existing Contacts, never LinkedIn search
+// candidates — dispatched to the channel-appropriate generator by the
+// campaign's own channel_type, never guessed from the request.
 export async function POST(_: Request, { params }: Context) {
   try {
     const context = await getCurrentWorkspace();
     const p = await params;
-    const result = await generateParticipantPersonalization(context, p.campaignId, p.participantId);
+    const campaign = await database.query<{ channel_type: string }>(`select channel_type from campaigns where workspace_id=$1 and id=$2`, [context.workspaceId, p.campaignId]);
+    const result = campaign.rows[0]?.channel_type === "whatsapp"
+      ? await generateWhatsAppParticipantPersonalization(context, p.campaignId, p.participantId)
+      : await generateParticipantPersonalization(context, p.campaignId, p.participantId);
     if (!result.ok) return NextResponse.json({ error: result.reason }, { status: 400 });
     return NextResponse.json({ personalization: result.personalization });
   } catch (error) {
