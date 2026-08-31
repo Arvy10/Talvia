@@ -81,6 +81,11 @@ export type ConnectionSyncState = {
   heartbeatAt: string | null;
   completedAt: string | null;
   chatsProcessed: number;
+  // Every message the batch upsert wrote a row for — a fresh INSERT or an
+  // existing row's DO UPDATE both count. On a first backfill (the common
+  // case) this equals "new messages"; on a resync it also counts messages
+  // that already existed and were re-verified/corrected. Never described as
+  // "new inserts only" anywhere this value is surfaced.
   messagesImported: number;
   chatsSkippedGroups: number;
   chatsFailed: number;
@@ -575,77 +580,181 @@ export type BackfillSummary = { chatsProcessed: number; messagesInserted: number
 
 type BackfillChatResult = { skippedGroup: boolean; messagesInserted: number };
 
+// Never log a full chat id (WhatsApp/LinkedIn chat ids can be built from a
+// provider-side phone number on some accounts) — a short, non-reversible
+// prefix is enough to correlate log lines for one chat during a backfill run
+// without being a stable, searchable identifier.
+function truncateChatId(id: string): string {
+  return id.length > 10 ? `${id.slice(0, 6)}…(${id.length})` : id;
+}
+
+// unipileGet already embeds the HTTP status in its thrown Error's message
+// (see unipile.ts) — same pattern the LinkedIn invite executor already
+// checks for. Reused here purely for performance-log observability, never
+// to change retry/backoff behavior (out of scope for this phase).
+const RATE_LIMITED_PATTERN = /\(429\)/;
+
+type MessageUpsertRow = {
+  workspaceId: string; conversationId: string; direction: "inbound" | "outbound";
+  senderContactId: string | null; body: string; status: "sent" | "received";
+  providerMessageId: string; timestamp: string; metadataJson: string;
+};
+
+// Builds ONE multi-row INSERT...ON CONFLICT DO UPDATE for an entire page of
+// messages (up to 100) instead of one round trip per message. Postgres
+// applies the DO UPDATE SET clause per conflicting row against that row's
+// own `excluded` values, so the status-rank guard and the
+// imported-preserving metadata merge are exactly as precise per-row as the
+// old one-row-at-a-time version — nothing about those invariants changes,
+// only how many round trips it costs to apply them.
+function buildMessageUpsertQuery(rows: MessageUpsertRow[]): { sql: string; params: unknown[] } {
+  const values: string[] = [];
+  const params: unknown[] = [];
+  rows.forEach((row, index) => {
+    const base = index * 9;
+    const [p1, p2, p3, p4, p5, p6, p7, p8, p9] = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => base + n);
+    values.push(`($${p1},$${p2},$${p3},$${p4},$${p5},$${p6},$${p7},case when $${p3}::varchar='outbound' then $${p8}::timestamptz else null end,case when $${p3}::varchar='inbound' then $${p8}::timestamptz else null end,$${p9}::jsonb)`);
+    params.push(row.workspaceId, row.conversationId, row.direction, row.senderContactId, row.body, row.status, row.providerMessageId, row.timestamp, row.metadataJson);
+  });
+  const sql = `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at,metadata)
+     values ${values.join(",")}
+     on conflict(conversation_id,provider_message_id) where provider_message_id is not null do update set
+       direction=excluded.direction,
+       sender_contact_id=excluded.sender_contact_id,
+       body=excluded.body,
+       status=case when ${statusRankSql("messages.status")} > ${statusRankSql("excluded.status")} then messages.status else excluded.status end,
+       metadata=messages.metadata || (excluded.metadata - 'imported')
+     returning id`;
+  return { sql, params };
+}
+
+// Transaction #1 of 2 for one chat — short-lived, resolves/creates Contact +
+// Conversation only, then commits immediately. Kept separate from message
+// persistence so this never sits open across a Unipile network call.
+async function resolveContactAndConversation(workspaceId: string, connectionId: string, channelType: string, chatId: string, counterparty: Awaited<ReturnType<typeof listChatAttendees>>[number]): Promise<{ contactId: string; conversationId: string }> {
+  const client = await database.connect();
+  try {
+    await client.query("begin");
+    const contactId = await findOrCreateContact(client, workspaceId, channelType, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "", counterparty.picture_url, counterparty.specifics?.occupation);
+    const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, channelType, chatId, contactId);
+    await client.query("commit");
+    return { contactId, conversationId };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// Transaction #2..N — one short transaction PER PAGE, opened only around the
+// batch upsert itself (never around the Unipile fetch that produced the
+// page). A failure on page K no longer rolls back pages 1..K-1 — they're
+// already committed — so a retried chat has strictly less redundant work to
+// redo than before, not more.
+async function persistMessagePage(workspaceId: string, conversationId: string, contactId: string, messages: Awaited<ReturnType<typeof listChatMessages>>["items"]): Promise<number> {
+  const rows: MessageUpsertRow[] = messages.filter((message) => !message.deleted).map((message) => {
+    const attachments = normalizeAttachments(message.attachments);
+    return {
+      workspaceId, conversationId,
+      direction: message.is_sender ? "outbound" : "inbound",
+      senderContactId: message.is_sender ? null : contactId,
+      body: message.text ?? "",
+      status: message.is_sender ? "sent" : "received",
+      providerMessageId: message.id,
+      timestamp: message.timestamp,
+      metadataJson: JSON.stringify({ ...(attachments.length ? { attachments } : {}), imported: true }),
+    };
+  });
+  if (!rows.length) return 0;
+
+  const { sql, params } = buildMessageUpsertQuery(rows);
+  const client = await database.connect();
+  try {
+    await client.query("begin");
+    const result = await client.query<{ id: string }>(sql, params);
+    await client.query("commit");
+    return result.rows.length;
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 // V1 group-chat policy: WhatsApp groups are ignored entirely, never
 // attributed to whichever participant happens to come first. A chat counts
 // as a group when it has MORE THAN ONE non-self attendee — exactly one
 // non-self attendee is a real 1:1 conversation; zero is a chat with no
 // external participant at all (self-chat, deleted account) and is left
 // exactly as before: nothing to attach messages to, silently 0 messages.
+//
+// Performance structure (this phase): attendees fetch, then per page —
+// Unipile fetch OUTSIDE any transaction, then a short transaction just for
+// that page's batch upsert. No transaction is ever held open across a
+// network call. Chats are still processed strictly sequentially (no
+// concurrency between chats in this phase). Emits one [unipile][perf] log
+// line per page and one summary line per chat — never message content, full
+// phone numbers, names, tokens, or raw payloads.
 async function backfillChat(workspaceId: string, connectionId: string, config: NonNullable<ReturnType<typeof getUnipileConfig>>, chat: Awaited<ReturnType<typeof listChats>>["items"][number], channelType: string): Promise<BackfillChatResult> {
+  const chatStartedAt = Date.now();
+  const chatLogId = truncateChatId(chat.id);
+
+  const attendeesStartedAt = Date.now();
   const attendees = await listChatAttendees(config, chat.id);
+  const attendeesFetchMs = Date.now() - attendeesStartedAt;
+
   const nonSelf = attendees.filter((attendee) => !attendee.is_self);
   if (nonSelf.length > 1) return { skippedGroup: true, messagesInserted: 0 };
   const counterparty = nonSelf[0];
   if (!counterparty) return { skippedGroup: false, messagesInserted: 0 };
 
+  let messagesFetchMs = 0;
+  let dbPersistenceMs = 0;
   let messagesInserted = 0;
-  const client = await database.connect();
+  let pageCount = 0;
+
   try {
-    await client.query("begin");
-    const contactId = await findOrCreateContact(client, workspaceId, channelType, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "", counterparty.picture_url, counterparty.specifics?.occupation);
-    const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, channelType, chat.id, contactId);
+    const resolveStartedAt = Date.now();
+    const { contactId, conversationId } = await resolveContactAndConversation(workspaceId, connectionId, channelType, chat.id, counterparty);
+    dbPersistenceMs += Date.now() - resolveStartedAt;
 
     let messagesCursor: string | undefined;
     do {
+      const pageFetchStartedAt = Date.now();
       const messagesPage = await listChatMessages(config, chat.id, messagesCursor);
-      for (const message of messagesPage.items) {
-        if (message.deleted) continue;
-        const direction = message.is_sender ? "outbound" : "inbound";
-        const status = message.is_sender ? "sent" : "received";
-        const attachments = normalizeAttachments(message.attachments);
-        // Upsert, not insert-or-skip: this is a resync against Unipile's
-        // authoritative record, so a message a stale ingestion path already
-        // stored with the wrong direction/contact (e.g. from a production
-        // deploy that predates a bugfix) gets corrected here instead of
-        // being silently left wrong forever. Two invariants on that upsert:
-        //  - status never regresses (statusRankSql) — a message this same
-        //    backfill (or a prior one) already advanced via the real-time
-        //    delivery-receipt path must not be pushed back to sent/received.
-        //  - metadata's 'imported' key is only ever set on a fresh INSERT
-        //    (this row is being created BY backfill). On conflict, the
-        //    'imported' key is stripped out of `excluded.metadata` before
-        //    merging, so a message the real-time webhook already created
-        //    (no 'imported' key) is never retroactively marked imported, and
-        //    one backfill already created keeps its own 'imported':true —
-        //    only the refreshed fields (e.g. attachments) come from excluded.
-        const upserted = await client.query<{ id: string }>(
-          `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at,metadata)
-           values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then $8::timestamptz else null end,case when $3::varchar='inbound' then $8::timestamptz else null end,$9::jsonb)
-           on conflict(conversation_id,provider_message_id) where provider_message_id is not null do update set
-             direction=excluded.direction,
-             sender_contact_id=excluded.sender_contact_id,
-             body=excluded.body,
-             status=case when ${statusRankSql("messages.status")} > ${statusRankSql("excluded.status")} then messages.status else excluded.status end,
-             metadata=messages.metadata || (excluded.metadata - 'imported')
-           returning id`,
-          [workspaceId, conversationId, direction, message.is_sender ? null : contactId, message.text ?? "", status, message.id, message.timestamp, JSON.stringify({ ...(attachments.length ? { attachments } : {}), imported: true })],
-        );
-        if (upserted.rows[0]) messagesInserted += 1;
-      }
+      const fetchMs = Date.now() - pageFetchStartedAt;
+      messagesFetchMs += fetchMs;
+      pageCount += 1;
+
+      const dbStartedAt = Date.now();
+      const insertedInPage = await persistMessagePage(workspaceId, conversationId, contactId, messagesPage.items);
+      const dbMs = Date.now() - dbStartedAt;
+      dbPersistenceMs += dbMs;
+      messagesInserted += insertedInPage;
+
+      console.log(`[unipile][perf] chat=${chatLogId} page=${pageCount} pageSize=${messagesPage.items.length} fetchMs=${fetchMs} dbMs=${dbMs}`);
+
       messagesCursor = messagesPage.cursor ?? undefined;
       // A single very large chat must not let the heartbeat go stale while
       // it's genuinely still being paged through — see touchSyncHeartbeat.
       await touchSyncHeartbeat(connectionId);
     } while (messagesCursor);
 
-    await client.query(`update conversations set last_message_at=greatest(coalesce(last_message_at,'epoch'::timestamptz),$2::timestamptz),updated_at=now() where id=$1`, [conversationId, chat.timestamp ?? new Date().toISOString()]);
-    await client.query("commit");
+    const finalUpdateStartedAt = Date.now();
+    await database.query(`update conversations set last_message_at=greatest(coalesce(last_message_at,'epoch'::timestamptz),$2::timestamptz),updated_at=now() where id=$1`, [conversationId, chat.timestamp ?? new Date().toISOString()]);
+    dbPersistenceMs += Date.now() - finalUpdateStartedAt;
+
+    const totalMs = Date.now() - chatStartedAt;
+    console.log(`[unipile][perf] chat=${chatLogId} attendeesFetchMs=${attendeesFetchMs} messagesFetchMs=${messagesFetchMs} dbPersistenceMs=${dbPersistenceMs} messageCount=${messagesInserted} pageCount=${pageCount} totalMs=${totalMs}`);
+
     return { skippedGroup: false, messagesInserted };
   } catch (error) {
-    await client.query("rollback");
+    const rateLimited = error instanceof Error && RATE_LIMITED_PATTERN.test(error.message);
+    const totalMs = Date.now() - chatStartedAt;
+    console.error(`[unipile][perf] chat=${chatLogId} failed attendeesFetchMs=${attendeesFetchMs} messagesFetchMs=${messagesFetchMs} dbPersistenceMs=${dbPersistenceMs} messageCount=${messagesInserted} pageCount=${pageCount} totalMs=${totalMs}${rateLimited ? " rateLimited=true" : ""}`);
     throw error;
-  } finally {
-    client.release();
   }
 }
 
