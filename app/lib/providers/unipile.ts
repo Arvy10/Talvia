@@ -12,6 +12,19 @@ export const PROVIDER_BY_CHANNEL: Record<ChannelId, UnipileProvider> = {
   gmail: "GOOGLE",
 };
 
+const CHANNEL_BY_PROVIDER: Record<UnipileProvider, ChannelId> = {
+  LINKEDIN: "linkedin",
+  WHATSAPP: "whatsapp",
+  GOOGLE: "gmail",
+};
+
+// Best-effort reverse lookup — case-insensitive, same discipline as
+// toConnectionStatus below. Returns null for anything unrecognized rather
+// than guessing; callers treat null as "cannot verify," never as a match.
+export function channelForProvider(accountType: string): ChannelId | null {
+  return CHANNEL_BY_PROVIDER[accountType.toUpperCase() as UnipileProvider] ?? null;
+}
+
 export type UnipileConfig = { apiKey: string; apiUrl: string; webhookSecret: string; appBaseUrl: string };
 
 // Mirrors the database.ts lesson from the production outage: a module that
@@ -26,7 +39,7 @@ export function getUnipileConfig(): UnipileConfig | null {
   return { apiKey, apiUrl, webhookSecret, appBaseUrl };
 }
 
-export type HostedAuthLinkParams = { channel: ChannelId; workspaceId: string };
+export type HostedAuthLinkParams = { channel: ChannelId; workspaceId: string; token: string };
 
 // https://developer.unipile.com/reference/hostedcontroller_requestlink
 export async function createHostedAuthLink(config: UnipileConfig, params: HostedAuthLinkParams): Promise<string> {
@@ -40,10 +53,22 @@ export async function createHostedAuthLink(config: UnipileConfig, params: Hosted
       expiresOn: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
       success_redirect_url: `${config.appBaseUrl}/app/connections?status=success`,
       failure_redirect_url: `${config.appBaseUrl}/app/connections?status=failure`,
-      notify_url: `${config.appBaseUrl}/api/webhooks/unipile`,
-      // The hosted-auth notify webhook echoes `name` back but — per the
-      // documented payload — carries no account_type field of its own, so we
-      // pack the channel in ourselves rather than guess at an undocumented one.
+      // notify_url is a bare URL string in this request body — nothing here
+      // lets us attach a custom header to it the way a persistent webhook
+      // subscription (created separately, via Unipile's dashboard/API) does.
+      // It carries a single-use, short-lived, opaque token instead — NEVER
+      // the global UNIPILE_WEBHOOK_SECRET, which must never appear in a URL
+      // (query strings leak into access/proxy logs). See
+      // createConnectionAuthAttempt (unipile-adapter.ts) for where this
+      // token is minted and hashed at rest, and api/webhooks/unipile for how
+      // it's resolved back to a workspace/channel — a completely separate
+      // authentication mechanism from the persistent webhook's Unipile-Auth
+      // header, on purpose (docs spec: don't mix the two roles).
+      notify_url: `${config.appBaseUrl}/api/webhooks/unipile?token=${encodeURIComponent(params.token)}`,
+      // Echoed back by Unipile per its docs — kept as a secondary,
+      // non-authoritative consistency check only; the token above is what
+      // actually resolves the workspace/channel (see
+      // ingestHostedAuthNotification).
       name: `${params.workspaceId}::${params.channel}`,
     }),
     signal: AbortSignal.timeout(20_000),
@@ -116,10 +141,16 @@ export function isAccountStatusPayload(payload: UnipileWebhookPayload): payload 
 const CONNECTED_STATUSES = new Set(["CREATION_SUCCESS", "RECONNECTED", "SYNC_SUCCESS", "OK"]);
 const ERROR_STATUSES = new Set(["ERROR", "CREDENTIALS", "STOPPED"]);
 
+// Case-insensitive on purpose: a persistent webhook subscription's event
+// name (e.g. "creation_success", lowercase, as configured on Unipile's side)
+// is not guaranteed to match the casing of the `status`/`message` value
+// Unipile actually sends in the payload body — comparing case-sensitively
+// silently misclassified a real "connected" event as "connecting" here.
 export function toConnectionStatus(unipileStatus: string): "connected" | "connecting" | "error" | "disconnected" {
-  if (CONNECTED_STATUSES.has(unipileStatus)) return "connected";
-  if (ERROR_STATUSES.has(unipileStatus)) return "error";
-  if (unipileStatus === "DELETED") return "disconnected";
+  const normalized = unipileStatus.toUpperCase();
+  if (CONNECTED_STATUSES.has(normalized)) return "connected";
+  if (ERROR_STATUSES.has(normalized)) return "error";
+  if (normalized === "DELETED") return "disconnected";
   return "connecting";
 }
 

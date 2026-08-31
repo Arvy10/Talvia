@@ -1,9 +1,11 @@
+import { createHash, randomBytes } from "node:crypto";
 import { database } from "../database";
 import { dispatchCommittedActivity, recordSystemActivity } from "../activities";
 import { normalizeLinkedIn, normalizePhone } from "../../app/contacts/contact-utils";
 import { advanceParticipantToNextStep } from "../campaign-execution/step-progression";
 import type { WorkspaceContext } from "../workspace-context";
 import {
+  channelForProvider,
   editChatMessage,
   getUnipileConfig,
   listChatAttendees,
@@ -60,36 +62,129 @@ function splitDisplayName(name: string) {
   return { firstName: parts[0] ?? "", lastName: parts.slice(1).join(" ") };
 }
 
-// The hosted auth flow's one-time confirmation: this is where we first learn
-// which account_id Unipile assigned, and — via the `name` we set when
-// requesting the link (`${workspaceId}::${channel}`) — which workspace and
-// channel it belongs to.
-export async function ingestHostedAuthNotification(payload: UnipileHostedAuthNotifyPayload) {
-  const [workspaceId, channel] = payload.name.split("::");
-  if (!workspaceId || (channel !== "linkedin" && channel !== "whatsapp" && channel !== "gmail")) return;
-  const status = toConnectionStatus(payload.status);
+const AUTH_ATTEMPT_TTL_MS = 30 * 60 * 1000; // matches createHostedAuthLink's own expiresOn window
+
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+export type ConnectionAuthAttempt = { workspaceId: string; channelType: "linkedin" | "whatsapp" | "gmail" };
+
+// Minted once per POST /api/connections/[channel]/connect, before Unipile
+// is ever called — this is the ONLY safe place workspace/channel context for
+// a brand-new hosted-auth connection can come from (an AccountStatus webhook
+// event later never carries it — see ingestAccountStatus below). 32 random
+// bytes, base64url-encoded: only its SHA-256 hash is persisted, never the
+// raw value — the raw token exists only in memory here and in the
+// notify_url handed to Unipile.
+export async function createConnectionAuthAttempt(workspaceId: string, channelType: "linkedin" | "whatsapp" | "gmail"): Promise<{ token: string; expiresAt: string }> {
+  const token = randomBytes(32).toString("base64url");
+  const expiresAt = new Date(Date.now() + AUTH_ATTEMPT_TTL_MS).toISOString();
   await database.query(
+    `insert into connection_auth_attempts(workspace_id,channel_type,token_hash,expires_at) values($1,$2,$3,$4)`,
+    [workspaceId, channelType, hashToken(token), expiresAt],
+  );
+  return { token, expiresAt };
+}
+
+// Resolves a notify_url token back to its workspace/channel — the
+// correlation the hosted-auth flow needs, without ever trusting a bare
+// AccountStatus payload to guess one (docs spec, explicit constraint).
+//
+// Exact semantics: the token binds PERMANENTLY to whichever account_id
+// first resolves it successfully.
+//   - first call, token T + account A  -> binds T to A, succeeds
+//   - redelivery,  token T + account A -> already bound to A, succeeds
+//     (idempotent — Unipile's webhook delivery is at-least-once, a
+//     legitimate retry must not fail)
+//   - token T + a DIFFERENT account B  -> rejected, T stays bound to A
+// This is a single atomic UPDATE, not a check-then-update: the WHERE clause
+// itself is the compare-and-set (`external_account_id is null or
+// external_account_id=$2`), so Postgres's row-level lock on that UPDATE
+// serializes two concurrent callbacks for different account_ids — the
+// second one blocks until the first commits, then re-evaluates its own
+// WHERE clause against the now-committed value and correctly fails to
+// match. No separate SELECT-then-UPDATE race window exists.
+export async function resolveConnectionAuthAttempt(token: string, accountId: string): Promise<ConnectionAuthAttempt | null> {
+  const tokenHash = hashToken(token);
+  const result = await database.query<{ workspace_id: string; channel_type: string }>(
+    `update connection_auth_attempts
+     set external_account_id=coalesce(external_account_id,$2), consumed_at=now()
+     where token_hash=$1 and expires_at>now() and (external_account_id is null or external_account_id=$2)
+     returning workspace_id,channel_type`,
+    [tokenHash, accountId],
+  );
+  const row = result.rows[0];
+  if (!row) return null; // unknown token, expired, or already bound to a different account_id
+  if (row.channel_type !== "linkedin" && row.channel_type !== "whatsapp" && row.channel_type !== "gmail") return null;
+  return { workspaceId: row.workspace_id, channelType: row.channel_type };
+}
+
+// The hosted auth flow's one-time confirmation: this is where we first learn
+// which account_id Unipile assigned. `context` — resolved by the caller via
+// resolveConnectionAuthAttempt, from the token on the request, not from this
+// payload — is the authoritative source of workspace/channel. `payload.name`
+// is still echoed by Unipile per its docs and cross-checked as a sanity
+// signal only; a mismatch is logged, never trusted over the token.
+export async function ingestHostedAuthNotification(payload: UnipileHostedAuthNotifyPayload, context: ConnectionAuthAttempt) {
+  const { workspaceId, channelType: channel } = context;
+  if (payload.name && payload.name !== `${workspaceId}::${channel}`) {
+    console.error(`[unipile-adapter] ingestHostedAuthNotification: name mismatch — token resolved to workspace=${workspaceId} channel=${channel}, payload.name was "${payload.name}"`);
+  }
+  const status = toConnectionStatus(payload.status);
+  const result = await database.query(
     `insert into connections(workspace_id,provider,channel_type,external_account_id,display_name,status,connected_at,last_synced_at)
      values($1,$2,$3,$4,$5,$6,case when $6::varchar='connected' then now() else null end,case when $6::varchar='connected' then now() else null end)
      on conflict(workspace_id,provider,external_account_id) do update set
        status=excluded.status,
        connected_at=case when excluded.status='connected' then now() else connections.connected_at end,
-       last_synced_at=case when excluded.status='connected' then now() else connections.last_synced_at end`,
+       last_synced_at=case when excluded.status='connected' then now() else connections.last_synced_at end
+     returning id`,
     [workspaceId, PROVIDER, channel, payload.account_id, channel === "gmail" ? "Gmail" : channel === "linkedin" ? "LinkedIn" : "WhatsApp", status],
   );
+  console.log(`[unipile-adapter] ingestHostedAuthNotification: workspace=${workspaceId} channel=${channel} account_id=${payload.account_id} status=${status} connection_id=${result.rows[0]?.id}`);
 }
 
 // Ongoing lifecycle events for an already-connected account (no workspace
 // hint in the payload — must already have a connections row for account_id).
+// Deliberately UPDATE-only: an AccountStatus payload carries no workspace
+// context to safely create a row from (docs spec — never guess a workspace).
+//
+// Channel/provider consistency: the hosted-auth-notify payload that CREATES
+// a connection (ingestHostedAuthNotification, above) carries no
+// account_type field at all — per Unipile's documented payload, there is
+// nothing to cross-check at that stage, so `channel_type` on a newly created
+// connection is guaranteed correct only by construction (it is always
+// `attempt.channelType`, resolved server-side from Talvia's own token —
+// never read from anything Unipile sends). AccountStatus, on the other
+// hand, DOES carry `account_type` — the one place in this whole flow such a
+// check is actually possible — so it's applied here, before ever touching
+// an existing connection's status.
 export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["AccountStatus"]) {
-  await database.query(
+  const existing = await database.query<{ id: string; channel_type: string }>(
+    `select id,channel_type from connections where provider=$1 and external_account_id=$2`,
+    [PROVIDER, payload.account_id],
+  );
+  const row = existing.rows[0];
+  if (!row) {
+    console.error(`[unipile-adapter] ingestAccountStatus: no existing connection for account_id=${payload.account_id} — nothing updated (a connection can only be created by ingestHostedAuthNotification)`);
+    return;
+  }
+  const reportedChannel = channelForProvider(payload.account_type);
+  if (reportedChannel && reportedChannel !== row.channel_type) {
+    console.error(`[unipile-adapter] ingestAccountStatus: account_type mismatch for connection ${row.id} — stored channel_type=${row.channel_type}, payload reported account_type=${payload.account_type} — update skipped`);
+    return;
+  }
+  const result = await database.query(
     `update connections set status=$1,
        connected_at=case when $1::varchar='connected' then now() else connected_at end,
        last_synced_at=case when $1::varchar='connected' then now() else last_synced_at end,
        updated_at=now()
-     where provider=$2 and external_account_id=$3`,
-    [toConnectionStatus(payload.message), PROVIDER, payload.account_id],
+     where id=$2
+     returning id`,
+    [toConnectionStatus(payload.message), row.id],
   );
+  console.log(`[unipile-adapter] ingestAccountStatus: account_id=${payload.account_id} updated, connection_id=${result.rows[0]?.id}`);
 }
 
 // contact_identities.channel_type only accepts ('linkedin','whatsapp','email',

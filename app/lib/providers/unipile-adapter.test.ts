@@ -1,5 +1,17 @@
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { UnipileAccountStatusPayload, UnipileHostedAuthNotifyPayload, UnipileNewMessagePayload } from "./unipile";
+
+describe("connection_auth_attempts migration", () => {
+  it("5. token_hash carries a real UNIQUE constraint, not just a plain index", () => {
+    const migrationPath = resolve(process.cwd(), "../db/migrations/020_connection_auth_attempts.sql");
+    expect(existsSync(migrationPath)).toBe(true);
+    const migration = readFileSync(migrationPath, "utf8");
+    expect(migration).toContain("unique(token_hash)");
+    expect(migration).toContain("external_account_id");
+  });
+});
 
 // unipile-adapter.ts talks to Postgres exclusively through `database.query` /
 // `database.connect`. This fake understands only the handful of query shapes
@@ -16,6 +28,7 @@ function createFakeDatabase() {
   const campaigns: Array<Record<string, unknown>> = [];
   const campaignSteps: Array<Record<string, unknown>> = [];
   const campaignParticipants: Array<Record<string, unknown>> = [];
+  const connectionAuthAttempts: Array<Record<string, unknown>> = [];
   let seq = 0;
   const nextId = (prefix: string) => `${prefix}-${(seq += 1)}`;
 
@@ -24,19 +37,47 @@ function createFakeDatabase() {
 
     if (text === "begin" || text === "commit" || text === "rollback") return { rows: [] };
 
+    if (text.startsWith("insert into connection_auth_attempts")) {
+      const [workspaceId, channelType, tokenHash, expiresAt] = params as string[];
+      connectionAuthAttempts.push({ id: nextId("attempt"), workspace_id: workspaceId, channel_type: channelType, token_hash: tokenHash, external_account_id: null as string | null, expires_at: expiresAt, consumed_at: null as string | null });
+      return { rows: [], rowCount: 1 };
+    }
+
+    // The atomic compare-and-set: a single, synchronous find+mutate here
+    // mirrors Postgres's row-level lock on this UPDATE — see
+    // resolveConnectionAuthAttempt's own comment on why that makes two
+    // concurrent callbacks for different account_ids race-safe.
+    if (text.startsWith("update connection_auth_attempts set external_account_id=coalesce(external_account_id,$2)")) {
+      const [tokenHash, accountId] = params as string[];
+      const row = connectionAuthAttempts.find((a) => a.token_hash === tokenHash);
+      if (!row) return { rows: [], rowCount: 0 };
+      const notExpired = new Date(row.expires_at as string).getTime() > Date.now();
+      const accountMatches = row.external_account_id === null || row.external_account_id === accountId;
+      if (!notExpired || !accountMatches) return { rows: [], rowCount: 0 };
+      row.external_account_id = row.external_account_id ?? accountId;
+      row.consumed_at = new Date().toISOString();
+      return { rows: [{ workspace_id: row.workspace_id, channel_type: row.channel_type }], rowCount: 1 };
+    }
+
     if (text.startsWith("insert into connections")) {
       const [workspaceId, provider, channelType, externalAccountId, displayName, status] = params as string[];
       let row = connections.find((c) => c.workspace_id === workspaceId && c.provider === provider && c.external_account_id === externalAccountId);
       if (row) { row.status = status; }
       else { row = { id: nextId("conn"), workspace_id: workspaceId, provider, channel_type: channelType, external_account_id: externalAccountId, display_name: displayName, status }; connections.push(row); }
-      return { rows: [row] };
+      return { rows: [row], rowCount: 1 };
     }
 
-    if (text.startsWith("update connections set status")) {
-      const [status, provider, externalAccountId] = params as string[];
+    if (text.startsWith("select id,channel_type from connections where provider=$1 and external_account_id=$2")) {
+      const [provider, externalAccountId] = params as string[];
       const row = connections.find((c) => c.provider === provider && c.external_account_id === externalAccountId);
+      return { rows: row ? [{ id: row.id, channel_type: row.channel_type }] : [] };
+    }
+
+    if (text.startsWith("update connections set status") && text.includes("where id=$2")) {
+      const [status, connectionId] = params as string[];
+      const row = connections.find((c) => c.id === connectionId);
       if (row) row.status = status;
-      return { rows: row ? [row] : [] };
+      return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
     }
 
     if (text.startsWith("select id,workspace_id,channel_type from connections")) {
@@ -222,7 +263,7 @@ function createFakeDatabase() {
     throw new Error(`unhandled query in fake database: ${text}`);
   }
 
-  return { query, connect: async () => ({ query, release: () => {} }), connections, contacts, contactIdentities, conversations, participants, messages, activities, campaigns, campaignSteps, campaignParticipants };
+  return { query, connect: async () => ({ query, release: () => {} }), connections, contacts, contactIdentities, conversations, participants, messages, activities, campaigns, campaignSteps, campaignParticipants, connectionAuthAttempts };
 }
 
 let fakeDatabase = createFakeDatabase();
@@ -246,7 +287,7 @@ vi.mock("./unipile", async (importOriginal) => ({
 const runDueCampaignActionsMock = vi.hoisted(() => vi.fn(async () => ({ attempted: 0, sent: 0, skipped: 0, failed: 0 })));
 vi.mock("../campaign-execution/engine", () => ({ runDueCampaignActions: runDueCampaignActionsMock }));
 
-const { editMessage, ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, sendMessage } = await import("./unipile-adapter");
+const { createConnectionAuthAttempt, editMessage, ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, resolveConnectionAuthAttempt, sendMessage } = await import("./unipile-adapter");
 
 beforeEach(() => { fakeDatabase = createFakeDatabase(); sendChatMessageMock.mockClear(); editChatMessageMock.mockClear(); runDueCampaignActionsMock.mockClear(); });
 
@@ -254,7 +295,7 @@ const workspaceId = "ws-1";
 const accountId = "acct-unipile-1";
 
 function connectAccount(status = "OK") {
-  return ingestHostedAuthNotification({ status, account_id: accountId, name: `${workspaceId}::linkedin` } satisfies UnipileHostedAuthNotifyPayload);
+  return ingestHostedAuthNotification({ status, account_id: accountId, name: `${workspaceId}::linkedin` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "linkedin" });
 }
 
 const selfUserId = "linkedin-self-divin";
@@ -274,16 +315,155 @@ function messagePayload(overrides: Partial<UnipileNewMessagePayload> = {}): Unip
   };
 }
 
+describe("createConnectionAuthAttempt / resolveConnectionAuthAttempt", () => {
+  it("creates a pending auth attempt row scoped to the workspace and channel, storing only the token's hash", async () => {
+    const { token } = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+
+    expect(fakeDatabase.connectionAuthAttempts).toHaveLength(1);
+    const row = fakeDatabase.connectionAuthAttempts[0]!;
+    expect(row.workspace_id).toBe(workspaceId);
+    expect(row.channel_type).toBe("whatsapp");
+    expect(row.token_hash).not.toBe(token); // never the raw token at rest
+    expect(String(row.token_hash)).toHaveLength(64); // sha256 hex digest
+  });
+
+  it("mints a sufficiently random token — two attempts never collide", async () => {
+    const first = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+    const second = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+    expect(first.token).not.toBe(second.token);
+    expect(first.token.length).toBeGreaterThanOrEqual(40); // 32 random bytes, base64url
+  });
+
+  it("resolves a freshly-minted token back to its exact workspace and channel", async () => {
+    const { token } = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+    const resolved = await resolveConnectionAuthAttempt(token, "account-A");
+    expect(resolved).toEqual({ workspaceId, channelType: "whatsapp" });
+  });
+
+  it("rejects an unknown token", async () => {
+    const resolved = await resolveConnectionAuthAttempt("this-token-was-never-issued", "account-A");
+    expect(resolved).toBeNull();
+  });
+
+  it("rejects an expired token", async () => {
+    const { token } = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+    fakeDatabase.connectionAuthAttempts[0]!.expires_at = new Date(Date.now() - 60_000).toISOString();
+
+    const resolved = await resolveConnectionAuthAttempt(token, "account-A");
+    expect(resolved).toBeNull();
+  });
+
+  it("a token minted for one workspace resolves only to that workspace, never another", async () => {
+    const { token } = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+    await createConnectionAuthAttempt("ws-2", "whatsapp");
+
+    const resolved = await resolveConnectionAuthAttempt(token, "account-A");
+    expect(resolved?.workspaceId).toBe(workspaceId);
+    expect(resolved?.workspaceId).not.toBe("ws-2");
+  });
+
+  describe("token <-> account_id binding", () => {
+    it("1. first callback (token T + account A) succeeds and binds the token to A", async () => {
+      const { token } = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+      const resolved = await resolveConnectionAuthAttempt(token, "account-A");
+      expect(resolved).toEqual({ workspaceId, channelType: "whatsapp" });
+      expect(fakeDatabase.connectionAuthAttempts[0]!.external_account_id).toBe("account-A");
+    });
+
+    it("2. redelivery (token T + the SAME account A) still succeeds — idempotent, tolerates at-least-once webhook delivery", async () => {
+      const { token } = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+      const first = await resolveConnectionAuthAttempt(token, "account-A");
+      const second = await resolveConnectionAuthAttempt(token, "account-A");
+      expect(first).toEqual({ workspaceId, channelType: "whatsapp" });
+      expect(second).toEqual({ workspaceId, channelType: "whatsapp" });
+    });
+
+    it("3. token T + a DIFFERENT account B is rejected once T is already bound to A", async () => {
+      const { token } = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+      const forA = await resolveConnectionAuthAttempt(token, "account-A");
+      const forB = await resolveConnectionAuthAttempt(token, "account-B");
+
+      expect(forA).toEqual({ workspaceId, channelType: "whatsapp" });
+      expect(forB).toBeNull();
+      // The binding to A is never overwritten by the rejected attempt.
+      expect(fakeDatabase.connectionAuthAttempts[0]!.external_account_id).toBe("account-A");
+    });
+
+    it("4. two concurrent callbacks for different account_ids never both bind the token — exactly one wins", async () => {
+      const { token } = await createConnectionAuthAttempt(workspaceId, "whatsapp");
+
+      const [resultA, resultB] = await Promise.all([
+        resolveConnectionAuthAttempt(token, "account-A"),
+        resolveConnectionAuthAttempt(token, "account-B"),
+      ]);
+
+      const succeeded = [resultA, resultB].filter((result) => result !== null);
+      expect(succeeded).toHaveLength(1);
+      // Whichever won, the stored binding matches it exactly — never both,
+      // never neither.
+      const bound = fakeDatabase.connectionAuthAttempts[0]!.external_account_id;
+      expect(["account-A", "account-B"]).toContain(bound);
+    });
+  });
+});
+
 describe("ingestHostedAuthNotification", () => {
-  it("creates a connection row scoped to the workspace and channel encoded in `name`", async () => {
+  it("creates a connection row scoped to the token-resolved workspace and channel", async () => {
     await connectAccount("CREATION_SUCCESS");
     expect(fakeDatabase.connections).toHaveLength(1);
     expect(fakeDatabase.connections[0]).toMatchObject({ workspace_id: workspaceId, channel_type: "linkedin", external_account_id: accountId, status: "connected" });
   });
 
-  it("ignores a malformed `name` instead of throwing", async () => {
-    await ingestHostedAuthNotification({ status: "OK", account_id: accountId, name: "not-a-valid-name" } satisfies UnipileHostedAuthNotifyPayload);
-    expect(fakeDatabase.connections).toHaveLength(0);
+  it("a mismatched/malformed `name` no longer blocks creation — the token-resolved context is authoritative", async () => {
+    // `name` is now a secondary sanity check only (logged if it disagrees),
+    // never the source of truth — resolveConnectionAuthAttempt's context is.
+    await ingestHostedAuthNotification({ status: "OK", account_id: accountId, name: "not-a-valid-name" } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "linkedin" });
+    expect(fakeDatabase.connections).toHaveLength(1);
+    expect(fakeDatabase.connections[0]).toMatchObject({ workspace_id: workspaceId, channel_type: "linkedin" });
+  });
+
+  it("WhatsApp: creates a connection row with channel_type='whatsapp' and the real external_account_id", async () => {
+    const whatsappAccountId = "acct-whatsapp-real-1";
+    await ingestHostedAuthNotification({ status: "CREATION_SUCCESS", account_id: whatsappAccountId, name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "whatsapp" });
+
+    expect(fakeDatabase.connections).toHaveLength(1);
+    expect(fakeDatabase.connections[0]).toMatchObject({ workspace_id: workspaceId, channel_type: "whatsapp", external_account_id: whatsappAccountId, status: "connected", display_name: "WhatsApp" });
+  });
+
+  it("WhatsApp: a lowercase status (e.g. matching a webhook event named 'creation_success') still resolves to 'connected'", async () => {
+    await ingestHostedAuthNotification({ status: "creation_success", account_id: "acct-whatsapp-2", name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "whatsapp" });
+    expect(fakeDatabase.connections[0]!.status).toBe("connected");
+  });
+
+  it("the same hosted-auth-notify event delivered twice never creates a duplicate row", async () => {
+    const whatsappAccountId = "acct-whatsapp-dup";
+    const payload = { status: "CREATION_SUCCESS", account_id: whatsappAccountId, name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload;
+    const context = { workspaceId, channelType: "whatsapp" as const };
+    await ingestHostedAuthNotification(payload, context);
+    await ingestHostedAuthNotification(payload, context);
+
+    expect(fakeDatabase.connections).toHaveLength(1);
+  });
+
+  it("a WhatsApp connection for one workspace never appears under another workspace", async () => {
+    await ingestHostedAuthNotification({ status: "CREATION_SUCCESS", account_id: "acct-ws1", name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "whatsapp" });
+    await ingestHostedAuthNotification({ status: "CREATION_SUCCESS", account_id: "acct-ws2", name: `ws-2::whatsapp` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId: "ws-2", channelType: "whatsapp" });
+
+    const ws1 = fakeDatabase.connections.find((c) => c.external_account_id === "acct-ws1");
+    const ws2 = fakeDatabase.connections.find((c) => c.external_account_id === "acct-ws2");
+    expect(ws1?.workspace_id).toBe(workspaceId);
+    expect(ws2?.workspace_id).toBe("ws-2");
+    expect(fakeDatabase.connections).toHaveLength(2);
+  });
+
+  it("6. a WhatsApp attempt can never become a LinkedIn connection — channel_type is always the token-resolved one, never influenced by payload content", async () => {
+    // Even a payload.name that claims linkedin cannot override a whatsapp
+    // attempt — context (resolved server-side from the token) is
+    // authoritative, name is diagnostic only (see the mismatch test above).
+    await ingestHostedAuthNotification({ status: "CREATION_SUCCESS", account_id: "acct-should-be-whatsapp", name: `${workspaceId}::linkedin` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "whatsapp" });
+
+    expect(fakeDatabase.connections).toHaveLength(1);
+    expect(fakeDatabase.connections[0]!.channel_type).toBe("whatsapp");
   });
 });
 
@@ -292,6 +472,35 @@ describe("ingestAccountStatus", () => {
     await connectAccount("CREATION_SUCCESS");
     await ingestAccountStatus({ account_id: accountId, account_type: "LINKEDIN", message: "ERROR" } satisfies UnipileAccountStatusPayload["AccountStatus"]);
     expect(fakeDatabase.connections[0]!.status).toBe("error");
+  });
+
+  it("WhatsApp: a subsequent AccountStatus event updates the connection already created by hosted-auth-notify", async () => {
+    const whatsappAccountId = "acct-whatsapp-status";
+    await ingestHostedAuthNotification({ status: "CREATION_SUCCESS", account_id: whatsappAccountId, name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "whatsapp" });
+
+    await ingestAccountStatus({ account_id: whatsappAccountId, account_type: "WHATSAPP", message: "creation_success" } satisfies UnipileAccountStatusPayload["AccountStatus"]);
+
+    expect(fakeDatabase.connections).toHaveLength(1);
+    expect(fakeDatabase.connections[0]!.status).toBe("connected");
+  });
+
+  it("an AccountStatus event for an account with no existing connection never creates one — never guesses a workspace", async () => {
+    await ingestAccountStatus({ account_id: "acct-never-seen", account_type: "WHATSAPP", message: "creation_success" } satisfies UnipileAccountStatusPayload["AccountStatus"]);
+
+    expect(fakeDatabase.connections).toHaveLength(0);
+  });
+
+  it("an account_type that disagrees with the stored channel_type is rejected — the update is skipped, not silently applied", async () => {
+    const whatsappAccountId = "acct-whatsapp-mismatch";
+    await ingestHostedAuthNotification({ status: "CREATION_SUCCESS", account_id: whatsappAccountId, name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "whatsapp" });
+    const statusBefore = fakeDatabase.connections[0]!.status;
+
+    // A connection stored as channel_type='whatsapp' receiving an
+    // AccountStatus that claims account_type='LINKEDIN' for the same
+    // account_id — a real inconsistency, not something to trust blindly.
+    await ingestAccountStatus({ account_id: whatsappAccountId, account_type: "LINKEDIN", message: "ERROR" } satisfies UnipileAccountStatusPayload["AccountStatus"]);
+
+    expect(fakeDatabase.connections[0]!.status).toBe(statusBefore); // unchanged
   });
 });
 
@@ -470,7 +679,7 @@ describe("ingestMessage — delivery/read receipts", () => {
 
 describe("ingestMessage — channel-aware contact identities", () => {
   it("files an incoming WhatsApp message under a whatsapp contact identity, not a hardcoded linkedin one", async () => {
-    await ingestHostedAuthNotification({ status: "OK", account_id: "acct-whatsapp-1", name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload);
+    await ingestHostedAuthNotification({ status: "OK", account_id: "acct-whatsapp-1", name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "whatsapp" });
     const result = await ingestMessage(messagePayload({
       account_id: "acct-whatsapp-1",
       account_info: { type: "WHATSAPP", user_id: selfUserId },
