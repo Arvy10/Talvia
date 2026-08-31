@@ -32,10 +32,23 @@ function createFakeDatabase() {
   let seq = 0;
   const nextId = (prefix: string) => `${prefix}-${(seq += 1)}`;
 
+  // Query-shape observability for performance-related tests — every real
+  // call (not begin/commit/rollback) is logged with its SQL prefix and
+  // param count, so a test can assert "one batch call carrying N rows" vs
+  // "N individual calls" without needing a separate spy wired through
+  // database.connect()'s own closure. openTransactions lets a test check,
+  // from inside a mocked Unipile call's own implementation, whether a DB
+  // transaction is currently held open — proving (or disproving) that no
+  // transaction spans a network fetch.
+  const queryLog: Array<{ text: string; paramCount: number }> = [];
+  let openTransactions = 0;
+
   async function query(sql: string, params: unknown[] = []) {
     const text = sql.replace(/\s+/g, " ").trim();
 
-    if (text === "begin" || text === "commit" || text === "rollback") return { rows: [] };
+    if (text === "begin") { openTransactions += 1; return { rows: [] }; }
+    if (text === "commit" || text === "rollback") { openTransactions -= 1; return { rows: [] }; }
+    queryLog.push({ text, paramCount: params.length });
 
     if (text.startsWith("insert into connection_auth_attempts")) {
       const [workspaceId, channelType, tokenHash, expiresAt] = params as string[];
@@ -241,30 +254,38 @@ function createFakeDatabase() {
       return { rows: [{ id: row.id, created_at: row.created_at }] };
     }
 
-    // ingestMessage's insert (8 params, DO NOTHING on conflict — sent_at/
-    // received_at come from now(), not a bound param) vs backfillChat's
-    // upsert (9 params — $8 is the real message timestamp, pushing metadata
-    // to $9 — and a real DO UPDATE with a status-rank guard + an
-    // 'imported'-preserving metadata merge). Same status rank as
-    // statusRankSql in unipile-adapter.ts: read=2, delivered=1, else=0.
+    // ingestMessage's insert (8 params, single row, DO NOTHING on conflict —
+    // sent_at/received_at come from now(), not a bound param) vs
+    // backfillChat's batch upsert (a multiple of 9 params — one row of 9 per
+    // message, $8 is the real message timestamp pushing metadata to $9 —
+    // and a real multi-row DO UPDATE with a status-rank guard + an
+    // 'imported'-preserving metadata merge, applied per row exactly like
+    // Postgres would apply it per conflicting row in a real multi-VALUES
+    // upsert). Same status rank as statusRankSql in unipile-adapter.ts:
+    // read=2, delivered=1, else=0.
     if (text.startsWith("insert into messages")) {
       const statusRank = (s: string) => (s === "read" ? 2 : s === "delivered" ? 1 : 0);
-      if (params.length === 9) {
-        const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId, , metadataJson] = params as string[];
-        const existing = messages.find((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId);
-        const newMetadata = JSON.parse(metadataJson!) as Record<string, unknown>;
-        if (existing) {
-          existing.direction = direction;
-          existing.sender_contact_id = senderContactId;
-          existing.body = body;
-          if (statusRank(existing.status as string) < statusRank(status)) existing.status = status;
-          const rest = Object.fromEntries(Object.entries(newMetadata).filter(([key]) => key !== "imported"));
-          existing.metadata = { ...(existing.metadata as Record<string, unknown> ?? {}), ...rest };
-          return { rows: [{ id: existing.id }] };
+      if (params.length > 0 && params.length % 9 === 0 && text.includes("on conflict(conversation_id,provider_message_id) where provider_message_id is not null do update set")) {
+        const rowsOut: Array<{ id: string }> = [];
+        for (let offset = 0; offset < params.length; offset += 9) {
+          const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId, , metadataJson] = params.slice(offset, offset + 9) as string[];
+          const existing = messages.find((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId);
+          const newMetadata = JSON.parse(metadataJson!) as Record<string, unknown>;
+          if (existing) {
+            existing.direction = direction;
+            existing.sender_contact_id = senderContactId;
+            existing.body = body;
+            if (statusRank(existing.status as string) < statusRank(status)) existing.status = status;
+            const rest = Object.fromEntries(Object.entries(newMetadata).filter(([key]) => key !== "imported"));
+            existing.metadata = { ...(existing.metadata as Record<string, unknown> ?? {}), ...rest };
+            rowsOut.push({ id: existing.id as string });
+            continue;
+          }
+          const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, direction, sender_contact_id: senderContactId, body, status, provider_message_id: providerMessageId, metadata: newMetadata };
+          messages.push(row);
+          rowsOut.push({ id: row.id });
         }
-        const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, direction, sender_contact_id: senderContactId, body, status, provider_message_id: providerMessageId, metadata: newMetadata };
-        messages.push(row);
-        return { rows: [{ id: row.id }] };
+        return { rows: rowsOut };
       }
       const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId, metadataJson] = params as string[];
       if (messages.some((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId)) {
@@ -362,7 +383,7 @@ function createFakeDatabase() {
     throw new Error(`unhandled query in fake database: ${text}`);
   }
 
-  return { query, connect: async () => ({ query, release: () => {} }), connections, contacts, contactIdentities, conversations, participants, messages, activities, campaigns, campaignSteps, campaignParticipants, connectionAuthAttempts };
+  return { query, connect: async () => ({ query, release: () => {} }), connections, contacts, contactIdentities, conversations, participants, messages, activities, campaigns, campaignSteps, campaignParticipants, connectionAuthAttempts, queryLog, isTransactionOpen: () => openTransactions > 0 };
 }
 
 let fakeDatabase = createFakeDatabase();
@@ -376,7 +397,7 @@ const editChatMessageMock = vi.hoisted(() => vi.fn(async () => undefined));
 // page" and individual tests override with mockResolvedValueOnce/
 // mockImplementation for their specific fixture chats/messages/attendees.
 const listChatsMock = vi.hoisted(() => vi.fn(async () => ({ items: [] as Array<{ id: string; account_id: string; account_type: string; timestamp: string | null; archived: number }>, cursor: null as string | null })));
-const listChatMessagesMock = vi.hoisted(() => vi.fn(async () => ({ items: [] as Array<{ id: string; chat_id: string; text: string; is_sender: 0 | 1; sender_id: string; timestamp: string; deleted: 0 | 1 }>, cursor: null as string | null })));
+const listChatMessagesMock = vi.hoisted(() => vi.fn(async () => ({ items: [] as Array<{ id: string; chat_id: string; text: string; is_sender: 0 | 1; sender_id: string; timestamp: string; deleted: 0 | 1; attachments?: Array<{ id: string; type: string; mimetype?: string; file_size?: number }> }>, cursor: null as string | null })));
 const listChatAttendeesMock = vi.hoisted(() => vi.fn(async () => [] as Array<{ id: string; provider_id: string; name?: string; is_self: 0 | 1; profile_url?: string; picture_url?: string; specifics?: { occupation?: string } }>));
 vi.mock("./unipile", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./unipile")>()),
@@ -1121,6 +1142,101 @@ describe("backfillConnectionHistory — idempotence", () => {
 
     expect(fakeDatabase.messages.length).toBe(afterFirst);
     expect(fakeDatabase.conversations).toHaveLength(1);
+  });
+});
+
+describe("backfillConnectionHistory — performance (batch upsert, short transactions)", () => {
+  it("a page with multiple messages issues exactly ONE batch upsert query carrying all rows, not one INSERT per message", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({
+      items: [chatMessageFixture({ id: "M1" }), chatMessageFixture({ id: "M2" }), chatMessageFixture({ id: "M3" }), chatMessageFixture({ id: "M4" }), chatMessageFixture({ id: "M5" })],
+      cursor: null,
+    });
+
+    await backfillConnectionHistory(connectionId);
+
+    const messageUpsertCalls = fakeDatabase.queryLog.filter((entry) => entry.text.startsWith("insert into messages") && entry.text.includes("on conflict(conversation_id,provider_message_id)"));
+    expect(messageUpsertCalls).toHaveLength(1); // one round trip for the whole page
+    expect(messageUpsertCalls[0]!.paramCount).toBe(5 * 9); // 5 messages × 9 params/row, all in that one call
+    expect(fakeDatabase.messages).toHaveLength(5);
+  });
+
+  it("anti-regression (read/delivered/sent) holds per-row inside a multi-message batch, not just for a single message", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+
+    // Three messages already exist at different real-time-advanced statuses
+    // before backfill ever touches this chat.
+    await ingestMessage(waMessagePayload({ chat_id: "chat-1", message_id: "R1", sender: { attendee_id: "att-1", attendee_name: "Awa", attendee_provider_id: "wa-counterparty-1" } }));
+    await ingestMessage(waMessagePayload({ chat_id: "chat-1", event: "message_read", message_id: "R1" }));
+    await ingestMessage(waMessagePayload({ chat_id: "chat-1", message_id: "R2", sender: { attendee_id: "att-1", attendee_name: "Awa", attendee_provider_id: "wa-counterparty-1" } }));
+    await ingestMessage(waMessagePayload({ chat_id: "chat-1", event: "message_delivered", message_id: "R2" }));
+    await ingestMessage(waMessagePayload({ chat_id: "chat-1", message_id: "R3", sender: { attendee_id: "att-1", attendee_name: "Awa", attendee_provider_id: "wa-counterparty-1" } }));
+    expect(fakeDatabase.messages.find((m) => m.provider_message_id === "R1")!.status).toBe("read");
+    expect(fakeDatabase.messages.find((m) => m.provider_message_id === "R2")!.status).toBe("delivered");
+    expect(fakeDatabase.messages.find((m) => m.provider_message_id === "R3")!.status).toBe("received");
+
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({ items: [chatMessageFixture({ id: "R1" }), chatMessageFixture({ id: "R2" }), chatMessageFixture({ id: "R3" })], cursor: null });
+
+    await backfillConnectionHistory(connectionId);
+
+    // Backfill's own computed status for all three is "received" (rank 0) —
+    // none of them may regress, each row judged independently in the SAME
+    // batch call.
+    expect(fakeDatabase.messages.find((m) => m.provider_message_id === "R1")!.status).toBe("read");
+    expect(fakeDatabase.messages.find((m) => m.provider_message_id === "R2")!.status).toBe("delivered");
+    expect(fakeDatabase.messages.find((m) => m.provider_message_id === "R3")!.status).toBe("received");
+    expect(fakeDatabase.messages).toHaveLength(3); // no duplication
+  });
+
+  it("attachments and other metadata survive the batch upsert, per row", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({
+      items: [
+        chatMessageFixture({ id: "M1", text: "Voici le devis" }),
+        { ...chatMessageFixture({ id: "M2" }), attachments: [{ id: "att-file-1", type: "img" as const, mimetype: "image/png", file_size: 1024 }] },
+      ],
+      cursor: null,
+    });
+
+    await backfillConnectionHistory(connectionId);
+
+    const m1 = fakeDatabase.messages.find((m) => m.provider_message_id === "M1")!;
+    const m2 = fakeDatabase.messages.find((m) => m.provider_message_id === "M2")!;
+    expect(m1.body).toBe("Voici le devis");
+    expect((m2.metadata as { attachments?: unknown[] }).attachments).toHaveLength(1);
+    expect((m2.metadata as { imported?: boolean }).imported).toBe(true);
+  });
+
+  it("no DB transaction is held open while a Unipile network call is in flight", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+
+    let attendeesCalledWithTransactionOpen: boolean | null = null;
+    listChatAttendeesMock.mockImplementationOnce(async () => {
+      attendeesCalledWithTransactionOpen = fakeDatabase.isTransactionOpen();
+      return [attendeeFixture()];
+    });
+
+    let messagesCalledWithTransactionOpen: boolean | null = null;
+    listChatMessagesMock.mockImplementationOnce(async () => {
+      messagesCalledWithTransactionOpen = fakeDatabase.isTransactionOpen();
+      return { items: [chatMessageFixture()], cursor: null };
+    });
+
+    await backfillConnectionHistory(connectionId);
+
+    expect(attendeesCalledWithTransactionOpen).toBe(false);
+    expect(messagesCalledWithTransactionOpen).toBe(false); // the Contact/Conversation transaction already committed by this point
   });
 });
 
