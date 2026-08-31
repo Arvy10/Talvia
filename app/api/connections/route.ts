@@ -8,8 +8,12 @@ export const runtime = "nodejs";
 export async function GET() {
   try {
     const context = await getCurrentWorkspace();
-    const result = await database.query("select id,provider,channel_type,status,display_name,connected_at,last_synced_at from connections where workspace_id=$1 order by created_at", [context.workspaceId]);
-    return NextResponse.json({ connections: result.rows });
+    const result = await database.query<{ id: string; provider: string; channel_type: string; status: string; display_name: string; connected_at: string | null; last_synced_at: string | null; metadata: { sync?: unknown } }>(
+      "select id,provider,channel_type,status,display_name,connected_at,last_synced_at,metadata from connections where workspace_id=$1 order by created_at",
+      [context.workspaceId],
+    );
+    const connections = result.rows.map(({ metadata, ...rest }) => ({ ...rest, sync: metadata?.sync ?? null }));
+    return NextResponse.json({ connections });
   } catch (error) {
     return NextResponse.json({ error: error instanceof UnauthorizedError ? "Non authentifié." : "Erreur serveur." }, { status: error instanceof UnauthorizedError ? 401 : 400 });
   }
