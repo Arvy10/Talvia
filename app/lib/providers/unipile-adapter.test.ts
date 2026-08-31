@@ -63,8 +63,83 @@ function createFakeDatabase() {
       const [workspaceId, provider, channelType, externalAccountId, displayName, status] = params as string[];
       let row = connections.find((c) => c.workspace_id === workspaceId && c.provider === provider && c.external_account_id === externalAccountId);
       if (row) { row.status = status; }
-      else { row = { id: nextId("conn"), workspace_id: workspaceId, provider, channel_type: channelType, external_account_id: externalAccountId, display_name: displayName, status }; connections.push(row); }
+      else { row = { id: nextId("conn"), workspace_id: workspaceId, provider, channel_type: channelType, external_account_id: externalAccountId, display_name: displayName, status, metadata: {} }; connections.push(row); }
       return { rows: [row], rowCount: 1 };
+    }
+
+    if (text.startsWith("select workspace_id,channel_type,external_account_id from connections where id=$1 and status='connected'")) {
+      const [id] = params as string[];
+      const row = connections.find((c) => c.id === id && c.status === "connected");
+      return { rows: row ? [{ workspace_id: row.workspace_id, channel_type: row.channel_type, external_account_id: row.external_account_id }] : [] };
+    }
+
+    if (text.startsWith("select id,metadata from connections where workspace_id=$1 and provider=$2 and channel_type=$3 and status='connected'")) {
+      const [wsId, provider, channelType] = params as string[];
+      const row = connections.find((c) => c.workspace_id === wsId && c.provider === provider && c.channel_type === channelType && c.status === "connected");
+      return { rows: row ? [{ id: row.id, metadata: row.metadata ?? {} }] : [] };
+    }
+
+    // initializeAutoSyncIfNeeded — guarded: only fires when metadata.sync has
+    // never been set, exactly mirroring the real `and metadata->'sync' is
+    // null` WHERE clause (never reinitializes an existing running/completed/
+    // failed sync on a webhook redelivery).
+    if (text.startsWith("update connections set metadata=jsonb_set(coalesce(metadata,'{}'::jsonb),'{sync}',$2::jsonb) where id=$1 and metadata->'sync' is null")) {
+      const [id, stateJson] = params as string[];
+      const row = connections.find((c) => c.id === id);
+      if (row && !(row.metadata as Record<string, unknown> | undefined)?.sync) {
+        row.metadata = { ...(row.metadata as Record<string, unknown> ?? {}), sync: JSON.parse(stateJson) };
+      }
+      return { rows: [] };
+    }
+
+    // touchSyncHeartbeat — a targeted two-level jsonb_set touching only
+    // metadata.sync.heartbeatAt, called once per message page inside
+    // backfillChat so a single huge chat can't go stale mid-pagination.
+    if (text.startsWith("update connections set metadata=jsonb_set(coalesce(metadata,'{}'::jsonb),'{sync,heartbeatAt}',$2::jsonb) where id=$1")) {
+      const [id, heartbeatJson] = params as string[];
+      const row = connections.find((c) => c.id === id);
+      if (row) {
+        const metadata = (row.metadata as Record<string, unknown> | undefined) ?? {};
+        const sync = (metadata.sync as Record<string, unknown> | undefined) ?? {};
+        row.metadata = { ...metadata, sync: { ...sync, heartbeatAt: JSON.parse(heartbeatJson!) } };
+      }
+      return { rows: [] };
+    }
+
+    // writeSyncState / requestConnectionSync's own write — unconditional,
+    // but jsonb_set on a single top-level key ('sync') so any OTHER key
+    // already in metadata must survive untouched.
+    if (text.startsWith("update connections set metadata=jsonb_set(coalesce(metadata,'{}'::jsonb),'{sync}',$2::jsonb),updated_at=now() where id=$1")) {
+      const [id, stateJson] = params as string[];
+      const row = connections.find((c) => c.id === id);
+      if (row) row.metadata = { ...(row.metadata as Record<string, unknown> ?? {}), sync: JSON.parse(stateJson) };
+      return { rows: [] };
+    }
+
+    // runDueConnectionSyncs's atomic claim: SELECT...FOR UPDATE SKIP LOCKED
+    // + UPDATE in one CTE statement. The fake has no real row locking, but
+    // since this whole handler body runs synchronously with no internal
+    // await, two "concurrent" calls via Promise.all still can't observe each
+    // other's uncommitted state — the first call's mutation is fully applied
+    // before the second call's SELECT-equivalent filter ever runs, the same
+    // reasoning already relied on for resolveConnectionAuthAttempt's fake.
+    if (text.startsWith("with due as (")) {
+      const [limitRaw, provider, claimStateJson] = params as [number, string, string];
+      const staleMs = 10 * 60 * 1000;
+      const now = Date.now();
+      const eligible = connections
+        .filter((c) => {
+          if (c.provider !== provider || c.status !== "connected") return false;
+          const sync = (c.metadata as Record<string, { status?: string; heartbeatAt?: string }> | undefined)?.sync;
+          if (!sync) return false;
+          if (sync.status === "pending") return true;
+          if (sync.status === "running" && sync.heartbeatAt && now - new Date(sync.heartbeatAt).getTime() > staleMs) return true;
+          return false;
+        })
+        .slice(0, Number(limitRaw));
+      const claimState = JSON.parse(claimStateJson);
+      for (const row of eligible) row.metadata = { ...(row.metadata as Record<string, unknown> ?? {}), sync: { ...claimState } };
+      return { rows: eligible.map((row) => ({ id: row.id })) };
     }
 
     if (text.startsWith("select id,channel_type from connections where provider=$1 and external_account_id=$2")) {
@@ -166,7 +241,31 @@ function createFakeDatabase() {
       return { rows: [{ id: row.id, created_at: row.created_at }] };
     }
 
+    // ingestMessage's insert (8 params, DO NOTHING on conflict — sent_at/
+    // received_at come from now(), not a bound param) vs backfillChat's
+    // upsert (9 params — $8 is the real message timestamp, pushing metadata
+    // to $9 — and a real DO UPDATE with a status-rank guard + an
+    // 'imported'-preserving metadata merge). Same status rank as
+    // statusRankSql in unipile-adapter.ts: read=2, delivered=1, else=0.
     if (text.startsWith("insert into messages")) {
+      const statusRank = (s: string) => (s === "read" ? 2 : s === "delivered" ? 1 : 0);
+      if (params.length === 9) {
+        const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId, , metadataJson] = params as string[];
+        const existing = messages.find((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId);
+        const newMetadata = JSON.parse(metadataJson!) as Record<string, unknown>;
+        if (existing) {
+          existing.direction = direction;
+          existing.sender_contact_id = senderContactId;
+          existing.body = body;
+          if (statusRank(existing.status as string) < statusRank(status)) existing.status = status;
+          const rest = Object.fromEntries(Object.entries(newMetadata).filter(([key]) => key !== "imported"));
+          existing.metadata = { ...(existing.metadata as Record<string, unknown> ?? {}), ...rest };
+          return { rows: [{ id: existing.id }] };
+        }
+        const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, direction, sender_contact_id: senderContactId, body, status, provider_message_id: providerMessageId, metadata: newMetadata };
+        messages.push(row);
+        return { rows: [{ id: row.id }] };
+      }
       const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId, metadataJson] = params as string[];
       if (messages.some((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId)) {
         return { rows: [] }; // on conflict do nothing
@@ -273,11 +372,20 @@ vi.mock("../database", () => ({ get database() { return fakeDatabase; } }));
 // itself is a real network call to Unipile, mocked to isolate that.
 const sendChatMessageMock = vi.hoisted(() => vi.fn(async () => "provider-msg-outbound-1"));
 const editChatMessageMock = vi.hoisted(() => vi.fn(async () => undefined));
+// Historical backfill's three Unipile reads — each defaults to "one empty
+// page" and individual tests override with mockResolvedValueOnce/
+// mockImplementation for their specific fixture chats/messages/attendees.
+const listChatsMock = vi.hoisted(() => vi.fn(async () => ({ items: [] as Array<{ id: string; account_id: string; account_type: string; timestamp: string | null; archived: number }>, cursor: null as string | null })));
+const listChatMessagesMock = vi.hoisted(() => vi.fn(async () => ({ items: [] as Array<{ id: string; chat_id: string; text: string; is_sender: 0 | 1; sender_id: string; timestamp: string; deleted: 0 | 1 }>, cursor: null as string | null })));
+const listChatAttendeesMock = vi.hoisted(() => vi.fn(async () => [] as Array<{ id: string; provider_id: string; name?: string; is_self: 0 | 1; profile_url?: string; picture_url?: string; specifics?: { occupation?: string } }>));
 vi.mock("./unipile", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./unipile")>()),
   getUnipileConfig: () => ({ apiKey: "test-key", apiUrl: "https://api.test", webhookSecret: "test-secret", appBaseUrl: "https://app.test" }),
   sendChatMessage: sendChatMessageMock,
   editChatMessage: editChatMessageMock,
+  listChats: listChatsMock,
+  listChatMessages: listChatMessagesMock,
+  listChatAttendees: listChatAttendeesMock,
 }));
 
 // ingestMessage only *triggers* the Campaign Engine after an acceptance
@@ -287,9 +395,17 @@ vi.mock("./unipile", async (importOriginal) => ({
 const runDueCampaignActionsMock = vi.hoisted(() => vi.fn(async () => ({ attempted: 0, sent: 0, skipped: 0, failed: 0 })));
 vi.mock("../campaign-execution/engine", () => ({ runDueCampaignActions: runDueCampaignActionsMock }));
 
-const { createConnectionAuthAttempt, editMessage, ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, resolveConnectionAuthAttempt, sendMessage } = await import("./unipile-adapter");
+const { backfillConnectionHistory, createConnectionAuthAttempt, editMessage, ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, requestConnectionSync, resolveConnectionAuthAttempt, runDueConnectionSyncs, sendMessage } = await import("./unipile-adapter");
 
-beforeEach(() => { fakeDatabase = createFakeDatabase(); sendChatMessageMock.mockClear(); editChatMessageMock.mockClear(); runDueCampaignActionsMock.mockClear(); });
+beforeEach(() => {
+  fakeDatabase = createFakeDatabase();
+  sendChatMessageMock.mockClear();
+  editChatMessageMock.mockClear();
+  runDueCampaignActionsMock.mockClear();
+  listChatsMock.mockReset().mockResolvedValue({ items: [], cursor: null });
+  listChatMessagesMock.mockReset().mockResolvedValue({ items: [], cursor: null });
+  listChatAttendeesMock.mockReset().mockResolvedValue([]);
+});
 
 const workspaceId = "ws-1";
 const accountId = "acct-unipile-1";
@@ -865,5 +981,404 @@ describe("editMessage", () => {
     const messageId = await sendAndGetMessageId();
     await expect(editMessage("other-workspace", messageId, "Nope")).rejects.toThrow();
     expect(editChatMessageMock).not.toHaveBeenCalled();
+  });
+});
+
+// --- Historical backfill: generalization, groups, idempotence, and the
+// historical-vs-real-time reconciliation invariants. ---
+
+const waAccountId = "acct-whatsapp-1";
+
+function connectWhatsAppAccount(accountId = waAccountId) {
+  return ingestHostedAuthNotification({ status: "CREATION_SUCCESS", account_id: accountId, name: `${workspaceId}::whatsapp` } satisfies UnipileHostedAuthNotifyPayload, { workspaceId, channelType: "whatsapp" });
+}
+
+function chatFixture(overrides: Partial<{ id: string; account_id: string; account_type: string; timestamp: string | null; archived: number }> = {}) {
+  return { id: "chat-1", account_id: waAccountId, account_type: "WHATSAPP", timestamp: new Date().toISOString(), archived: 0, ...overrides };
+}
+function attendeeFixture(overrides: Partial<{ id: string; provider_id: string; name?: string; is_self: 0 | 1; profile_url?: string; picture_url?: string; specifics?: { occupation?: string } }> = {}) {
+  return { id: "att-1", provider_id: "wa-counterparty-1", name: "Awa Traoré", is_self: 0 as const, ...overrides };
+}
+function chatMessageFixture(overrides: Partial<{ id: string; chat_id: string; text: string; is_sender: 0 | 1; sender_id: string; timestamp: string; deleted: 0 | 1 }> = {}) {
+  return { id: "wa-msg-1", chat_id: "chat-1", text: "Bonjour", is_sender: 0 as const, sender_id: "wa-counterparty-1", timestamp: new Date().toISOString(), deleted: 0 as const, ...overrides };
+}
+
+function waMessagePayload(overrides: Partial<UnipileNewMessagePayload> = {}): UnipileNewMessagePayload {
+  return {
+    account_id: waAccountId,
+    account_type: "WHATSAPP",
+    account_info: { type: "WHATSAPP", user_id: "wa-self" },
+    event: "message_received",
+    chat_id: "chat-1",
+    timestamp: new Date().toISOString(),
+    message_id: "wa-msg-3",
+    message: "Merci, à bientôt.",
+    sender: { attendee_id: "att-1", attendee_name: "Awa Traoré", attendee_provider_id: "wa-counterparty-1" },
+    ...overrides,
+  };
+}
+
+describe("backfillConnectionHistory — generalization (LinkedIn + WhatsApp)", () => {
+  it("LinkedIn: still imports chats/messages exactly as before, with channel_type='linkedin'", async () => {
+    await connectAccount("CREATION_SUCCESS");
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [{ id: "li-chat-1", account_id: accountId, account_type: "LINKEDIN", timestamp: new Date().toISOString(), archived: 0 }], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([{ id: "att-li-1", provider_id: "linkedin-jane", name: "Jane Doe", is_self: 0 }]);
+    listChatMessagesMock.mockResolvedValue({ items: [{ id: "li-msg-1", chat_id: "li-chat-1", text: "Bonjour", is_sender: 0, sender_id: "linkedin-jane", timestamp: new Date().toISOString(), deleted: 0 }], cursor: null });
+
+    const state = await backfillConnectionHistory(connectionId);
+
+    expect(state.status).toBe("completed");
+    expect(state.chatsProcessed).toBe(1);
+    expect(state.messagesImported).toBe(1);
+    expect(fakeDatabase.conversations[0]!.channel_type).toBe("linkedin");
+    expect(fakeDatabase.contactIdentities[0]!.channel_type).toBe("linkedin");
+  });
+
+  it("WhatsApp: imports chats/messages with the real channel_type='whatsapp' (no more hardcoded 'linkedin')", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({ items: [chatMessageFixture()], cursor: null });
+
+    const state = await backfillConnectionHistory(connectionId);
+
+    expect(state.status).toBe("completed");
+    expect(state.chatsProcessed).toBe(1);
+    expect(state.messagesImported).toBe(1);
+    expect(fakeDatabase.conversations[0]!.channel_type).toBe("whatsapp");
+    expect(fakeDatabase.contactIdentities[0]!.channel_type).toBe("whatsapp");
+  });
+
+  it("rejects a channel that isn't linkedin or whatsapp", async () => {
+    fakeDatabase.connections.push({ id: "conn-gmail", workspace_id: workspaceId, provider: "unipile", channel_type: "email", external_account_id: "acct-gmail-1", status: "connected", metadata: {} });
+    await expect(backfillConnectionHistory("conn-gmail")).rejects.toThrow();
+  });
+});
+
+describe("backfillConnectionHistory — WhatsApp group handling", () => {
+  it("0 non-self attendee: chat is processed but yields no message, no Contact created", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([]);
+
+    const state = await backfillConnectionHistory(connectionId);
+
+    expect(state.chatsProcessed).toBe(1);
+    expect(state.chatsSkippedGroups).toBe(0);
+    expect(state.messagesImported).toBe(0);
+    expect(fakeDatabase.contacts).toHaveLength(0);
+    expect(listChatMessagesMock).not.toHaveBeenCalled();
+  });
+
+  it("exactly 1 non-self attendee: imported as a real 1:1 conversation", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({ items: [chatMessageFixture()], cursor: null });
+
+    const state = await backfillConnectionHistory(connectionId);
+
+    expect(state.chatsSkippedGroups).toBe(0);
+    expect(state.chatsProcessed).toBe(1);
+    expect(fakeDatabase.contacts).toHaveLength(1);
+    expect(fakeDatabase.conversations).toHaveLength(1);
+  });
+
+  it(">1 non-self attendees: skipped as a group, NEVER attributed to whichever attendee comes first — no Contact, no Conversation", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([
+      attendeeFixture({ id: "att-1", provider_id: "wa-member-1", name: "Membre 1" }),
+      attendeeFixture({ id: "att-2", provider_id: "wa-member-2", name: "Membre 2" }),
+    ]);
+
+    const state = await backfillConnectionHistory(connectionId);
+
+    expect(state.chatsSkippedGroups).toBe(1);
+    expect(state.chatsProcessed).toBe(0);
+    expect(fakeDatabase.contacts).toHaveLength(0);
+    expect(fakeDatabase.conversations).toHaveLength(0);
+    expect(listChatMessagesMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("backfillConnectionHistory — idempotence", () => {
+  it("running the same backfill twice inserts no duplicate messages", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({ items: [chatMessageFixture({ id: "wa-msg-1" }), chatMessageFixture({ id: "wa-msg-2" })], cursor: null });
+
+    await backfillConnectionHistory(connectionId);
+    const afterFirst = fakeDatabase.messages.length;
+    await backfillConnectionHistory(connectionId);
+
+    expect(fakeDatabase.messages.length).toBe(afterFirst);
+    expect(fakeDatabase.conversations).toHaveLength(1);
+  });
+});
+
+describe("backfillConnectionHistory — historical import never triggers automations", () => {
+  it("backfilled messages create no activity at all", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({ items: [chatMessageFixture({ id: "wa-msg-1" }), chatMessageFixture({ id: "wa-msg-2" })], cursor: null });
+
+    await backfillConnectionHistory(connectionId);
+
+    expect(fakeDatabase.activities).toHaveLength(0);
+    expect(fakeDatabase.messages.every((m) => (m.metadata as { imported?: boolean } | undefined)?.imported === true)).toBe(true);
+  });
+});
+
+describe("historical vs real-time reconciliation", () => {
+  it("Scenario A: backfill imports M1/M2, then a real-time webhook delivers M3 for the same chat — one Conversation, M1/M2 stay imported:true, M3 does not, only M3 gets an activity", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({ items: [chatMessageFixture({ id: "M1" }), chatMessageFixture({ id: "M2" })], cursor: null });
+
+    await backfillConnectionHistory(connectionId);
+    expect(fakeDatabase.activities).toHaveLength(0);
+
+    const result = await ingestMessage(waMessagePayload({ message_id: "M3" }));
+
+    expect(result.status).toBe("ingested");
+    expect(fakeDatabase.conversations).toHaveLength(1);
+    const byId = (id: string) => fakeDatabase.messages.find((m) => m.provider_message_id === id)!;
+    expect((byId("M1").metadata as { imported?: boolean }).imported).toBe(true);
+    expect((byId("M2").metadata as { imported?: boolean }).imported).toBe(true);
+    expect((byId("M3").metadata as { imported?: boolean } | undefined)?.imported).not.toBe(true);
+    expect(fakeDatabase.activities).toHaveLength(1);
+    expect(fakeDatabase.activities[0]).toMatchObject({ event_type: "message.received" });
+  });
+
+  it("Scenario B: a real-time M3 arrives first, then backfill re-encounters the same chat (which now includes M3) — no second Conversation, no duplicate, no status regression, M3 never becomes imported", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+
+    await ingestMessage(waMessagePayload({ message_id: "M3" }));
+    expect(fakeDatabase.conversations).toHaveLength(1);
+    // Advance M3 to 'read' via the real-time delivery-receipt path, so the
+    // anti-regression guard actually has something to protect.
+    await ingestMessage(waMessagePayload({ event: "message_read", message_id: "M3" }));
+    const m3Before = fakeDatabase.messages.find((m) => m.provider_message_id === "M3")!;
+    expect(m3Before.status).toBe("read");
+
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({
+      items: [
+        chatMessageFixture({ id: "M1" }),
+        chatMessageFixture({ id: "M2" }),
+        chatMessageFixture({ id: "M3" }), // Unipile's own history now includes the already-real-time message too
+      ],
+      cursor: null,
+    });
+
+    await backfillConnectionHistory(connectionId);
+
+    expect(fakeDatabase.conversations).toHaveLength(1);
+    expect(fakeDatabase.messages).toHaveLength(3);
+    const m3After = fakeDatabase.messages.find((m) => m.provider_message_id === "M3")!;
+    expect(m3After.status).toBe("read"); // never regressed back to 'received'
+    expect((m3After.metadata as { imported?: boolean } | undefined)?.imported).not.toBe(true); // never retroactively marked imported
+    const m1 = fakeDatabase.messages.find((m) => m.provider_message_id === "M1")!;
+    expect((m1.metadata as { imported?: boolean }).imported).toBe(true); // genuinely backfill-created rows still get it
+  });
+});
+
+describe("runDueConnectionSyncs — durable job runner", () => {
+  function pushConnection(sync: Record<string, unknown> | null, overrides: Partial<Record<string, unknown>> = {}) {
+    const row = { id: nextTestId(), workspace_id: workspaceId, provider: "unipile", channel_type: "whatsapp", external_account_id: `acct-${Math.random()}`, status: "connected", metadata: sync ? { sync } : {}, ...overrides };
+    fakeDatabase.connections.push(row);
+    return row;
+  }
+  let idSeq = 0;
+  function nextTestId() { idSeq += 1; return `conn-test-${idSeq}`; }
+
+  beforeEach(() => {
+    listChatsMock.mockResolvedValue({ items: [], cursor: null });
+  });
+
+  it("claims a 'pending' sync and runs it to completion", async () => {
+    pushConnection({ status: "pending", startedAt: null, heartbeatAt: null, completedAt: null, chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 0, error: null });
+
+    const result = await runDueConnectionSyncs();
+
+    expect(result.claimed).toBe(1);
+    expect(result.completed).toBe(1);
+    const sync = fakeDatabase.connections[0]!.metadata as { sync: { status: string } };
+    expect(sync.sync.status).toBe("completed");
+  });
+
+  it("reclaims a 'running' sync whose heartbeat is older than 10 minutes", async () => {
+    pushConnection({ status: "running", startedAt: new Date(Date.now() - 20 * 60 * 1000).toISOString(), heartbeatAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(), completedAt: null, chatsProcessed: 3, messagesImported: 9, chatsSkippedGroups: 0, chatsFailed: 0, error: null });
+
+    const result = await runDueConnectionSyncs();
+
+    expect(result.claimed).toBe(1);
+  });
+
+  it("does NOT reclaim a 'running' sync with a fresh heartbeat", async () => {
+    pushConnection({ status: "running", startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), completedAt: null, chatsProcessed: 1, messagesImported: 2, chatsSkippedGroups: 0, chatsFailed: 0, error: null });
+
+    const result = await runDueConnectionSyncs();
+
+    expect(result.claimed).toBe(0);
+  });
+
+  it("does NOT reclaim a 'completed' sync", async () => {
+    pushConnection({ status: "completed", startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), completedAt: new Date().toISOString(), chatsProcessed: 1, messagesImported: 2, chatsSkippedGroups: 0, chatsFailed: 0, error: null });
+
+    const result = await runDueConnectionSyncs();
+
+    expect(result.claimed).toBe(0);
+  });
+
+  it("does NOT reclaim a 'failed' sync on its own — only an explicit resync (requestConnectionSync) re-enqueues it", async () => {
+    pushConnection({ status: "failed", startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), completedAt: new Date().toISOString(), chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 1, error: "Erreur de synchronisation." });
+
+    const result = await runDueConnectionSyncs();
+
+    expect(result.claimed).toBe(0);
+  });
+
+  it("two concurrent runner invocations never both claim the same connection", async () => {
+    pushConnection({ status: "pending", startedAt: null, heartbeatAt: null, completedAt: null, chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 0, error: null });
+
+    const [a, b] = await Promise.all([runDueConnectionSyncs(), runDueConnectionSyncs()]);
+
+    expect(a.claimed + b.claimed).toBe(1);
+  });
+});
+
+describe("touchSyncHeartbeat — a huge chat can't go stale mid-pagination", () => {
+  it("a heartbeat refreshed per message page prevents a concurrent runner from reclaiming a still-progressing backfill as stale", async () => {
+    const row = { id: "conn-heartbeat-1", workspace_id: workspaceId, provider: "unipile", channel_type: "whatsapp", external_account_id: "acct-hb-1", status: "connected", metadata: { sync: { status: "running", startedAt: new Date(Date.now() - 15 * 60 * 1000).toISOString(), heartbeatAt: new Date(Date.now() - 15 * 60 * 1000).toISOString(), completedAt: null, chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 0, error: null } } };
+    fakeDatabase.connections.push(row);
+
+    listChatsMock.mockResolvedValue({ items: [chatFixture({ account_id: "acct-hb-1" })], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+
+    let checkedDuringPagination: { claimed: number; completed: number; failed: number } | null = null;
+    listChatMessagesMock
+      .mockResolvedValueOnce({ items: [chatMessageFixture({ id: "big-msg-1" })], cursor: "page-2" })
+      .mockImplementationOnce(async () => {
+        // Between page 1 and page 2 of ONE large chat: page 1's own
+        // touchSyncHeartbeat call has already run. A concurrent runner
+        // checking for stale work right now — despite the initial claim's
+        // heartbeat being 15 minutes old — must see this connection as still
+        // fresh and NOT reclaim it.
+        checkedDuringPagination = await runDueConnectionSyncs();
+        return { items: [chatMessageFixture({ id: "big-msg-2" })], cursor: null };
+      });
+
+    const state = await backfillConnectionHistory(row.id);
+
+    expect(checkedDuringPagination).toEqual({ claimed: 0, completed: 0, failed: 0 });
+    expect(state.status).toBe("completed");
+    expect(state.messagesImported).toBe(2);
+  });
+});
+
+describe("auto-sync after connection", () => {
+  it("WhatsApp: the first transition to 'connected' initializes metadata.sync to 'pending'", async () => {
+    await connectWhatsAppAccount();
+    const sync = (fakeDatabase.connections[0]!.metadata as { sync?: { status: string } }).sync;
+    expect(sync?.status).toBe("pending");
+  });
+
+  it("a webhook redelivery of the connected status never resets an existing sync", async () => {
+    await connectWhatsAppAccount();
+    (fakeDatabase.connections[0]!.metadata as { sync: { status: string } }).sync.status = "completed";
+
+    await connectWhatsAppAccount(); // same account_id — redelivery via ON CONFLICT
+
+    const sync = (fakeDatabase.connections[0]!.metadata as { sync: { status: string } }).sync;
+    expect(sync.status).toBe("completed");
+  });
+
+  it("LinkedIn connections are never auto-enrolled — the existing manual-only flow is untouched", async () => {
+    await connectAccount("CREATION_SUCCESS");
+    const metadata = fakeDatabase.connections[0]!.metadata as { sync?: unknown };
+    expect(metadata.sync).toBeUndefined();
+  });
+
+  it("ingestAccountStatus's own 'connected' transition also initializes sync exactly once", async () => {
+    fakeDatabase.connections.push({ id: "conn-wa-status", workspace_id: workspaceId, provider: "unipile", channel_type: "whatsapp", external_account_id: "acct-wa-status-1", status: "connecting", metadata: {} });
+    await ingestAccountStatus({ account_id: "acct-wa-status-1", account_type: "WHATSAPP", message: "creation_success" } satisfies UnipileAccountStatusPayload["AccountStatus"]);
+
+    const sync = (fakeDatabase.connections[0]!.metadata as { sync?: { status: string } }).sync;
+    expect(sync?.status).toBe("pending");
+  });
+});
+
+describe("requestConnectionSync — manual/auto resync endpoint logic", () => {
+  it("throws when the channel isn't connected", async () => {
+    await expect(requestConnectionSync(workspaceId, "whatsapp")).rejects.toThrow();
+  });
+
+  it("a pending sync is returned as-is, never duplicated", async () => {
+    await connectWhatsAppAccount(); // auto-initializes to pending
+    const state = await requestConnectionSync(workspaceId, "whatsapp");
+    expect(state.status).toBe("pending");
+  });
+
+  it("a fresh 'running' sync is returned as-is", async () => {
+    await connectWhatsAppAccount();
+    (fakeDatabase.connections[0]!.metadata as { sync: Record<string, unknown> }).sync = { status: "running", startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), completedAt: null, chatsProcessed: 2, messagesImported: 5, chatsSkippedGroups: 0, chatsFailed: 0, error: null };
+
+    const state = await requestConnectionSync(workspaceId, "whatsapp");
+
+    expect(state.status).toBe("running");
+    expect(state.chatsProcessed).toBe(2); // not reset while still fresh
+  });
+
+  it("a completed sync gets a fresh 'pending' with zeroed counters on resync", async () => {
+    await connectWhatsAppAccount();
+    (fakeDatabase.connections[0]!.metadata as { sync: Record<string, unknown> }).sync = { status: "completed", startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), completedAt: new Date().toISOString(), chatsProcessed: 12, messagesImported: 40, chatsSkippedGroups: 1, chatsFailed: 0, error: null };
+
+    const state = await requestConnectionSync(workspaceId, "whatsapp");
+
+    expect(state.status).toBe("pending");
+    expect(state.chatsProcessed).toBe(0);
+    expect(state.messagesImported).toBe(0);
+  });
+
+  it("a stale 'running' sync (heartbeat >10min old) is treated as resyncable, not fresh", async () => {
+    await connectWhatsAppAccount();
+    (fakeDatabase.connections[0]!.metadata as { sync: Record<string, unknown> }).sync = { status: "running", startedAt: new Date(Date.now() - 20 * 60 * 1000).toISOString(), heartbeatAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(), completedAt: null, chatsProcessed: 3, messagesImported: 8, chatsSkippedGroups: 0, chatsFailed: 0, error: null };
+
+    const state = await requestConnectionSync(workspaceId, "whatsapp");
+
+    expect(state.status).toBe("pending");
+    expect(state.chatsProcessed).toBe(0);
+  });
+});
+
+describe("connections.metadata — sync writes never clobber unrelated keys", () => {
+  it("a pre-existing, unrelated metadata key survives a sync-state write", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    fakeDatabase.connections[0]!.metadata = { ...(fakeDatabase.connections[0]!.metadata as Record<string, unknown>), someOtherKey: "keepme" };
+
+    listChatsMock.mockResolvedValue({ items: [chatFixture()], cursor: null });
+    listChatAttendeesMock.mockResolvedValue([attendeeFixture()]);
+    listChatMessagesMock.mockResolvedValue({ items: [chatMessageFixture()], cursor: null });
+    await backfillConnectionHistory(connectionId);
+
+    const metadata = fakeDatabase.connections[0]!.metadata as Record<string, unknown>;
+    expect(metadata.someOtherKey).toBe("keepme");
+    expect((metadata.sync as { status: string }).status).toBe("completed");
   });
 });

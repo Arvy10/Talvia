@@ -68,6 +68,84 @@ function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
+// --- Historical sync job state (connections.metadata.sync) ---
+// Persisted job state for the durable, cron-driven historical backfill —
+// see runDueConnectionSyncs below. Deliberately reuses the existing
+// connections.metadata jsonb column instead of a new table: connections
+// already IS the source of truth for the connected account
+// (ARCHITECTURE.md §3), and a single jsonb_set on the 'sync' key never
+// touches any other property that may already live in metadata.
+export type ConnectionSyncState = {
+  status: "pending" | "running" | "completed" | "failed";
+  startedAt: string | null;
+  heartbeatAt: string | null;
+  completedAt: string | null;
+  chatsProcessed: number;
+  messagesImported: number;
+  chatsSkippedGroups: number;
+  chatsFailed: number;
+  error: string | null;
+};
+
+const INITIAL_SYNC_STATE: ConnectionSyncState = {
+  status: "pending", startedAt: null, heartbeatAt: null, completedAt: null,
+  chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 0, error: null,
+};
+
+// Same 10-minute threshold already established for campaign participant
+// claims (campaign-execution/executor-shared.ts's CLAIM_STALE_AFTER) — kept
+// as a separate local constant rather than a cross-domain import, since it's
+// a single literal shared only by convention, not by coupling.
+const SYNC_STALE_AFTER = "10 minutes";
+
+async function writeSyncState(connectionId: string, state: ConnectionSyncState): Promise<void> {
+  await database.query(
+    `update connections set metadata=jsonb_set(coalesce(metadata,'{}'::jsonb),'{sync}',$2::jsonb),updated_at=now() where id=$1`,
+    [connectionId, JSON.stringify(state)],
+  );
+}
+
+// Closes a real concurrency gap without a lease system or a curseur
+// checkpoint: backfillConnectionHistory only refreshed the heartbeat once
+// per CHAT, but one chat can itself page through hundreds/thousands of
+// messages — a single huge chat could keep a live backfill's heartbeat
+// unrefreshed past SYNC_STALE_AFTER, making runDueConnectionSyncs wrongly
+// reclaim it while it's still actively progressing. Called once per message
+// page actually fetched inside backfillChat (below) — a targeted single-key
+// jsonb_set that touches only metadata.sync.heartbeatAt, leaving every other
+// key (counters, other metadata) untouched.
+async function touchSyncHeartbeat(connectionId: string): Promise<void> {
+  await database.query(
+    `update connections set metadata=jsonb_set(coalesce(metadata,'{}'::jsonb),'{sync,heartbeatAt}',$2::jsonb) where id=$1`,
+    [connectionId, JSON.stringify(new Date().toISOString())],
+  );
+}
+
+// Fires from ingestHostedAuthNotification and ingestAccountStatus — the two
+// places a connection's status can genuinely become 'connected' — right
+// after that write. Guarded atomically on `metadata->'sync' is null` so a
+// webhook redelivery (status already 'connected' from a prior call) can
+// never reinitialize a sync that is already running/completed/failed; it
+// only ever fires once, on the connection's first real transition. Scoped to
+// WhatsApp only — LinkedIn already has its own established manual-sync-only
+// flow and this must not silently change that shipped behavior.
+async function initializeAutoSyncIfNeeded(connectionId: string | undefined, channelType: string, status: string): Promise<void> {
+  if (!connectionId || status !== "connected" || channelType !== "whatsapp") return;
+  await database.query(
+    `update connections set metadata=jsonb_set(coalesce(metadata,'{}'::jsonb),'{sync}',$2::jsonb) where id=$1 and metadata->'sync' is null`,
+    [connectionId, JSON.stringify(INITIAL_SYNC_STATE)],
+  );
+}
+
+// Message status only ever advances forward: sent/received/pending/draft (0)
+// -> delivered (1) -> read (2), never backward. Both the real-time
+// delivery-receipt path (ingestMessageStatusUpdate) and the historical
+// backfill upsert (backfillChat) compare through this exact rank expression
+// so there is one definition of the ordering, not two.
+function statusRankSql(column: string): string {
+  return `(case ${column} when 'read' then 2 when 'delivered' then 1 else 0 end)`;
+}
+
 export type ConnectionAuthAttempt = { workspaceId: string; channelType: "linkedin" | "whatsapp" | "gmail" };
 
 // Minted once per POST /api/connections/[channel]/connect, before Unipile
@@ -143,6 +221,7 @@ export async function ingestHostedAuthNotification(payload: UnipileHostedAuthNot
     [workspaceId, PROVIDER, channel, payload.account_id, channel === "gmail" ? "Gmail" : channel === "linkedin" ? "LinkedIn" : "WhatsApp", status],
   );
   console.log(`[unipile-adapter] ingestHostedAuthNotification: workspace=${workspaceId} channel=${channel} account_id=${payload.account_id} status=${status} connection_id=${result.rows[0]?.id}`);
+  await initializeAutoSyncIfNeeded(result.rows[0]?.id, channel, status);
 }
 
 // Ongoing lifecycle events for an already-connected account (no workspace
@@ -175,6 +254,7 @@ export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["
     console.error(`[unipile-adapter] ingestAccountStatus: account_type mismatch for connection ${row.id} — stored channel_type=${row.channel_type}, payload reported account_type=${payload.account_type} — update skipped`);
     return;
   }
+  const status = toConnectionStatus(payload.message);
   const result = await database.query(
     `update connections set status=$1,
        connected_at=case when $1::varchar='connected' then now() else connected_at end,
@@ -182,9 +262,10 @@ export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["
        updated_at=now()
      where id=$2
      returning id`,
-    [toConnectionStatus(payload.message), row.id],
+    [status, row.id],
   );
   console.log(`[unipile-adapter] ingestAccountStatus: account_id=${payload.account_id} updated, connection_id=${result.rows[0]?.id}`);
+  await initializeAutoSyncIfNeeded(result.rows[0]?.id, row.channel_type, status);
 }
 
 // contact_identities.channel_type only accepts ('linkedin','whatsapp','email',
@@ -328,7 +409,7 @@ async function ingestMessageStatusUpdate(payload: UnipileNewMessagePayload): Pro
      where m.conversation_id=v.id and v.connection_id=c.id
        and c.provider=$2 and c.external_account_id=$3
        and v.external_thread_id=$4 and m.provider_message_id=$5
-       and m.status<>'read'
+       and ${statusRankSql("m.status")} < ${statusRankSql("$1::varchar")}
      returning m.id`,
     [status, PROVIDER, payload.account_id, payload.chat_id, payload.message_id],
   );
@@ -338,7 +419,19 @@ async function ingestMessageStatusUpdate(payload: UnipileNewMessagePayload): Pro
 // Idempotent by (conversation_id, provider_message_id) — a redelivered
 // webhook for a message we already stored is a safe no-op, matching the
 // same unique-constraint pattern createTestInbound() uses in lib/inbox.ts.
+// Logs receipt + outcome only (account_id, resolved channel, ingested /
+// duplicate / unknown_account) — never message body, phone number, token, or
+// URL. This was the one gap identified in the prior audit turn: without it,
+// there was no way to tell "webhook never arrived" from "arrived and was
+// silently rejected" from "arrived and no-opped as a duplicate".
 export async function ingestMessage(payload: UnipileNewMessagePayload): Promise<IngestResult> {
+  console.log(`[unipile-adapter] ingestMessage: received event=${payload.event} account_id=${payload.account_id ?? "unknown"}`);
+  const result = await ingestMessageBody(payload);
+  console.log(`[unipile-adapter] ingestMessage: account_id=${payload.account_id ?? "unknown"} result=${result.status}`);
+  return result;
+}
+
+async function ingestMessageBody(payload: UnipileNewMessagePayload): Promise<IngestResult> {
   if (payload.event === "message_read" || payload.event === "message_delivered") return ingestMessageStatusUpdate(payload);
   if (payload.event !== "message_received") return { status: "unknown_account" };
   const resolved = resolveCounterparty(payload);
@@ -480,17 +573,27 @@ async function stopParticipantsOnReply(client: import("pg").PoolClient, workspac
 
 export type BackfillSummary = { chatsProcessed: number; messagesInserted: number; chatsFailed: number };
 
-async function backfillChat(workspaceId: string, connectionId: string, config: NonNullable<ReturnType<typeof getUnipileConfig>>, chat: Awaited<ReturnType<typeof listChats>>["items"][number]): Promise<number> {
+type BackfillChatResult = { skippedGroup: boolean; messagesInserted: number };
+
+// V1 group-chat policy: WhatsApp groups are ignored entirely, never
+// attributed to whichever participant happens to come first. A chat counts
+// as a group when it has MORE THAN ONE non-self attendee — exactly one
+// non-self attendee is a real 1:1 conversation; zero is a chat with no
+// external participant at all (self-chat, deleted account) and is left
+// exactly as before: nothing to attach messages to, silently 0 messages.
+async function backfillChat(workspaceId: string, connectionId: string, config: NonNullable<ReturnType<typeof getUnipileConfig>>, chat: Awaited<ReturnType<typeof listChats>>["items"][number], channelType: string): Promise<BackfillChatResult> {
   const attendees = await listChatAttendees(config, chat.id);
-  const counterparty = attendees.find((attendee) => !attendee.is_self);
-  if (!counterparty) return 0; // group chats / chats with no external attendee aren't handled yet
+  const nonSelf = attendees.filter((attendee) => !attendee.is_self);
+  if (nonSelf.length > 1) return { skippedGroup: true, messagesInserted: 0 };
+  const counterparty = nonSelf[0];
+  if (!counterparty) return { skippedGroup: false, messagesInserted: 0 };
 
   let messagesInserted = 0;
   const client = await database.connect();
   try {
     await client.query("begin");
-    const contactId = await findOrCreateContact(client, workspaceId, "linkedin", counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "", counterparty.picture_url, counterparty.specifics?.occupation);
-    const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, "linkedin", chat.id, contactId);
+    const contactId = await findOrCreateContact(client, workspaceId, channelType, counterparty.provider_id, counterparty.profile_url, counterparty.name ?? "", counterparty.picture_url, counterparty.specifics?.occupation);
+    const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, channelType, chat.id, contactId);
 
     let messagesCursor: string | undefined;
     do {
@@ -504,23 +607,40 @@ async function backfillChat(workspaceId: string, connectionId: string, config: N
         // authoritative record, so a message a stale ingestion path already
         // stored with the wrong direction/contact (e.g. from a production
         // deploy that predates a bugfix) gets corrected here instead of
-        // being silently left wrong forever.
+        // being silently left wrong forever. Two invariants on that upsert:
+        //  - status never regresses (statusRankSql) — a message this same
+        //    backfill (or a prior one) already advanced via the real-time
+        //    delivery-receipt path must not be pushed back to sent/received.
+        //  - metadata's 'imported' key is only ever set on a fresh INSERT
+        //    (this row is being created BY backfill). On conflict, the
+        //    'imported' key is stripped out of `excluded.metadata` before
+        //    merging, so a message the real-time webhook already created
+        //    (no 'imported' key) is never retroactively marked imported, and
+        //    one backfill already created keeps its own 'imported':true —
+        //    only the refreshed fields (e.g. attachments) come from excluded.
         const upserted = await client.query<{ id: string }>(
           `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at,metadata)
-           values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then $8::timestamptz else null end,case when $3::varchar='inbound' then $8::timestamptz else null end,$9)
+           values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then $8::timestamptz else null end,case when $3::varchar='inbound' then $8::timestamptz else null end,$9::jsonb)
            on conflict(conversation_id,provider_message_id) where provider_message_id is not null do update set
-             direction=excluded.direction,sender_contact_id=excluded.sender_contact_id,body=excluded.body,status=excluded.status,metadata=excluded.metadata
+             direction=excluded.direction,
+             sender_contact_id=excluded.sender_contact_id,
+             body=excluded.body,
+             status=case when ${statusRankSql("messages.status")} > ${statusRankSql("excluded.status")} then messages.status else excluded.status end,
+             metadata=messages.metadata || (excluded.metadata - 'imported')
            returning id`,
-          [workspaceId, conversationId, direction, message.is_sender ? null : contactId, message.text ?? "", status, message.id, message.timestamp, JSON.stringify(attachments.length ? { attachments } : {})],
+          [workspaceId, conversationId, direction, message.is_sender ? null : contactId, message.text ?? "", status, message.id, message.timestamp, JSON.stringify({ ...(attachments.length ? { attachments } : {}), imported: true })],
         );
         if (upserted.rows[0]) messagesInserted += 1;
       }
       messagesCursor = messagesPage.cursor ?? undefined;
+      // A single very large chat must not let the heartbeat go stale while
+      // it's genuinely still being paged through — see touchSyncHeartbeat.
+      await touchSyncHeartbeat(connectionId);
     } while (messagesCursor);
 
     await client.query(`update conversations set last_message_at=greatest(coalesce(last_message_at,'epoch'::timestamptz),$2::timestamptz),updated_at=now() where id=$1`, [conversationId, chat.timestamp ?? new Date().toISOString()]);
     await client.query("commit");
-    return messagesInserted;
+    return { skippedGroup: false, messagesInserted };
   } catch (error) {
     await client.query("rollback");
     throw error;
@@ -529,45 +649,154 @@ async function backfillChat(workspaceId: string, connectionId: string, config: N
   }
 }
 
-// One-time historical import, run explicitly after a connection succeeds
-// (see api/connections/[channel]/sync) rather than inline in the webhook
-// handler — Unipile expects a fast webhook response, and an account can have
-// years of LinkedIn history to page through. Idempotent: safe to re-run
-// (e.g. after a partial failure) since every message insert is keyed by
-// provider_message_id, same as the live webhook path.
-export async function backfillConnectionHistory(connectionId: string): Promise<BackfillSummary> {
-  const config = getUnipileConfig();
-  if (!config) throw new Error("Unipile n'est pas configuré sur cet environnement.");
+function sanitizeSyncError(error: unknown): string {
+  const message = error instanceof Error ? error.message : "Erreur de synchronisation.";
+  return message.slice(0, 500);
+}
 
-  const connectionResult = await database.query<{ workspace_id: string; channel_type: string; external_account_id: string }>(
-    `select workspace_id,channel_type,external_account_id from connections where id=$1 and status='connected'`,
-    [connectionId],
-  );
-  const connection = connectionResult.rows[0];
-  if (!connection) throw new Error("Connexion introuvable ou non connectée.");
-  if (connection.channel_type !== "linkedin") throw new Error(`Synchronisation de l'historique non disponible pour ${connection.channel_type} pour le moment.`);
-  const { workspace_id: workspaceId, external_account_id: accountId } = connection;
+// Historical import for an already-connected LinkedIn or WhatsApp account.
+// Only ever invoked by runDueConnectionSyncs (the durable job runner) —
+// never called directly from an HTTP route, since a full history can take a
+// while to page through. Idempotent: safe to re-run in full (e.g. after a
+// crash) since every message insert is keyed by provider_message_id, same as
+// the live webhook path. Writes its own progress into
+// connections.metadata.sync as it goes (heartbeat + counters after every
+// chat processed/skipped/failed) so a caller never needs to guess progress.
+// Deliberately never calls recordSystemActivity/dispatchCommittedActivity —
+// a historical import must never trigger an automation, a campaign, a stop,
+// or an opportunity. See ingestMessage for the real-time path that does.
+export async function backfillConnectionHistory(connectionId: string): Promise<ConnectionSyncState> {
+  const state: ConnectionSyncState = {
+    status: "running", startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), completedAt: null,
+    chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 0, error: null,
+  };
+  try {
+    const config = getUnipileConfig();
+    if (!config) throw new Error("Unipile n'est pas configuré sur cet environnement.");
 
-  const summary: BackfillSummary = { chatsProcessed: 0, messagesInserted: 0, chatsFailed: 0 };
-  let chatsCursor: string | undefined;
-  do {
-    const chatsPage = await listChats(config, accountId, chatsCursor);
-    for (const chat of chatsPage.items) {
-      try {
-        summary.messagesInserted += await backfillChat(workspaceId, connectionId, config, chat);
-        summary.chatsProcessed += 1;
-      } catch (error) {
-        // A single slow/failed chat (timeout, transient Unipile error) must
-        // not abort hours of otherwise-successful pagination — log and move
-        // on; re-running the sync will retry whatever didn't complete.
-        summary.chatsFailed += 1;
-        console.error(`[unipile] backfill failed for chat ${chat.id}`, error);
-      }
+    const connectionResult = await database.query<{ workspace_id: string; channel_type: string; external_account_id: string }>(
+      `select workspace_id,channel_type,external_account_id from connections where id=$1 and status='connected'`,
+      [connectionId],
+    );
+    const connection = connectionResult.rows[0];
+    if (!connection) throw new Error("Connexion introuvable ou non connectée.");
+    if (connection.channel_type !== "linkedin" && connection.channel_type !== "whatsapp") {
+      throw new Error(`Synchronisation de l'historique non disponible pour ${connection.channel_type} pour le moment.`);
     }
-    chatsCursor = chatsPage.cursor ?? undefined;
-  } while (chatsCursor);
+    const { workspace_id: workspaceId, external_account_id: accountId, channel_type: channelType } = connection;
 
-  return summary;
+    let chatsCursor: string | undefined;
+    do {
+      const chatsPage = await listChats(config, accountId, chatsCursor);
+      for (const chat of chatsPage.items) {
+        try {
+          const result = await backfillChat(workspaceId, connectionId, config, chat, channelType);
+          if (result.skippedGroup) state.chatsSkippedGroups += 1;
+          else {
+            state.chatsProcessed += 1;
+            state.messagesImported += result.messagesInserted;
+          }
+        } catch (error) {
+          // A single slow/failed chat (timeout, transient Unipile error) must
+          // not abort hours of otherwise-successful pagination — log and move
+          // on; re-running the sync will retry whatever didn't complete.
+          state.chatsFailed += 1;
+          console.error(`[unipile] backfill failed for chat ${chat.id}`, error);
+        }
+        state.heartbeatAt = new Date().toISOString();
+        await writeSyncState(connectionId, state);
+      }
+      chatsCursor = chatsPage.cursor ?? undefined;
+    } while (chatsCursor);
+
+    state.status = "completed";
+    state.completedAt = new Date().toISOString();
+    await writeSyncState(connectionId, state);
+    return state;
+  } catch (error) {
+    state.status = "failed";
+    state.completedAt = new Date().toISOString();
+    state.error = sanitizeSyncError(error);
+    await writeSyncState(connectionId, state);
+    throw error;
+  }
+}
+
+// The durable job runner — the counterpart to lib/acquisition/scheduler.ts
+// and campaign-execution/engine.ts's runEngineSweep, meant to be hit
+// periodically by the same external cron (see api/connections/sync/run).
+// Claim is a single atomic statement: SELECT ... FOR UPDATE SKIP LOCKED
+// inside a CTE, immediately followed by the UPDATE that flips claimed rows
+// to 'running' with fresh counters, all in one round trip — there is never a
+// window where two concurrent runner invocations can both see the same
+// connection as claimable, matching the exact pattern already proven by
+// runAcquisitionScheduler.
+export async function runDueConnectionSyncs(limit = 3): Promise<{ claimed: number; completed: number; failed: number }> {
+  const claimState = JSON.stringify({
+    status: "running", startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), completedAt: null,
+    chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 0, error: null,
+  });
+  const claimed = await database.query<{ id: string }>(
+    `with due as (
+       select id from connections
+       where provider=$2 and status='connected'
+         and (
+           metadata->'sync'->>'status' = 'pending'
+           or (
+             metadata->'sync'->>'status' = 'running'
+             and metadata->'sync'->>'heartbeatAt' is not null
+             and (metadata->'sync'->>'heartbeatAt')::timestamptz < now() - interval '${SYNC_STALE_AFTER}'
+           )
+         )
+       order by coalesce((metadata->'sync'->>'startedAt')::timestamptz, 'epoch'::timestamptz)
+       for update skip locked
+       limit $1
+     )
+     update connections c set metadata=jsonb_set(coalesce(c.metadata,'{}'::jsonb),'{sync}',$3::jsonb), updated_at=now()
+     from due where c.id=due.id
+     returning c.id`,
+    [Math.min(Math.max(limit, 1), 20), PROVIDER, claimState],
+  );
+
+  let completed = 0, failed = 0;
+  for (const row of claimed.rows) {
+    try {
+      await backfillConnectionHistory(row.id);
+      completed += 1;
+    } catch (error) {
+      // backfillConnectionHistory already persisted its own 'failed' state —
+      // this catch only keeps one connection's failure from stopping the
+      // rest of this batch, mirroring runAcquisitionScheduler's per-item
+      // try/catch.
+      failed += 1;
+      console.error(`[unipile] connection sync failed for connection ${row.id}`, error);
+    }
+  }
+  return { claimed: claimed.rows.length, completed, failed };
+}
+
+const SYNC_FRESH_MS = 10 * 60 * 1000; // matches SYNC_STALE_AFTER
+
+// Fast, session-authenticated entry point for both the auto-triggered first
+// sync's UI polling and a manual resync click — POST
+// /api/connections/[channel]/sync. Never runs the backfill itself: it only
+// decides whether to (re)enqueue and returns immediately, leaving the actual
+// work to the next runDueConnectionSyncs pass. Idempotent: a pending or
+// still-fresh running sync is returned as-is, never duplicated.
+export async function requestConnectionSync(workspaceId: string, channelType: "linkedin" | "whatsapp"): Promise<ConnectionSyncState> {
+  const result = await database.query<{ id: string; metadata: { sync?: ConnectionSyncState } }>(
+    `select id,metadata from connections where workspace_id=$1 and provider=$2 and channel_type=$3 and status='connected'`,
+    [workspaceId, PROVIDER, channelType],
+  );
+  const row = result.rows[0];
+  if (!row) throw new Error("Ce canal n'est pas connecté.");
+
+  const sync = row.metadata?.sync;
+  const isFreshRunning = sync?.status === "running" && Boolean(sync.heartbeatAt) && Date.now() - new Date(sync.heartbeatAt!).getTime() < SYNC_FRESH_MS;
+  if (sync?.status === "pending" || isFreshRunning) return sync;
+
+  await writeSyncState(row.id, INITIAL_SYNC_STATE);
+  return INITIAL_SYNC_STATE;
 }
 
 export type SendMessageResult = { id: string; body: string; direction: "outbound"; status: "sent"; createdAt: string };
