@@ -2,6 +2,7 @@ import type { PoolClient } from "pg";
 
 import { database } from "./database";
 import { dispatchCommittedActivity, recordActivity, type ActivityRecord } from "./activities";
+import { initializeParticipantStep } from "./campaign-execution/step-progression";
 import type { CampaignStrategy } from "./campaign-strategy";
 import type { WorkspaceContext } from "./workspace-context";
 
@@ -45,8 +46,71 @@ export async function listCampaigns(context:WorkspaceContext) { const client=awa
 export async function getCampaign(context:WorkspaceContext,campaignId:string) { const client=await database.connect(); try { const row=await getCampaignRow(client,context.workspaceId,campaignId); return row?record(client,context.workspaceId,row):null; } finally { client.release(); } }
 export async function createCampaign(context:WorkspaceContext,input:CampaignInput) { validateInput(input); const steps=input.steps??[]; validateSteps(steps); const participantIds=[...new Set(input.participantIds??[])]; const client=await database.connect(); try { await client.query("begin"); for(const contactId of participantIds) if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,input.channelType)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal."); const created=await client.query<{id:string}>(`insert into campaigns(workspace_id,name,objective,channel_type,status,created_by_user_id,settings) values($1,$2,$3,$4,'draft',$5,$6) returning id`,[context.workspaceId,input.name.trim(),input.objective,input.channelType,context.userId,{description:input.description?.trim()||undefined,stopOnReply:input.stopOnReply??true}]); const id=created.rows[0]!.id; for(const step of steps) await client.query(`insert into campaign_steps(campaign_id,position,step_type,channel_type,delay_value,delay_unit,message_template) values($1,$2,$3,$4,$5,$6,$7)`,[id,step.position,step.stepType,step.channelType??input.channelType,step.delayValue??0,step.delayUnit??"days",step.messageTemplate?.trim()||null]); for(const contactId of participantIds) await client.query(`insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,'waiting')`,[id,contactId]); const event=await activity(client,context,id,"campaign.created"); const row=await getCampaignRow(client,context.workspaceId,id); const value=await record(client,context.workspaceId,row!); await client.query("commit"); await dispatchCommittedActivity(event); return value; } catch(error) { await client.query("rollback"); throw error; } finally { client.release(); } }
 export async function updateCampaign(context:WorkspaceContext,id:string,input:Partial<CampaignInput>) { const client=await database.connect(); try { const existing=await getCampaignRow(client,context.workspaceId,id); if(!existing)return null; if(existing.status!=="draft" && (input.participantIds||input.steps)) invalid("La séquence et l’audience ne peuvent plus être modifiées après activation."); const name=input.name?.trim()||existing.name; const objective=input.objective??existing.objective; const channel=input.channelType??existing.channel_type; await client.query(`update campaigns set name=$1,objective=$2,channel_type=$3,settings=$4,updated_at=now() where workspace_id=$5 and id=$6`,[name,objective,channel,{...existing.settings,description:input.description?.trim()||existing.settings?.description,stopOnReply:input.stopOnReply??existing.settings?.stopOnReply??true},context.workspaceId,id]); await activity(client,context,id,"campaign.updated"); return record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,id))!); } finally { client.release(); } }
-export async function transitionCampaign(context:WorkspaceContext,id:string,action:"activate"|"pause"|"resume"|"complete"|"archive") { const client=await database.connect(); try { const current=await getCampaignRow(client,context.workspaceId,id); if(!current)return null; const target={activate:"active",pause:"paused",resume:"active",complete:"completed",archive:"archived"}[action] as CampaignStatus; await client.query(`update campaigns set status=$1,started_at=case when $2='activate' then coalesce(started_at,now()) else started_at end,paused_at=case when $2='pause' then now() else paused_at end,completed_at=case when $2='complete' then now() else completed_at end,archived_at=case when $2='archive' then now() else archived_at end,updated_at=now() where workspace_id=$3 and id=$4`,[target,action,context.workspaceId,id]); if(action==="activate"||action==="resume") await client.query(`update campaign_participants set status='active',started_at=coalesce(started_at,now()),updated_at=now() where campaign_id=$1 and status='waiting'`,[id]); await activity(client,context,id,`campaign.${action==='activate'?'started':action==='resume'?'resumed':action==='pause'?'paused':action==='complete'?'completed':'archived'}`); return record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,id))!); } finally { client.release(); } }
-export async function addParticipants(context:WorkspaceContext,campaignId:string,contactIds:string[]) { const client=await database.connect(); try { await client.query("begin"); const campaign=await getCampaignRow(client,context.workspaceId,campaignId); if(!campaign){await client.query("rollback");return null;} for(const contactId of [...new Set(contactIds)]) { if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,campaign.channel_type)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal."); await client.query(`insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,$3) on conflict(campaign_id,contact_id) do nothing`,[campaignId,contactId,campaign.status==='active'?'active':'waiting']); } await activity(client,context,campaignId,"campaign.contact_added"); const value=await record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,campaignId))!); await client.query("commit"); return value; } catch(error){await client.query("rollback");throw error;} finally {client.release();} }
+// Wrapped in an explicit transaction (this function previously had none —
+// each client.query call auto-committed on its own) precisely because
+// activation must never be observable as "participants already active" while
+// their current_step_id initialization hasn't happened yet: a crash or
+// thrown error between the two would otherwise leave a real, committed
+// active-but-unclaimable participant. Reuses the plain begin/commit/rollback
+// pattern already used elsewhere in this same file (createCampaign,
+// addParticipants, saveSteps) — no new transactional infrastructure.
+export async function transitionCampaign(context:WorkspaceContext,id:string,action:"activate"|"pause"|"resume"|"complete"|"archive") {
+  const client=await database.connect();
+  try {
+    await client.query("begin");
+    const current=await getCampaignRow(client,context.workspaceId,id);
+    if(!current){await client.query("rollback");return null;}
+    const target={activate:"active",pause:"paused",resume:"active",complete:"completed",archive:"archived"}[action] as CampaignStatus;
+    await client.query(`update campaigns set status=$1,started_at=case when $2='activate' then coalesce(started_at,now()) else started_at end,paused_at=case when $2='pause' then now() else paused_at end,completed_at=case when $2='complete' then now() else completed_at end,archived_at=case when $2='archive' then now() else archived_at end,updated_at=now() where workspace_id=$3 and id=$4`,[target,action,context.workspaceId,id]);
+    if(action==="activate"||action==="resume") {
+      // The never-reinitialize guard is `current_step_id is null` directly
+      // in this WHERE clause, not merely implied by `status='waiting'` —
+      // status='waiting' happens to always coincide with current_step_id
+      // being null today (nothing else ever regresses a participant back to
+      // 'waiting', verified exhaustively), but that's an emergent property
+      // of the rest of the codebase, not something this query enforces on
+      // its own. Asserting current_step_id is null explicitly means this
+      // query stays correct even if that invariant is ever broken
+      // elsewhere — a participant genuinely mid-sequence (e.g. re-activated
+      // after a pause, current_step_id already pointing somewhere real) is
+      // structurally excluded here, not just by convention.
+      const activated=await client.query<{id:string}>(`update campaign_participants set status='active',started_at=coalesce(started_at,now()),updated_at=now() where campaign_id=$1 and status='waiting' and current_step_id is null returning id`,[id]);
+      for(const row of activated.rows) await initializeParticipantStep(context.workspaceId,id,row.id,client);
+    }
+    await activity(client,context,id,`campaign.${action==='activate'?'started':action==='resume'?'resumed':action==='pause'?'paused':action==='complete'?'completed':'archived'}`);
+    const value=await record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,id))!);
+    await client.query("commit");
+    return value;
+  } catch(error) {
+    await client.query("rollback");
+    throw error;
+  } finally { client.release(); }
+}
+// A contact added to an already-active campaign becomes an active
+// participant immediately (never passes through transitionCampaign) — so it
+// must be initialized right here, in the same transaction as its own
+// insert, for the same atomicity reason documented on transitionCampaign
+// above. `returning id` distinguishes a genuinely new row from a no-op
+// conflict (already a participant) — only a fresh insert is ever
+// initialized.
+export async function addParticipants(context:WorkspaceContext,campaignId:string,contactIds:string[]) {
+  const client=await database.connect();
+  try {
+    await client.query("begin");
+    const campaign=await getCampaignRow(client,context.workspaceId,campaignId);
+    if(!campaign){await client.query("rollback");return null;}
+    for(const contactId of [...new Set(contactIds)]) {
+      if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,campaign.channel_type)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal.");
+      const inserted=await client.query<{id:string}>(`insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,$3) on conflict(campaign_id,contact_id) do nothing returning id`,[campaignId,contactId,campaign.status==='active'?'active':'waiting']);
+      if(inserted.rows[0] && campaign.status==='active') await initializeParticipantStep(context.workspaceId,campaignId,inserted.rows[0].id,client);
+    }
+    await activity(client,context,campaignId,"campaign.contact_added");
+    const value=await record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,campaignId))!);
+    await client.query("commit");
+    return value;
+  } catch(error){await client.query("rollback");throw error;}
+  finally {client.release();}
+}
 export async function stopParticipant(context:WorkspaceContext,campaignId:string,participantId:string,reason="manual") { const client=await database.connect(); try { if(!await getCampaignRow(client,context.workspaceId,campaignId))return null; const r=await client.query(`update campaign_participants set status='stopped',stopped_at=now(),stop_reason=$1,updated_at=now() where id=$2 and campaign_id=$3 returning id`,[reason,participantId,campaignId]); if(!r.rowCount)return null; await activity(client,context,campaignId,"campaign.contact_stopped"); return record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,campaignId))!); } finally {client.release();} }
 export async function removeParticipant(context:WorkspaceContext,campaignId:string,participantId:string) { const client=await database.connect(); try { const campaign=await getCampaignRow(client,context.workspaceId,campaignId); if(!campaign)return null; if(campaign.status!=="draft")invalid("Les participants d’une campagne active doivent être arrêtés, pas supprimés."); const r=await client.query(`delete from campaign_participants where id=$1 and campaign_id=$2 returning id`,[participantId,campaignId]); if(!r.rowCount)return null; await activity(client,context,campaignId,"campaign.contact_removed"); return record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,campaignId))!); } finally {client.release();} }
 export async function saveSteps(context:WorkspaceContext,campaignId:string,steps:CampaignStepInput[]) { validateSteps(steps); const client=await database.connect(); try { await client.query("begin"); const campaign=await getCampaignRow(client,context.workspaceId,campaignId); if(!campaign){await client.query("rollback");return null;} if(campaign.status!=="draft")invalid("La séquence ne peut plus être modifiée après activation."); const referenced=await client.query<{current_step_id:string}>(`select current_step_id from campaign_participants where campaign_id=$1 and current_step_id is not null`,[campaignId]); const keep=new Set(steps.flatMap(step=>step.id?[step.id]:[])); for(const row of referenced.rows)if(!keep.has(row.current_step_id))invalid("Une étape utilisée par un participant ne peut pas être supprimée."); await client.query(`delete from campaign_steps where campaign_id=$1`,[campaignId]); for(const step of steps)await client.query(`insert into campaign_steps(campaign_id,position,step_type,channel_type,delay_value,delay_unit,message_template) values($1,$2,$3,$4,$5,$6,$7)`,[campaignId,step.position,step.stepType,step.channelType??campaign.channel_type,step.delayValue??0,step.delayUnit??"days",step.messageTemplate?.trim()||null]); await activity(client,context,campaignId,"campaign.updated"); const value=await record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,campaignId))!); await client.query("commit");return value; }catch(error){await client.query("rollback");throw error;}finally{client.release();} }
