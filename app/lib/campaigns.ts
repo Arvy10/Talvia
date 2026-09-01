@@ -30,6 +30,8 @@ type CampaignRow = { id:string; name:string; objective:CampaignObjective; channe
 type StepRow = { id:string; position:number; step_type:CampaignStepType; channel_type:CampaignChannel|null; delay_value:number; delay_unit:"minutes"|"hours"|"days"; message_template:string|null };
 type ParticipantRow = { id:string; contact_id:string; display_name:string; company:string|null; status:ParticipantStatus; current_step_id:string|null; started_at:string|null; replied_at:string|null; stopped_at:string|null; stop_reason:string|null };
 
+export type WhatsAppRelation = { id:string; name:string; company?:string; conversationId:string; lastMessageAt?:string; lastMessagePreview?:string; lastMessageDirection?:"inbound"|"outbound" };
+
 function invalid(message:string): never { throw new Error(message); }
 function validateInput(input:CampaignInput) { if (!input.name?.trim()) invalid("Le nom de la campagne est requis."); if (!input.objective || !input.channelType) invalid("L’objectif et le canal sont requis."); }
 function validateSteps(steps:CampaignStepInput[]) { const positions=new Set<number>(); for(const step of steps){ if(!Number.isInteger(step.position)||step.position<0||positions.has(step.position)) invalid("Les étapes doivent avoir des positions uniques."); positions.add(step.position); if(step.delayValue!==undefined&&(!Number.isInteger(step.delayValue)||step.delayValue<0)) invalid("Le délai doit être positif."); } }
@@ -37,6 +39,84 @@ function stepFromRow(row:StepRow):CampaignStepInput { return {id:row.id,position
 function participantFromRow(row:ParticipantRow):CampaignParticipantRecord { return {id:row.id,contactId:row.contact_id,name:row.display_name,...(row.company?{company:row.company}:{}),status:row.status,...(row.current_step_id?{currentStepId:row.current_step_id}:{}),...(row.started_at?{startedAt:row.started_at}:{}),...(row.replied_at?{repliedAt:row.replied_at}:{}),...(row.stopped_at?{stoppedAt:row.stopped_at}:{}),...(row.stop_reason?{stopReason:row.stop_reason}:{})}; }
 async function activity(client:PoolClient, context:WorkspaceContext, campaignId:string, event:string) { return recordActivity(context,{eventType:event,entityType:"campaign",entityId:campaignId,metadata:{campaignId}},client); }
 async function hasCompatibleIdentity(client:PoolClient, workspaceId:string, contactId:string, channel:CampaignChannel) { const result=await client.query<{id:string}>(`select c.id from contacts c join contact_identities ci on ci.contact_id=c.id and ci.workspace_id=c.workspace_id where c.workspace_id=$1 and c.id=$2 and c.archived_at is null and ci.channel_type=$3 limit 1`,[workspaceId,contactId,channel]); return Boolean(result.rows[0]); }
+
+// WhatsApp-specific: an identity alone (see hasCompatibleIdentity above) is
+// not enough — a Contact must ALSO have a real, existing Conversation on
+// this channel (docs spec: "une identité WhatsApp seule ne suffit plus").
+// Both invariants — identity exists, Conversation exists — are expressed as
+// two separate `exists` clauses, deliberately not inferred from one another.
+// Bulk by design: createCampaign/addParticipants can receive dozens of
+// contactIds at once, and checking each one with its own round trip would
+// be exactly the N+1 this must avoid — one query returns the full eligible
+// subset, checked in memory afterward. Its own `exists` clause on
+// contact_identities already re-proves the exact identity requirement
+// hasCompatibleIdentity checks — for WhatsApp this function REPLACES that
+// per-contact call entirely (see the two call sites below), it never runs
+// alongside it. Calling both would silently reintroduce the same N+1 this
+// was built to remove.
+async function eligibleWhatsAppContactIds(client:PoolClient, workspaceId:string, contactIds:string[]): Promise<Set<string>> {
+  if (!contactIds.length) return new Set();
+  const result = await client.query<{id:string}>(
+    `select distinct c.id from contacts c
+     where c.workspace_id=$1 and c.id = any($2::uuid[]) and c.archived_at is null
+       and exists (select 1 from contact_identities ci where ci.workspace_id=c.workspace_id and ci.contact_id=c.id and ci.channel_type='whatsapp')
+       and exists (select 1 from conversations conv where conv.workspace_id=c.workspace_id and conv.contact_id=c.id and conv.channel_type='whatsapp')`,
+    [workspaceId, contactIds],
+  );
+  return new Set(result.rows.map((row) => row.id));
+}
+
+function truncatePreview(body: string | null | undefined, max = 140): string | undefined {
+  const trimmed = body?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
+}
+
+// The WhatsApp campaign audience: one row per Contact that genuinely has
+// both a WhatsApp identity AND an existing WhatsApp Conversation — never a
+// generic Contacts list. The per-contact Conversation picked here is the
+// exact same canonical rule as conversation-resolution.ts's
+// findConversationId (mirrored, not merely similar — see that file's own
+// comment on why it can't be imported here directly without a circular
+// require), so the Conversation shown in the audience is always the one the
+// executor will actually send into. Single query, no N+1: a LATERAL join
+// per Contact picks that Contact's one canonical Conversation, and a second
+// LATERAL picks its one latest non-draft message for the preview — never a
+// separate round trip per Contact, never the full message history.
+export async function listEligibleWhatsAppRelations(context:WorkspaceContext): Promise<WhatsAppRelation[]> {
+  const result = await database.query<{ contact_id:string; display_name:string; company:string|null; conversation_id:string; last_message_at:string|null; last_message_body:string|null; last_message_direction:"inbound"|"outbound"|null }>(
+    `select c.id contact_id, c.display_name, co.name company, v.id conversation_id, v.last_message_at, lm.body last_message_body, lm.direction last_message_direction
+     from contacts c
+     left join companies co on co.id=c.company_id and co.workspace_id=c.workspace_id
+     join lateral (
+       select conv.id, conv.last_message_at
+       from conversations conv
+       where conv.workspace_id=c.workspace_id and conv.contact_id=c.id and conv.channel_type='whatsapp'
+       order by coalesce(conv.last_message_at,conv.created_at) desc, conv.created_at desc, conv.id desc
+       limit 1
+     ) v on true
+     left join lateral (
+       select m.body, m.direction
+       from messages m
+       where m.conversation_id=v.id and m.status<>'draft'
+       order by m.effective_time desc
+       limit 1
+     ) lm on true
+     where c.workspace_id=$1 and c.archived_at is null
+       and exists (select 1 from contact_identities ci where ci.workspace_id=c.workspace_id and ci.contact_id=c.id and ci.channel_type='whatsapp')
+     order by v.last_message_at desc nulls last, c.display_name asc`,
+    [context.workspaceId],
+  );
+  return result.rows.map((row) => ({
+    id: row.contact_id,
+    name: row.display_name,
+    ...(row.company ? { company: row.company } : {}),
+    conversationId: row.conversation_id,
+    ...(row.last_message_at ? { lastMessageAt: row.last_message_at } : {}),
+    ...(truncatePreview(row.last_message_body) ? { lastMessagePreview: truncatePreview(row.last_message_body) } : {}),
+    ...(row.last_message_direction ? { lastMessageDirection: row.last_message_direction } : {}),
+  }));
+}
 async function getCampaignRow(client:PoolClient, workspaceId:string, campaignId:string) { const r=await client.query<CampaignRow>(`select c.id,c.name,c.objective,c.channel_type,c.status,c.settings,c.started_at,c.paused_at,c.completed_at,c.archived_at,c.created_at,c.updated_at,count(p.id) participant_count from campaigns c left join campaign_participants p on p.campaign_id=c.id where c.workspace_id=$1 and c.id=$2 group by c.id`,[workspaceId,campaignId]); return r.rows[0]??null; }
 async function stepsFor(client:PoolClient,campaignId:string) { const r=await client.query<StepRow>(`select id,position,step_type,channel_type,delay_value,delay_unit,message_template from campaign_steps where campaign_id=$1 order by position asc`,[campaignId]); return r.rows.map(stepFromRow); }
 async function participantsFor(client:PoolClient,workspaceId:string,campaignId:string) { const r=await client.query<ParticipantRow>(`select p.id,p.contact_id,c.display_name,co.name company,p.status,p.current_step_id,p.started_at,p.replied_at,p.stopped_at,p.stop_reason from campaign_participants p join contacts c on c.id=p.contact_id and c.workspace_id=$1 left join companies co on co.id=c.company_id and co.workspace_id=c.workspace_id where p.campaign_id=$2 order by c.display_name`,[workspaceId,campaignId]); return r.rows.map(participantFromRow); }
@@ -44,7 +124,7 @@ async function record(client:PoolClient,workspaceId:string,row:CampaignRow):Prom
 
 export async function listCampaigns(context:WorkspaceContext) { const client=await database.connect(); try { const r=await client.query<CampaignRow>(`select c.id,c.name,c.objective,c.channel_type,c.status,c.settings,c.started_at,c.paused_at,c.completed_at,c.archived_at,c.created_at,c.updated_at,count(p.id) participant_count from campaigns c left join campaign_participants p on p.campaign_id=c.id where c.workspace_id=$1 and c.status<>'archived' group by c.id order by c.updated_at desc`,[context.workspaceId]); return Promise.all(r.rows.map(row=>record(client,context.workspaceId,row))); } finally { client.release(); } }
 export async function getCampaign(context:WorkspaceContext,campaignId:string) { const client=await database.connect(); try { const row=await getCampaignRow(client,context.workspaceId,campaignId); return row?record(client,context.workspaceId,row):null; } finally { client.release(); } }
-export async function createCampaign(context:WorkspaceContext,input:CampaignInput) { validateInput(input); const steps=input.steps??[]; validateSteps(steps); const participantIds=[...new Set(input.participantIds??[])]; const client=await database.connect(); try { await client.query("begin"); for(const contactId of participantIds) if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,input.channelType)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal."); const created=await client.query<{id:string}>(`insert into campaigns(workspace_id,name,objective,channel_type,status,created_by_user_id,settings) values($1,$2,$3,$4,'draft',$5,$6) returning id`,[context.workspaceId,input.name.trim(),input.objective,input.channelType,context.userId,{description:input.description?.trim()||undefined,stopOnReply:input.stopOnReply??true}]); const id=created.rows[0]!.id; for(const step of steps) await client.query(`insert into campaign_steps(campaign_id,position,step_type,channel_type,delay_value,delay_unit,message_template) values($1,$2,$3,$4,$5,$6,$7)`,[id,step.position,step.stepType,step.channelType??input.channelType,step.delayValue??0,step.delayUnit??"days",step.messageTemplate?.trim()||null]); for(const contactId of participantIds) await client.query(`insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,'waiting')`,[id,contactId]); const event=await activity(client,context,id,"campaign.created"); const row=await getCampaignRow(client,context.workspaceId,id); const value=await record(client,context.workspaceId,row!); await client.query("commit"); await dispatchCommittedActivity(event); return value; } catch(error) { await client.query("rollback"); throw error; } finally { client.release(); } }
+export async function createCampaign(context:WorkspaceContext,input:CampaignInput) { validateInput(input); const steps=input.steps??[]; validateSteps(steps); const participantIds=[...new Set(input.participantIds??[])]; const client=await database.connect(); try { await client.query("begin"); const eligibleWhatsAppIds = input.channelType==='whatsapp' ? await eligibleWhatsAppContactIds(client,context.workspaceId,participantIds) : null; for(const contactId of participantIds) { if(eligibleWhatsAppIds){ if(!eligibleWhatsAppIds.has(contactId)) invalid("Ce contact n’a pas encore de conversation WhatsApp éligible dans Talvia."); } else if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,input.channelType)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal."); } const created=await client.query<{id:string}>(`insert into campaigns(workspace_id,name,objective,channel_type,status,created_by_user_id,settings) values($1,$2,$3,$4,'draft',$5,$6) returning id`,[context.workspaceId,input.name.trim(),input.objective,input.channelType,context.userId,{description:input.description?.trim()||undefined,stopOnReply:input.stopOnReply??true}]); const id=created.rows[0]!.id; for(const step of steps) await client.query(`insert into campaign_steps(campaign_id,position,step_type,channel_type,delay_value,delay_unit,message_template) values($1,$2,$3,$4,$5,$6,$7)`,[id,step.position,step.stepType,step.channelType??input.channelType,step.delayValue??0,step.delayUnit??"days",step.messageTemplate?.trim()||null]); for(const contactId of participantIds) await client.query(`insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,'waiting')`,[id,contactId]); const event=await activity(client,context,id,"campaign.created"); const row=await getCampaignRow(client,context.workspaceId,id); const value=await record(client,context.workspaceId,row!); await client.query("commit"); await dispatchCommittedActivity(event); return value; } catch(error) { await client.query("rollback"); throw error; } finally { client.release(); } }
 export async function updateCampaign(context:WorkspaceContext,id:string,input:Partial<CampaignInput>) { const client=await database.connect(); try { const existing=await getCampaignRow(client,context.workspaceId,id); if(!existing)return null; if(existing.status!=="draft" && (input.participantIds||input.steps)) invalid("La séquence et l’audience ne peuvent plus être modifiées après activation."); const name=input.name?.trim()||existing.name; const objective=input.objective??existing.objective; const channel=input.channelType??existing.channel_type; await client.query(`update campaigns set name=$1,objective=$2,channel_type=$3,settings=$4,updated_at=now() where workspace_id=$5 and id=$6`,[name,objective,channel,{...existing.settings,description:input.description?.trim()||existing.settings?.description,stopOnReply:input.stopOnReply??existing.settings?.stopOnReply??true},context.workspaceId,id]); await activity(client,context,id,"campaign.updated"); return record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,id))!); } finally { client.release(); } }
 // Wrapped in an explicit transaction (this function previously had none —
 // each client.query call auto-committed on its own) precisely because
@@ -99,8 +179,10 @@ export async function addParticipants(context:WorkspaceContext,campaignId:string
     await client.query("begin");
     const campaign=await getCampaignRow(client,context.workspaceId,campaignId);
     if(!campaign){await client.query("rollback");return null;}
-    for(const contactId of [...new Set(contactIds)]) {
-      if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,campaign.channel_type)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal.");
+    const uniqueContactIds=[...new Set(contactIds)];
+    const eligibleWhatsAppIds = campaign.channel_type==='whatsapp' ? await eligibleWhatsAppContactIds(client,context.workspaceId,uniqueContactIds) : null;
+    for(const contactId of uniqueContactIds) {
+      if(eligibleWhatsAppIds){ if(!eligibleWhatsAppIds.has(contactId)) invalid("Ce contact n’a pas encore de conversation WhatsApp éligible dans Talvia."); } else if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,campaign.channel_type)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal.");
       const inserted=await client.query<{id:string}>(`insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,$3) on conflict(campaign_id,contact_id) do nothing returning id`,[campaignId,contactId,campaign.status==='active'?'active':'waiting']);
       if(inserted.rows[0] && campaign.status==='active') await initializeParticipantStep(context.workspaceId,campaignId,inserted.rows[0].id,client);
     }
