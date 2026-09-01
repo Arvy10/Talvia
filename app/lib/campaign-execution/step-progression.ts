@@ -51,11 +51,25 @@ export type AdvanceResult = {
 // is atomic with the event that caused it — a crash between the two would
 // otherwise leave a participant permanently stuck on invite_accepted_at set
 // but current_step_id never advanced.
-export async function advanceParticipantToNextStep(workspaceId: string, campaignId: string, participantId: string, fromStepId: string, client?: PoolClient): Promise<AdvanceResult> {
+//
+// fromStepId=null means "this participant hasn't executed any step yet" —
+// used by initializeParticipantStep below to start a brand-new participant
+// at the beginning of the sequence. There is no real step to look up a
+// position from in that case, so fromPosition is simply -1: every real step
+// has position>=0 (see the campaign_steps check constraint), so
+// nextStepAfter(campaignId, -1) already resolves to position 0 with no
+// special-casing needed — same query, same terminal/'end' handling, same
+// current_step_id/last_action_at/step_claimed_at stamping as any other
+// advance.
+export async function advanceParticipantToNextStep(workspaceId: string, campaignId: string, participantId: string, fromStepId: string | null, client?: PoolClient): Promise<AdvanceResult> {
   const executor = client ?? database;
-  const current = await executor.query<{ position: number }>(`select position from campaign_steps where campaign_id=$1 and id=$2`, [campaignId, fromStepId]);
-  const fromPosition = current.rows[0]?.position;
-  if (fromPosition === undefined) return { advancedTo: "none", stepId: null, stepType: null };
+  let fromPosition = -1;
+  if (fromStepId !== null) {
+    const current = await executor.query<{ position: number }>(`select position from campaign_steps where campaign_id=$1 and id=$2`, [campaignId, fromStepId]);
+    const position = current.rows[0]?.position;
+    if (position === undefined) return { advancedTo: "none", stepId: null, stepType: null };
+    fromPosition = position;
+  }
 
   const next = await nextStepAfter(campaignId, fromPosition);
   if (!next || next.step_type === "end") {
@@ -75,6 +89,26 @@ export async function advanceParticipantToNextStep(workspaceId: string, campaign
 
   await executor.query(`update campaign_participants set current_step_id=$1,step_claimed_at=null,last_action_at=now(),updated_at=now() where id=$2`, [next.id, participantId]);
   return { advancedTo: "actionable", stepId: next.id, stepType: next.step_type };
+}
+
+// A participant becoming genuinely ACTIVE in a sequential campaign
+// (waiting->active at campaign activation/resume, or inserted directly as
+// active by addParticipants on an already-active campaign) must land on a
+// valid current_step_id pointing at the first step of the sequence — never
+// stay active with current_step_id=NULL, which claimByStepType's own JOIN
+// on campaign_steps can never match. This is a thin, explicitly-named alias
+// over advanceParticipantToNextStep(..., null) — not a second SQL path: the
+// exact same terminal/'end' handling, the exact same
+// current_step_id/last_action_at/step_claimed_at stamping (last_action_at in
+// particular is what lets a WAIT-first sequence become due later, via
+// consumeDueWaitSteps below). Callers MUST only invoke this for a
+// participant whose current_step_id is genuinely still null — calling it on
+// one that has already progressed would silently do nothing useful for a
+// real step (nextStepAfter would still resolve from position -1, i.e. the
+// very first step again) — see campaigns.ts's `current_step_id is null`
+// guard at both call sites for how that's enforced today.
+export async function initializeParticipantStep(workspaceId: string, campaignId: string, participantId: string, client?: PoolClient): Promise<AdvanceResult> {
+  return advanceParticipantToNextStep(workspaceId, campaignId, participantId, null, client);
 }
 
 // --- WAIT steps ---

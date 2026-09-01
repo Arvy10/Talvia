@@ -102,7 +102,7 @@ function createFakeDatabase() {
 let fakeDatabase = createFakeDatabase();
 vi.mock("../database", () => ({ get database() { return fakeDatabase; } }));
 
-const { advanceParticipantToNextStep, consumeDueWaitSteps } = await import("./step-progression");
+const { advanceParticipantToNextStep, consumeDueWaitSteps, initializeParticipantStep } = await import("./step-progression");
 
 beforeEach(() => { fakeDatabase = createFakeDatabase(); });
 
@@ -354,5 +354,84 @@ describe("consumeDueWaitSteps — stale vs fresh claim recovery (Phase 4B §9)",
 
     expect(result).toEqual({ consumed: 0 });
     expect(participant.current_step_id).toBe("camp-1-wait1"); // untouched — still "owned" by the other claim
+  });
+});
+
+// message(0) -> wait 3d(1) -> end(2), reused from seedShortSequenceEndsAfterWait
+// above but this time entered from scratch via initializeParticipantStep —
+// the actual new entry point campaigns.ts calls for a participant that has
+// never executed any step yet.
+describe("initializeParticipantStep — starts a brand-new participant at the beginning of the sequence", () => {
+  it("resolves to the real first step (position 0), not a hardcoded id, for an ordinary message-first sequence", async () => {
+    seedSequence("camp-1");
+    fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-1", status: "active", current_step_id: null, step_claimed_at: null, last_action_at: null });
+
+    const result = await initializeParticipantStep(workspaceId, "camp-1", "part-1");
+
+    expect(result).toMatchObject({ advancedTo: "actionable", stepId: "camp-1-invite", stepType: "invite" });
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.id === "part-1")!;
+    expect(participant.current_step_id).toBe("camp-1-invite");
+  });
+
+  it("WAIT-first: current_step_id lands on the WAIT step itself, with last_action_at stamped so consumeDueWaitSteps can later determine it's due", async () => {
+    // wait 3d(0) -> message(1) -> end(2) — a genuinely WAIT-first sequence,
+    // distinct from seedShortSequenceEndsAfterWait's message-then-wait shape.
+    fakeDatabase.campaigns.push({ id: "camp-2", workspace_id: workspaceId, status: "active" });
+    fakeDatabase.campaignSteps.push({ id: "camp-2-wait", campaign_id: "camp-2", position: 0, step_type: "wait", delay_value: 3, delay_unit: "days", message_template: null });
+    fakeDatabase.campaignSteps.push({ id: "camp-2-msg", campaign_id: "camp-2", position: 1, step_type: "message", message_template: "Bonjour !" });
+    fakeDatabase.campaignSteps.push({ id: "camp-2-end", campaign_id: "camp-2", position: 2, step_type: "end", message_template: null });
+    fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-2", contact_id: "contact-1", status: "active", current_step_id: null, step_claimed_at: null, last_action_at: null });
+
+    const before = Date.now();
+    const result = await initializeParticipantStep(workspaceId, "camp-2", "part-1");
+
+    expect(result).toMatchObject({ advancedTo: "actionable", stepId: "camp-2-wait", stepType: "wait" });
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.id === "part-1")!;
+    expect(participant.current_step_id).toBe("camp-2-wait");
+    expect(participant.last_action_at).not.toBeNull();
+    expect(new Date(participant.last_action_at as string).getTime()).toBeGreaterThanOrEqual(before);
+
+    // Not due yet — untouched by a fresh consumeDueWaitSteps call.
+    const tooSoon = await consumeDueWaitSteps(workspaceId, "camp-2");
+    expect(tooSoon).toEqual({ consumed: 0 });
+    expect(fakeDatabase.campaignParticipants.find((p) => p.id === "part-1")!.current_step_id).toBe("camp-2-wait");
+
+    // Backdate last_action_at past the WAIT's own delay — now genuinely due,
+    // and progresses exactly like any other WAIT: onto the next real step.
+    participant.last_action_at = ago(3 * DAY + 60_000);
+    const due = await consumeDueWaitSteps(workspaceId, "camp-2");
+    expect(due).toEqual({ consumed: 1 });
+    expect(fakeDatabase.campaignParticipants.find((p) => p.id === "part-1")!.current_step_id).toBe("camp-2-msg");
+    expect(fakeDatabase.campaignParticipants.find((p) => p.id === "part-1")!.status).toBe("active");
+  });
+
+  it("zero steps configured: the participant is completed directly, never left active with current_step_id=NULL", async () => {
+    fakeDatabase.campaigns.push({ id: "camp-empty", workspace_id: workspaceId, status: "active" });
+    fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-empty", contact_id: "contact-1", status: "active", current_step_id: null, step_claimed_at: null, last_action_at: null });
+
+    const result = await initializeParticipantStep(workspaceId, "camp-empty", "part-1");
+
+    expect(result).toMatchObject({ advancedTo: "end", stepId: null, stepType: "end" });
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.id === "part-1")!;
+    expect(participant.status).toBe("completed");
+    // current_step_id legitimately stays null here (no step exists at all
+    // to point to) — but the participant is 'completed', not 'active', so
+    // claimByStepType's own `status='active'` filter already excludes it.
+    // "Active with a null current_step_id" is the state that must never be
+    // observable, and it isn't.
+    expect(participant.status).not.toBe("active");
+  });
+
+  it("an 'end'-only sequence (no real actionable step at all) also completes directly, current_step_id pointing at the end step", async () => {
+    fakeDatabase.campaigns.push({ id: "camp-end-only", workspace_id: workspaceId, status: "active" });
+    fakeDatabase.campaignSteps.push({ id: "camp-end-only-end", campaign_id: "camp-end-only", position: 0, step_type: "end", message_template: null });
+    fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-end-only", contact_id: "contact-1", status: "active", current_step_id: null, step_claimed_at: null, last_action_at: null });
+
+    const result = await initializeParticipantStep(workspaceId, "camp-end-only", "part-1");
+
+    expect(result).toMatchObject({ advancedTo: "end", stepId: "camp-end-only-end", stepType: "end" });
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.id === "part-1")!;
+    expect(participant.current_step_id).toBe("camp-end-only-end");
+    expect(participant.status).toBe("completed");
   });
 });
