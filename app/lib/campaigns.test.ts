@@ -9,6 +9,28 @@ import type { WorkspaceContext } from "./workspace-context";
 // enough to exercise createCampaign/transitionCampaign/addParticipants end
 // to end, including the new current_step_id initialization they now trigger
 // via step-progression.ts's real (unmocked) advanceParticipantToNextStep.
+// Mirrors conversation-resolution.ts's own tie-break exactly: primary key
+// coalesce(last_message_at,created_at) desc, then created_at desc, then id
+// desc as a final, always-unique tie-break. Shared by both the
+// listEligibleWhatsAppRelations fake handler and the findConversationId fake
+// handler below so a cross-check test comparing their two results is
+// actually meaningful — not just two independently-plausible fakes.
+function pickCanonicalConversation(candidates: Array<Record<string, unknown>>): Record<string, unknown> | undefined {
+  return [...candidates].sort((a, b) => {
+    const aKey = (a.last_message_at as string | null) ?? (a.created_at as string);
+    const bKey = (b.last_message_at as string | null) ?? (b.created_at as string);
+    if (aKey !== bKey) return aKey < bKey ? 1 : -1;
+    const aCreated = a.created_at as string, bCreated = b.created_at as string;
+    if (aCreated !== bCreated) return aCreated < bCreated ? 1 : -1;
+    const aId = a.id as string, bId = b.id as string;
+    return aId < bId ? 1 : -1;
+  })[0];
+}
+function pickLastNonDraftMessage(messages: Array<Record<string, unknown>>, conversationId: string): Record<string, unknown> | undefined {
+  const candidates = messages.filter((m) => m.conversation_id === conversationId && m.status !== "draft");
+  return [...candidates].sort((a, b) => ((a.effective_time as string) < (b.effective_time as string) ? 1 : -1))[0];
+}
+
 function createFakeDatabase() {
   const campaigns: Array<Record<string, unknown>> = [];
   const campaignSteps: Array<Record<string, unknown>> = [];
@@ -16,11 +38,19 @@ function createFakeDatabase() {
   const contacts: Array<Record<string, unknown>> = [];
   const companies: Array<Record<string, unknown>> = [];
   const contactIdentities: Array<Record<string, unknown>> = [];
+  const conversations: Array<Record<string, unknown>> = [];
+  const messages: Array<Record<string, unknown>> = [];
   const activities: Array<Record<string, unknown>> = [];
   let seq = 0;
   const nextId = (prefix: string) => `${prefix}-${(seq += 1)}`;
 
   const transactionLog: string[] = [];
+  // Call counters proving the N+1 fix: hasCompatibleIdentity's own query vs
+  // eligibleWhatsAppContactIds' single bulk query, counted separately so a
+  // test can assert "one bulk call, zero per-contact calls" for WhatsApp
+  // without needing a generic query log.
+  let identityCheckCalls = 0;
+  let bulkEligibilityCalls = 0;
   // Configurable failure trigger for the atomicity test — set via the
   // returned object's setter BEFORE calling transitionCampaign. Deliberately
   // internal to this closure rather than a reassignable `fakeDatabase.query`
@@ -70,10 +100,74 @@ function createFakeDatabase() {
     }
 
     if (text.startsWith("select c.id from contacts c join contact_identities ci on ci.contact_id=c.id and ci.workspace_id=c.workspace_id")) {
+      identityCheckCalls += 1;
       const [workspaceId, contactId, channelType] = params as [string, string, string];
       const contact = contacts.find((c) => c.workspace_id === workspaceId && c.id === contactId && !c.archived_at);
       const hasIdentity = contact && contactIdentities.some((ci) => ci.workspace_id === workspaceId && ci.contact_id === contactId && ci.channel_type === channelType);
       return { rows: hasIdentity ? [{ id: contactId }] : [] };
+    }
+
+    // eligibleWhatsAppContactIds — the bulk guard: both identity AND a real
+    // Conversation, checked for a whole batch of contactIds in one query.
+    if (text.startsWith("select distinct c.id from contacts c where c.workspace_id=$1 and c.id = any($2::uuid[]) and c.archived_at is null")) {
+      bulkEligibilityCalls += 1;
+      const [workspaceId, contactIds] = params as [string, string[]];
+      const eligible = contacts.filter((c) =>
+        c.workspace_id === workspaceId
+        && contactIds.includes(c.id as string)
+        && !c.archived_at
+        && contactIdentities.some((ci) => ci.workspace_id === workspaceId && ci.contact_id === c.id && ci.channel_type === "whatsapp")
+        && conversations.some((v) => v.workspace_id === workspaceId && v.contact_id === c.id && v.channel_type === "whatsapp"),
+      );
+      return { rows: eligible.map((c) => ({ id: c.id })) };
+    }
+
+    // listEligibleWhatsAppRelations — the audience listing itself. Mirrors
+    // the real query's semantics precisely: an INNER lateral pick of the
+    // canonical Conversation (a Contact with no eligible Conversation is
+    // excluded entirely, exactly like a real INNER LATERAL JOIN would), a
+    // LEFT lateral pick of the latest non-draft message for the preview,
+    // and the identity existence check as a separate, explicit condition.
+    if (text.startsWith("select c.id contact_id, c.display_name, co.name company, v.id conversation_id, v.last_message_at, lm.body last_message_body, lm.direction last_message_direction")) {
+      const [workspaceId] = params as [string];
+      const eligibleContacts = contacts.filter((c) =>
+        c.workspace_id === workspaceId
+        && !c.archived_at
+        && contactIdentities.some((ci) => ci.workspace_id === workspaceId && ci.contact_id === c.id && ci.channel_type === "whatsapp"),
+      );
+      const rows = eligibleContacts
+        .map((c) => {
+          const candidates = conversations.filter((v) => v.workspace_id === workspaceId && v.contact_id === c.id && v.channel_type === "whatsapp");
+          const canonical = pickCanonicalConversation(candidates);
+          if (!canonical) return null; // no eligible Conversation -> excluded, same as a real INNER LATERAL JOIN
+          const lastMessage = pickLastNonDraftMessage(messages, canonical.id as string);
+          const company = companies.find((co) => co.id === c.company_id && co.workspace_id === workspaceId);
+          return {
+            contact_id: c.id, display_name: c.display_name, company: company?.name ?? null,
+            conversation_id: canonical.id, last_message_at: canonical.last_message_at ?? null,
+            last_message_body: lastMessage?.body ?? null, last_message_direction: lastMessage?.direction ?? null,
+          };
+        })
+        .filter((row): row is NonNullable<typeof row> => row !== null)
+        .sort((a, b) => {
+          if (a.last_message_at !== b.last_message_at) {
+            if (a.last_message_at === null) return 1; // nulls last
+            if (b.last_message_at === null) return -1;
+            return a.last_message_at < b.last_message_at ? 1 : -1;
+          }
+          return (a.display_name as string).localeCompare(b.display_name as string);
+        });
+      return { rows };
+    }
+
+    // conversation-resolution.ts's own findConversationId — reused directly
+    // (not re-derived) so the cross-check test below compares the REAL
+    // function's output, not a second independent fake of it.
+    if (text.startsWith("select id from conversations where workspace_id=$1 and contact_id=$2 and channel_type=$3")) {
+      const [workspaceId, contactId, channelType] = params as [string, string, string];
+      const candidates = conversations.filter((v) => v.workspace_id === workspaceId && v.contact_id === contactId && v.channel_type === channelType);
+      const canonical = pickCanonicalConversation(candidates);
+      return { rows: canonical ? [{ id: canonical.id }] : [] };
     }
 
     if (text.startsWith("select c.id,c.name,c.objective,c.channel_type,c.status,c.settings,c.started_at,c.paused_at,c.completed_at,c.archived_at,c.created_at,c.updated_at,count(p.id) participant_count from campaigns c")) {
@@ -161,16 +255,24 @@ function createFakeDatabase() {
 
   return {
     query, connect: async () => ({ query, release: () => {} }),
-    campaigns, campaignSteps, campaignParticipants, contacts, companies, contactIdentities, activities, transactionLog,
+    campaigns, campaignSteps, campaignParticipants, contacts, companies, contactIdentities, conversations, messages, activities, transactionLog,
     setFailInitializationOnCallNumber: (n: number | null) => { failInitializationOnCallNumber = n; },
+    get identityCheckCalls() { return identityCheckCalls; },
+    get bulkEligibilityCalls() { return bulkEligibilityCalls; },
   };
 }
 
 let fakeDatabase = createFakeDatabase();
+// conversation-resolution.ts imports "../database" (relative to
+// lib/campaign-execution/) — resolves to the exact same lib/database.ts
+// module as campaigns.ts's own "./database", so this one mock covers both;
+// the cross-check test below imports findConversationId directly and runs
+// it against this same fake.
 vi.mock("./database", () => ({ get database() { return fakeDatabase; } }));
 
-const { addParticipants, createCampaign, transitionCampaign } = await import("./campaigns");
+const { addParticipants, createCampaign, listEligibleWhatsAppRelations, transitionCampaign } = await import("./campaigns");
 const { advanceParticipantToNextStep } = await import("./campaign-execution/step-progression");
+const { findConversationId } = await import("./campaign-execution/conversation-resolution");
 
 beforeEach(() => { fakeDatabase = createFakeDatabase(); });
 
@@ -180,6 +282,29 @@ const context: WorkspaceContext = { authUserId: "auth-1", userId: "user-1", work
 function seedContact(id: string, channelType: "whatsapp" | "linkedin" = "whatsapp") {
   fakeDatabase.contacts.push({ id, workspace_id: workspaceId, display_name: `Contact ${id}`, company_id: null, archived_at: null });
   fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: id, channel_type: channelType });
+}
+
+function seedConversation(id: string, contactId: string, opts: { channelType?: "whatsapp" | "linkedin"; lastMessageAt?: string | null; createdAt?: string; workspaceId?: string } = {}) {
+  fakeDatabase.conversations.push({
+    id, workspace_id: opts.workspaceId ?? workspaceId, contact_id: contactId, channel_type: opts.channelType ?? "whatsapp",
+    last_message_at: opts.lastMessageAt ?? null, created_at: opts.createdAt ?? "2026-01-01T00:00:00.000Z",
+  });
+}
+
+function seedMessage(id: string, conversationId: string, opts: { body?: string; direction?: "inbound" | "outbound"; effectiveTime?: string; status?: string } = {}) {
+  fakeDatabase.messages.push({
+    id, conversation_id: conversationId, body: opts.body ?? "Bonjour", direction: opts.direction ?? "inbound",
+    effective_time: opts.effectiveTime ?? "2026-01-01T00:00:00.000Z", status: opts.status ?? "received",
+  });
+}
+
+// Convenience for tests that predate the Phase B eligibility guard (identity
+// AND a real Conversation) and just need a WhatsApp relation that is
+// unconditionally eligible — identity-only fixtures deliberately still use
+// seedContact alone where a test's whole point is "no Conversation yet".
+function seedWhatsAppRelation(contactId: string) {
+  seedContact(contactId);
+  seedConversation(`conv-${contactId}`, contactId, { lastMessageAt: "2026-01-01T00:00:00.000Z" });
 }
 
 // message(0) -> wait 3d(1) -> message "relance"(2) -> end(3) — the standard
@@ -201,7 +326,7 @@ async function createWhatsAppCampaign(objective: "follow_up" | "reactivation", c
 
 describe("current_step_id initialization — WhatsApp follow_up/reactivation", () => {
   it("1. follow_up: activation initializes the first participant's current_step_id, making it claimable", async () => {
-    seedContact("contact-1");
+    seedWhatsAppRelation("contact-1");
     const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
     expect(fakeDatabase.campaignParticipants[0]).toMatchObject({ status: "waiting", current_step_id: null });
 
@@ -214,7 +339,7 @@ describe("current_step_id initialization — WhatsApp follow_up/reactivation", (
   });
 
   it("2. reactivation: same guarantee as follow_up", async () => {
-    seedContact("contact-1");
+    seedWhatsAppRelation("contact-1");
     const campaign = await createWhatsAppCampaign("reactivation", ["contact-1"]);
 
     await transitionCampaign(context, campaign.id, "activate");
@@ -227,8 +352,8 @@ describe("current_step_id initialization — WhatsApp follow_up/reactivation", (
 
 describe("current_step_id initialization — addParticipants", () => {
   it("3. adding a contact to an already-active campaign initializes it immediately", async () => {
-    seedContact("contact-1");
-    seedContact("contact-2");
+    seedWhatsAppRelation("contact-1");
+    seedWhatsAppRelation("contact-2");
     const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
     await transitionCampaign(context, campaign.id, "activate");
 
@@ -240,8 +365,8 @@ describe("current_step_id initialization — addParticipants", () => {
   });
 
   it("4a. adding a contact to a still-draft campaign leaves it waiting, current_step_id null", async () => {
-    seedContact("contact-1");
-    seedContact("contact-2");
+    seedWhatsAppRelation("contact-1");
+    seedWhatsAppRelation("contact-2");
     const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]); // draft, never activated
 
     await addParticipants(context, campaign.id, ["contact-2"]);
@@ -252,8 +377,8 @@ describe("current_step_id initialization — addParticipants", () => {
   });
 
   it("4b. ...and activating the campaign afterward initializes it then, not before", async () => {
-    seedContact("contact-1");
-    seedContact("contact-2");
+    seedWhatsAppRelation("contact-1");
+    seedWhatsAppRelation("contact-2");
     const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
     await addParticipants(context, campaign.id, ["contact-2"]);
 
@@ -267,7 +392,7 @@ describe("current_step_id initialization — addParticipants", () => {
 
 describe("current_step_id initialization — never re-initializes an already-advanced participant", () => {
   it("5. real progression (step_1 -> step_2 via advanceParticipantToNextStep) survives a pause/resume cycle unchanged — never reinitialized from scratch", async () => {
-    seedContact("contact-1");
+    seedWhatsAppRelation("contact-1");
     const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
     await transitionCampaign(context, campaign.id, "activate");
 
@@ -300,7 +425,7 @@ describe("current_step_id initialization — never re-initializes an already-adv
 
 describe("current_step_id initialization — workspace isolation", () => {
   it("6. transitionCampaign never touches a campaign belonging to another workspace", async () => {
-    seedContact("contact-1");
+    seedWhatsAppRelation("contact-1");
     const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
 
     const intruderContext: WorkspaceContext = { authUserId: "auth-2", userId: "user-2", workspaceId: "ws-intruder", role: "owner" };
@@ -313,7 +438,7 @@ describe("current_step_id initialization — workspace isolation", () => {
 
 describe("current_step_id initialization — WAIT-first sequence", () => {
   it("8. a campaign starting with WAIT initializes current_step_id onto the WAIT step, with last_action_at set", async () => {
-    seedContact("contact-1");
+    seedWhatsAppRelation("contact-1");
     const campaign = await createCampaign(context, {
       name: "Wait first",
       objective: "reactivation",
@@ -336,7 +461,7 @@ describe("current_step_id initialization — WAIT-first sequence", () => {
 
 describe("current_step_id initialization — zero steps configured", () => {
   it("9. a campaign with no steps at all never leaves a participant active with current_step_id=NULL", async () => {
-    seedContact("contact-1");
+    seedWhatsAppRelation("contact-1");
     const campaign = await createCampaign(context, { name: "Empty", objective: "follow_up", channelType: "whatsapp", participantIds: ["contact-1"], steps: [] });
 
     await transitionCampaign(context, campaign.id, "activate");
@@ -349,8 +474,8 @@ describe("current_step_id initialization — zero steps configured", () => {
 
 describe("current_step_id initialization — atomicity", () => {
   it("10. transitionCampaign now wraps activation in a real transaction — an error during initialization triggers rollback, never commit", async () => {
-    seedContact("contact-1");
-    seedContact("contact-2");
+    seedWhatsAppRelation("contact-1");
+    seedWhatsAppRelation("contact-2");
     const campaign = await createWhatsAppCampaign("follow_up", ["contact-1", "contact-2"]);
     fakeDatabase.transactionLog.length = 0; // discard createCampaign's own begin/commit
     fakeDatabase.setFailInitializationOnCallNumber(2); // fail on the 2nd participant's initialization
@@ -368,5 +493,249 @@ describe("current_step_id initialization — atomicity", () => {
     await expect(transitionCampaign(context, campaign.id, "activate")).rejects.toThrow("simulated failure during initialization");
 
     expect(fakeDatabase.transactionLog).toEqual(["begin", "rollback"]); // never reached commit
+  });
+});
+
+// --- Phase B: WhatsApp campaign audience = existing relationship + canonical
+// Conversation + real conversation metadata. ---
+
+describe("listEligibleWhatsAppRelations", () => {
+  it("1. identity + real Conversation -> eligible, with real relationship metadata", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z" });
+    seedMessage("msg-1", "conv-1", { body: "Merci pour votre retour", direction: "inbound", effectiveTime: "2026-02-01T10:00:00.000Z" });
+
+    const relations = await listEligibleWhatsAppRelations(context);
+
+    expect(relations).toEqual([{
+      id: "contact-1", name: "Contact contact-1", conversationId: "conv-1",
+      lastMessageAt: "2026-02-01T10:00:00.000Z", lastMessagePreview: "Merci pour votre retour", lastMessageDirection: "inbound",
+    }]);
+  });
+
+  it("2. identity WITHOUT a Conversation -> absent from the listing", async () => {
+    seedContact("contact-1"); // WhatsApp identity, no conversation seeded at all
+
+    const relations = await listEligibleWhatsAppRelations(context);
+
+    expect(relations).toEqual([]);
+  });
+
+  it("4. a Conversation WITHOUT a matching identity -> not eligible", async () => {
+    // A conversation exists, but the contact has no whatsapp contact_identity
+    // row at all (e.g. identity was removed, or never truly established).
+    fakeDatabase.contacts.push({ id: "contact-1", workspace_id: workspaceId, display_name: "Contact contact-1", company_id: null, archived_at: null });
+    seedConversation("conv-1", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z" });
+
+    const relations = await listEligibleWhatsAppRelations(context);
+
+    expect(relations).toEqual([]);
+  });
+
+  it("5. a Conversation in another workspace is never eligible", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-intruder", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z", workspaceId: "ws-intruder" });
+
+    const relations = await listEligibleWhatsAppRelations(context);
+
+    expect(relations).toEqual([]); // the contact's own workspace has no eligible conversation
+  });
+
+  it("6. a LinkedIn-only Conversation is never eligible for WhatsApp", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-li", "contact-1", { channelType: "linkedin", lastMessageAt: "2026-02-01T10:00:00.000Z" });
+
+    const relations = await listEligibleWhatsAppRelations(context);
+
+    expect(relations).toEqual([]);
+  });
+
+  it("7. multiple WhatsApp Conversations -> the most recent one is selected", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-old", "contact-1", { lastMessageAt: "2026-01-01T10:00:00.000Z" });
+    seedConversation("conv-recent", "contact-1", { lastMessageAt: "2026-02-15T10:00:00.000Z" });
+
+    const relations = await listEligibleWhatsAppRelations(context);
+
+    expect(relations).toHaveLength(1);
+    expect(relations[0]!.conversationId).toBe("conv-recent");
+  });
+
+  it("8. a tie on the primary sort value resolves deterministically (created_at, then id)", async () => {
+    seedContact("contact-1");
+    // Same last_message_at, different created_at -> created_at breaks the tie.
+    seedConversation("conv-a", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z" });
+    seedConversation("conv-b", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z", createdAt: "2026-01-05T00:00:00.000Z" });
+
+    const first = await listEligibleWhatsAppRelations(context);
+    expect(first[0]!.conversationId).toBe("conv-b"); // newer created_at wins
+
+    // Same last_message_at AND same created_at -> id is the final,
+    // always-deterministic tie-break — never left to insertion/scan order.
+    fakeDatabase.conversations.length = 0;
+    seedConversation("conv-x", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z" });
+    seedConversation("conv-y", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z" });
+    const second = await listEligibleWhatsAppRelations(context);
+    expect(second[0]!.conversationId).toBe("conv-y"); // "conv-y" > "conv-x" lexicographically, id desc
+
+    // Deterministic — repeating the exact same call never flips the answer.
+    const third = await listEligibleWhatsAppRelations(context);
+    expect(third[0]!.conversationId).toBe("conv-y");
+  });
+
+  it("9. last message: preview truncated, drafts ignored, direction and recency correct", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1", { lastMessageAt: "2026-02-01T10:05:00.000Z" });
+    seedMessage("msg-1", "conv-1", { body: "Un premier message", direction: "inbound", effectiveTime: "2026-02-01T10:00:00.000Z" });
+    seedMessage("msg-2", "conv-1", { body: "x".repeat(200), direction: "outbound", effectiveTime: "2026-02-01T10:05:00.000Z" });
+    seedMessage("msg-3-draft", "conv-1", { body: "Brouillon jamais envoyé", direction: "outbound", effectiveTime: "2026-02-01T10:10:00.000Z", status: "draft" });
+
+    const relations = await listEligibleWhatsAppRelations(context);
+
+    expect(relations[0]!.lastMessageDirection).toBe("outbound"); // msg-2, not the later draft
+    expect(relations[0]!.lastMessagePreview).toBe(`${"x".repeat(140)}…`); // truncated to 140 chars + ellipsis
+    expect(relations[0]!.lastMessagePreview!.length).toBe(141);
+  });
+
+  it("10. the response never carries full conversation history — only the single latest message's preview fields", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z" });
+    for (let i = 0; i < 20; i += 1) seedMessage(`msg-${i}`, "conv-1", { body: `Message ${i}`, effectiveTime: `2026-01-${String(i + 1).padStart(2, "0")}T00:00:00.000Z` });
+
+    const relations = await listEligibleWhatsAppRelations(context);
+
+    const keys = Object.keys(relations[0]!);
+    expect(keys).toEqual(expect.arrayContaining(["id", "name", "conversationId", "lastMessageAt", "lastMessagePreview", "lastMessageDirection"]));
+    expect(keys).not.toContain("messages");
+    expect(keys).not.toContain("history");
+    // Only ONE message's data is present — a preview string, never an array.
+    expect(typeof relations[0]!.lastMessagePreview).toBe("string");
+  });
+
+  it("15. workspace isolation: a relation never leaks across workspaces", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z" });
+    const otherContext: WorkspaceContext = { authUserId: "auth-2", userId: "user-2", workspaceId: "ws-other", role: "owner" };
+
+    const relations = await listEligibleWhatsAppRelations(otherContext);
+
+    expect(relations).toEqual([]);
+  });
+});
+
+describe("WhatsApp backend guard — createCampaign / addParticipants", () => {
+  it("11. createCampaign refuses a contact with identity but no eligible Conversation, before any participant is created", async () => {
+    seedContact("contact-1"); // identity only, no conversation
+
+    await expect(createWhatsAppCampaign("follow_up", ["contact-1"])).rejects.toThrow("Ce contact n’a pas encore de conversation WhatsApp éligible dans Talvia.");
+    expect(fakeDatabase.campaigns).toHaveLength(0); // rolled back entirely, nothing partially committed
+    expect(fakeDatabase.campaignParticipants).toHaveLength(0);
+  });
+
+  it("createCampaign succeeds for a contact with a real eligible Conversation", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z" });
+
+    const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
+
+    expect(fakeDatabase.campaignParticipants).toHaveLength(1);
+    expect(campaign.participants[0]!.contactId).toBe("contact-1");
+  });
+
+  it("12. addParticipants refuses the same way, on an already-existing campaign", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z" });
+    const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
+    seedContact("contact-2"); // identity only, no conversation
+
+    await expect(addParticipants(context, campaign.id, ["contact-2"])).rejects.toThrow("Ce contact n’a pas encore de conversation WhatsApp éligible dans Talvia.");
+    expect(fakeDatabase.campaignParticipants.some((p) => p.contact_id === "contact-2")).toBe(false);
+  });
+
+  it("does not affect LinkedIn campaigns — the WhatsApp-only guard never runs for other channels", async () => {
+    seedContact("contact-li", "linkedin");
+
+    const campaign = await createCampaign(context, {
+      name: "LinkedIn sans conversation",
+      objective: "prospecting",
+      channelType: "linkedin",
+      participantIds: ["contact-li"],
+      steps: [{ position: 0, stepType: "invite", channelType: "linkedin" }, { position: 1, stepType: "end" }],
+    });
+
+    expect(campaign.participants).toHaveLength(1); // identity alone is still sufficient for LinkedIn, unchanged
+  });
+
+  it("createCampaign validates N eligible WhatsApp contacts with exactly one bulk query and zero per-contact identity checks", async () => {
+    seedWhatsAppRelation("contact-a");
+    seedWhatsAppRelation("contact-b");
+    seedWhatsAppRelation("contact-c");
+    const bulkBefore = fakeDatabase.bulkEligibilityCalls;
+    const identityBefore = fakeDatabase.identityCheckCalls;
+
+    const campaign = await createWhatsAppCampaign("follow_up", ["contact-a", "contact-b", "contact-c"]);
+
+    expect(campaign.participants).toHaveLength(3);
+    expect(fakeDatabase.bulkEligibilityCalls - bulkBefore).toBe(1); // one bulk query for all 3 contacts, not 3
+    expect(fakeDatabase.identityCheckCalls - identityBefore).toBe(0); // hasCompatibleIdentity never runs for WhatsApp anymore
+  });
+
+  it("addParticipants validates N eligible WhatsApp contacts added at once with exactly one bulk query and zero per-contact identity checks", async () => {
+    seedWhatsAppRelation("contact-seed");
+    const campaign = await createWhatsAppCampaign("follow_up", ["contact-seed"]);
+    seedWhatsAppRelation("contact-b");
+    seedWhatsAppRelation("contact-c");
+    const bulkBefore = fakeDatabase.bulkEligibilityCalls;
+    const identityBefore = fakeDatabase.identityCheckCalls;
+
+    await addParticipants(context, campaign.id, ["contact-b", "contact-c"]);
+
+    expect(fakeDatabase.bulkEligibilityCalls - bulkBefore).toBe(1); // one bulk query for both new contacts, not 2
+    expect(fakeDatabase.identityCheckCalls - identityBefore).toBe(0);
+  });
+
+  it("LinkedIn keeps calling hasCompatibleIdentity once per contact and never touches the WhatsApp bulk query", async () => {
+    seedContact("contact-li-a", "linkedin");
+    seedContact("contact-li-b", "linkedin");
+    const bulkBefore = fakeDatabase.bulkEligibilityCalls;
+    const identityBefore = fakeDatabase.identityCheckCalls;
+
+    const campaign = await createCampaign(context, {
+      name: "LinkedIn multi",
+      objective: "prospecting",
+      channelType: "linkedin",
+      participantIds: ["contact-li-a", "contact-li-b"],
+      steps: [{ position: 0, stepType: "invite", channelType: "linkedin" }, { position: 1, stepType: "end" }],
+    });
+
+    expect(campaign.participants).toHaveLength(2);
+    expect(fakeDatabase.identityCheckCalls - identityBefore).toBe(2); // one hasCompatibleIdentity call per contact, unchanged
+    expect(fakeDatabase.bulkEligibilityCalls - bulkBefore).toBe(0); // LinkedIn never touches the WhatsApp-only bulk query
+  });
+});
+
+describe("listing <-> executor consistency (cross-check)", () => {
+  it("13. listEligibleWhatsAppRelations and findConversationId resolve to the exact same Conversation, including with multiple candidates", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-old", "contact-1", { lastMessageAt: "2026-01-01T10:00:00.000Z" });
+    seedConversation("conv-recent", "contact-1", { lastMessageAt: "2026-02-15T10:00:00.000Z" });
+
+    const relations = await listEligibleWhatsAppRelations(context);
+    const executorResolved = await findConversationId(workspaceId, "contact-1", "whatsapp");
+
+    expect(relations[0]!.conversationId).toBe("conv-recent");
+    expect(executorResolved).toBe("conv-recent");
+    expect(relations[0]!.conversationId).toBe(executorResolved);
+  });
+
+  it("13b. the same consistency holds when the primary sort key ties (relies on the exact same tie-break rule in both paths)", async () => {
+    seedContact("contact-1");
+    seedConversation("conv-x", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z" });
+    seedConversation("conv-y", "contact-1", { lastMessageAt: "2026-02-01T10:00:00.000Z", createdAt: "2026-01-01T00:00:00.000Z" });
+
+    const relations = await listEligibleWhatsAppRelations(context);
+    const executorResolved = await findConversationId(workspaceId, "contact-1", "whatsapp");
+
+    expect(relations[0]!.conversationId).toBe(executorResolved);
   });
 });

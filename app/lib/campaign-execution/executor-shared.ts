@@ -4,6 +4,7 @@ import { getParticipantPersonalization } from "../campaign-personalization";
 import { sendMessage } from "../providers/unipile-adapter";
 import type { CampaignChannel } from "../campaigns";
 import type { WorkspaceContext } from "../workspace-context";
+import { findConversationId } from "./conversation-resolution";
 import type { ReasonCode } from "./reason-codes";
 import { advanceParticipantToNextStep, loadCampaignStep } from "./step-progression";
 import type { EngineRunSummary } from "./types";
@@ -98,19 +99,6 @@ export async function checkParticipantStillActive(participantId: string, expecte
   if (row.current_step_id !== expectedStepId) return "NOT_ELIGIBLE";
   if (row.status !== "active") return "PARTICIPANT_REPLIED";
   return null;
-}
-
-// Generalized over channel_type (was LinkedIn-only): a WhatsApp participant
-// must never be able to pick up a LinkedIn conversation for the same
-// Contact, or vice versa — the channel_type filter here is the only thing
-// standing between the two, so it is never optional and always paired with
-// workspace_id.
-export async function findConversationId(workspaceId: string, contactId: string, channelType: CampaignChannel): Promise<string | null> {
-  const result = await database.query<{ id: string }>(
-    `select id from conversations where workspace_id=$1 and contact_id=$2 and channel_type=$3 order by coalesce(last_message_at,created_at) desc limit 1`,
-    [workspaceId, contactId, channelType],
-  );
-  return result.rows[0]?.id ?? null;
 }
 
 export type StepOutcome = { result: "sent" | "failed"; reason?: ReasonCode };
