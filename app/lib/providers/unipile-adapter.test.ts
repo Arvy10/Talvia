@@ -346,10 +346,21 @@ function createFakeDatabase() {
       for (const p of matches) p.invite_accepted_at = new Date().toISOString();
       return { rows: matches.map((p) => ({ id: p.id, campaign_id: p.campaign_id, current_step_id: p.current_step_id })) };
     }
-    if (text.startsWith("update campaign_participants set status='replied'")) {
-      const [contactId, workspaceId, excludeIds] = params as [string, string, string[]];
-      const campaignIds = new Set(campaigns.filter((c) => c.workspace_id === workspaceId).map((c) => c.id));
-      const matches = campaignParticipants.filter((p) => p.contact_id === contactId && (p.status === "active" || p.status === "completed") && p.invite_accepted_at && !p.replied_at && campaignIds.has(p.campaign_id) && !excludeIds.includes(p.id as string));
+    // Channel-scoped reply-stop: only campaigns whose channel_type matches
+    // the channel the reply actually arrived on; invite_accepted_at is only
+    // required inside the LinkedIn branch (meaningless for WhatsApp, which
+    // has no invite/accept concept — see the real query's own comment).
+    if (text.startsWith("update campaign_participants p set status='replied'")) {
+      const [contactId, workspaceId, channelType, excludeIds] = params as [string, string, string, string[]];
+      const campaignIds = new Set(campaigns.filter((c) => c.workspace_id === workspaceId && c.channel_type === channelType).map((c) => c.id));
+      const matches = campaignParticipants.filter((p) =>
+        p.contact_id === contactId
+        && (p.status === "active" || p.status === "completed")
+        && !p.replied_at
+        && campaignIds.has(p.campaign_id)
+        && (channelType !== "linkedin" || Boolean(p.invite_accepted_at))
+        && !excludeIds.includes(p.id as string),
+      );
       for (const p of matches) { p.status = "replied"; p.replied_at = new Date().toISOString(); }
       return { rows: matches.map((p) => ({ id: p.id, campaign_id: p.campaign_id })) };
     }
@@ -881,7 +892,7 @@ describe("ingestMessage — LinkedIn prospecting acceptance detection", () => {
     await connectAccount();
     fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe", first_name: "Jane", last_name: "Doe", company: "Acme Corp" });
     fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
-    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId, status: "active" });
+    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId, status: "active", channel_type: "linkedin" });
     fakeDatabase.campaignSteps.push({ id: "step-invite", campaign_id: "camp-1", position: 0, step_type: "invite", message_template: null });
     fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Bonjour {first_name} !" });
     fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-jane", status: "active", current_step_id: "step-invite", invite_sent_at: new Date(Date.now() - 60_000).toISOString(), invite_accepted_at: null });
@@ -917,7 +928,7 @@ describe("ingestMessage — LinkedIn prospecting acceptance detection", () => {
     await connectAccount();
     fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe", first_name: "Jane", last_name: "Doe" });
     fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
-    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId, status: "active" });
+    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId, status: "active", channel_type: "linkedin" });
     fakeDatabase.campaignSteps.push({ id: "step-invite", campaign_id: "camp-1", position: 0, step_type: "invite", message_template: null });
     fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Bonjour {first_name} !" });
     fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-jane", status: "active", current_step_id: "step-invite", invite_sent_at: new Date(Date.now() - 60_000).toISOString(), invite_accepted_at: null });
@@ -934,7 +945,7 @@ describe("ingestMessage — LinkedIn prospecting acceptance detection", () => {
     await connectAccount();
     fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe", first_name: "Jane", last_name: "Doe", company: "Acme Corp" });
     fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
-    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId });
+    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId, channel_type: "linkedin" });
     fakeDatabase.campaignSteps.push({ id: "step-invite", campaign_id: "camp-1", position: 0, step_type: "invite", message_template: null });
     fakeDatabase.campaignSteps.push({ id: "step-message", campaign_id: "camp-1", position: 1, step_type: "message", message_template: "Bonjour {first_name} !" });
     // Already past acceptance and follow-up (as the previous test proves
@@ -954,7 +965,7 @@ describe("ingestMessage — LinkedIn prospecting acceptance detection", () => {
     await connectAccount();
     fakeDatabase.contacts.push({ id: "contact-jane", workspace_id: workspaceId, display_name: "Jane Doe", first_name: "Jane", last_name: "Doe" });
     fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-jane", channel_type: "linkedin", identifier_normalized: "linkedin-jane" });
-    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId });
+    fakeDatabase.campaigns.push({ id: "camp-1", workspace_id: workspaceId, channel_type: "linkedin" });
     const repliedAt = new Date(Date.now() - 30_000).toISOString();
     fakeDatabase.campaignParticipants.push({ id: "part-1", campaign_id: "camp-1", contact_id: "contact-jane", status: "replied", current_step_id: "step-message", invite_sent_at: new Date(Date.now() - 120_000).toISOString(), invite_accepted_at: new Date(Date.now() - 60_000).toISOString(), replied_at: repliedAt });
 
@@ -1535,5 +1546,149 @@ describe("connections.metadata — sync writes never clobber unrelated keys", ()
     const metadata = fakeDatabase.connections[0]!.metadata as Record<string, unknown>;
     expect(metadata.someOtherKey).toBe("keepme");
     expect((metadata.sync as { status: string }).status).toBe("completed");
+  });
+});
+
+// --- stopParticipantsOnReply: the reply-stop invariant, channel-scoped.
+// Phase A fix — invite_accepted_at was previously required unconditionally,
+// which made a WhatsApp reply structurally unable to ever stop a
+// participant (WhatsApp never sets invite_accepted_at — no invite/accept
+// concept exists for it). The fix scopes by campaign.channel_type and only
+// requires invite_accepted_at inside the LinkedIn branch. ---
+
+async function primeWhatsAppContact(chatId = "chat-prime"): Promise<string> {
+  await ingestMessage(waMessagePayload({ chat_id: chatId, message_id: `${chatId}-priming` }));
+  return fakeDatabase.contacts[0]!.id as string;
+}
+
+describe("stopParticipantsOnReply — channel-scoped reply-stop", () => {
+  it("1. WhatsApp: an active participant with invite_accepted_at=NULL is stopped by a genuine inbound reply", async () => {
+    await connectWhatsAppAccount();
+    const contactId = await primeWhatsAppContact();
+    fakeDatabase.campaigns.push({ id: "wa-camp-1", workspace_id: workspaceId, status: "active", channel_type: "whatsapp" });
+    fakeDatabase.campaignSteps.push({ id: "wa-step-1", campaign_id: "wa-camp-1", position: 0, step_type: "message", message_template: "Bonjour !" });
+    fakeDatabase.campaignParticipants.push({ id: "wa-part-1", campaign_id: "wa-camp-1", contact_id: contactId, status: "active", current_step_id: "wa-step-1", invite_accepted_at: null, replied_at: null });
+
+    const result = await ingestMessage(waMessagePayload({ chat_id: "chat-prime", message_id: "wa-reply-1", message: "Je ne suis plus intéressé, merci." }));
+
+    expect(result).toEqual({ status: "ingested" });
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.id === "wa-part-1")!;
+    expect(participant.status).toBe("replied");
+    expect(participant.replied_at).not.toBeNull();
+    expect(fakeDatabase.activities.some((a) => a.event_type === "campaign.participant_stopped")).toBe(true);
+  });
+
+  it("2. WhatsApp: once stopped, the participant is no longer 'active' — claimByStepType's own WHERE p.status='active' (executor-shared.ts) structurally excludes it from any future claim/send", async () => {
+    await connectWhatsAppAccount();
+    const contactId = await primeWhatsAppContact();
+    fakeDatabase.campaigns.push({ id: "wa-camp-2", workspace_id: workspaceId, status: "active", channel_type: "whatsapp" });
+    fakeDatabase.campaignSteps.push({ id: "wa-step-2a", campaign_id: "wa-camp-2", position: 0, step_type: "message", message_template: "Bonjour !" });
+    fakeDatabase.campaignSteps.push({ id: "wa-step-2b", campaign_id: "wa-camp-2", position: 1, step_type: "wait", delay_value: 3, delay_unit: "days" });
+    fakeDatabase.campaignSteps.push({ id: "wa-step-2c", campaign_id: "wa-camp-2", position: 2, step_type: "message", message_template: "Relance" });
+    fakeDatabase.campaignParticipants.push({ id: "wa-part-2", campaign_id: "wa-camp-2", contact_id: contactId, status: "active", current_step_id: "wa-step-2a", invite_accepted_at: null, replied_at: null });
+
+    await ingestMessage(waMessagePayload({ chat_id: "chat-prime", message_id: "wa-reply-2" }));
+
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.id === "wa-part-2")!;
+    expect(participant.status).not.toBe("active"); // 'replied' — the one status claimByStepType never matches
+    expect(participant.status).toBe("replied");
+  });
+
+  it("4. an outbound (self-sent) WhatsApp message never stops any campaign", async () => {
+    await connectWhatsAppAccount();
+    const contactId = await primeWhatsAppContact();
+    fakeDatabase.campaigns.push({ id: "wa-camp-4", workspace_id: workspaceId, status: "active", channel_type: "whatsapp" });
+    fakeDatabase.campaignSteps.push({ id: "wa-step-4", campaign_id: "wa-camp-4", position: 0, step_type: "message", message_template: "Bonjour !" });
+    fakeDatabase.campaignParticipants.push({ id: "wa-part-4", campaign_id: "wa-camp-4", contact_id: contactId, status: "active", current_step_id: "wa-step-4", invite_accepted_at: null, replied_at: null });
+
+    await ingestMessage(waMessagePayload({
+      chat_id: "chat-prime",
+      message_id: "wa-outbound-1",
+      sender: { attendee_id: "self", attendee_name: "Moi", attendee_provider_id: "wa-self" }, // matches account_info.user_id -> outbound
+    }));
+
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.id === "wa-part-4")!;
+    expect(participant.status).toBe("active");
+    expect(participant.replied_at).toBeFalsy();
+  });
+
+  it("5. workspace isolation: a reply resolved in workspace A never modifies a participant recorded under workspace B", async () => {
+    await connectWhatsAppAccount();
+    const contactId = await primeWhatsAppContact();
+    fakeDatabase.campaigns.push({ id: "wa-camp-5a", workspace_id: workspaceId, status: "active", channel_type: "whatsapp" });
+    fakeDatabase.campaignSteps.push({ id: "wa-step-5a", campaign_id: "wa-camp-5a", position: 0, step_type: "message", message_template: "Bonjour !" });
+    fakeDatabase.campaignParticipants.push({ id: "wa-part-5a", campaign_id: "wa-camp-5a", contact_id: contactId, status: "active", current_step_id: "wa-step-5a", invite_accepted_at: null, replied_at: null });
+    // Same contact_id value, but recorded under a DIFFERENT workspace's own
+    // campaign — an adversarial construction purely to prove the SQL's own
+    // workspace_id filter, since contact_id alone is not, by itself, proof
+    // of workspace membership in this fake.
+    fakeDatabase.campaigns.push({ id: "wa-camp-5b", workspace_id: "ws-other", status: "active", channel_type: "whatsapp" });
+    fakeDatabase.campaignSteps.push({ id: "wa-step-5b", campaign_id: "wa-camp-5b", position: 0, step_type: "message", message_template: "Bonjour !" });
+    fakeDatabase.campaignParticipants.push({ id: "wa-part-5b", campaign_id: "wa-camp-5b", contact_id: contactId, status: "active", current_step_id: "wa-step-5b", invite_accepted_at: null, replied_at: null });
+
+    await ingestMessage(waMessagePayload({ chat_id: "chat-prime", message_id: "wa-reply-5" }));
+
+    expect(fakeDatabase.campaignParticipants.find((p) => p.id === "wa-part-5a")!.status).toBe("replied");
+    expect(fakeDatabase.campaignParticipants.find((p) => p.id === "wa-part-5b")!.status).toBe("active");
+    expect(fakeDatabase.campaignParticipants.find((p) => p.id === "wa-part-5b")!.replied_at).toBeFalsy();
+  });
+
+  it("6. idempotence: a redelivered inbound webhook (same provider_message_id) never re-stops or changes an already-stable state", async () => {
+    await connectWhatsAppAccount();
+    const contactId = await primeWhatsAppContact();
+    fakeDatabase.campaigns.push({ id: "wa-camp-6", workspace_id: workspaceId, status: "active", channel_type: "whatsapp" });
+    fakeDatabase.campaignSteps.push({ id: "wa-step-6", campaign_id: "wa-camp-6", position: 0, step_type: "message", message_template: "Bonjour !" });
+    fakeDatabase.campaignParticipants.push({ id: "wa-part-6", campaign_id: "wa-camp-6", contact_id: contactId, status: "active", current_step_id: "wa-step-6", invite_accepted_at: null, replied_at: null });
+
+    const first = await ingestMessage(waMessagePayload({ chat_id: "chat-prime", message_id: "wa-reply-6" }));
+    const repliedAtAfterFirst = fakeDatabase.campaignParticipants.find((p) => p.id === "wa-part-6")!.replied_at;
+    const second = await ingestMessage(waMessagePayload({ chat_id: "chat-prime", message_id: "wa-reply-6" })); // same message_id redelivered
+
+    expect(first).toEqual({ status: "ingested" });
+    expect(second).toEqual({ status: "duplicate" });
+    expect(fakeDatabase.campaignParticipants.find((p) => p.id === "wa-part-6")!.replied_at).toBe(repliedAtAfterFirst);
+  });
+
+  it("7. a participant already 'replied' stays stable when another message arrives", async () => {
+    await connectWhatsAppAccount();
+    const contactId = await primeWhatsAppContact();
+    fakeDatabase.campaigns.push({ id: "wa-camp-7", workspace_id: workspaceId, status: "active", channel_type: "whatsapp" });
+    fakeDatabase.campaignSteps.push({ id: "wa-step-7", campaign_id: "wa-camp-7", position: 0, step_type: "message", message_template: "Bonjour !" });
+    const repliedAt = new Date(Date.now() - 30_000).toISOString();
+    fakeDatabase.campaignParticipants.push({ id: "wa-part-7", campaign_id: "wa-camp-7", contact_id: contactId, status: "replied", current_step_id: "wa-step-7", invite_accepted_at: null, replied_at: repliedAt });
+
+    await ingestMessage(waMessagePayload({ chat_id: "chat-prime", message_id: "wa-reply-7-second" }));
+
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.id === "wa-part-7")!;
+    expect(participant.status).toBe("replied");
+    expect(participant.replied_at).toBe(repliedAt);
+  });
+
+  it("8. multi-campaign: a Contact enrolled in both a WhatsApp and a LinkedIn campaign simultaneously — a WhatsApp reply stops only the WhatsApp participant, never the unrelated LinkedIn one", async () => {
+    await connectWhatsAppAccount();
+    const contactId = await primeWhatsAppContact();
+
+    fakeDatabase.campaigns.push({ id: "multi-camp-wa", workspace_id: workspaceId, status: "active", channel_type: "whatsapp" });
+    fakeDatabase.campaignSteps.push({ id: "multi-step-wa", campaign_id: "multi-camp-wa", position: 0, step_type: "message", message_template: "Bonjour !" });
+    fakeDatabase.campaignParticipants.push({ id: "multi-part-wa", campaign_id: "multi-camp-wa", contact_id: contactId, status: "active", current_step_id: "multi-step-wa", invite_accepted_at: null, replied_at: null });
+
+    // Same Contact, a genuinely separate LinkedIn campaign — already past
+    // invitation acceptance, exactly the resting state a real LinkedIn
+    // participant is in while mid-sequence.
+    fakeDatabase.campaigns.push({ id: "multi-camp-li", workspace_id: workspaceId, status: "active", channel_type: "linkedin" });
+    fakeDatabase.campaignSteps.push({ id: "multi-step-li", campaign_id: "multi-camp-li", position: 1, step_type: "message", message_template: "Bonjour !" });
+    fakeDatabase.campaignParticipants.push({ id: "multi-part-li", campaign_id: "multi-camp-li", contact_id: contactId, status: "active", current_step_id: "multi-step-li", invite_sent_at: new Date(Date.now() - 120_000).toISOString(), invite_accepted_at: new Date(Date.now() - 60_000).toISOString(), replied_at: null });
+
+    await ingestMessage(waMessagePayload({ chat_id: "chat-prime", message_id: "wa-reply-8" }));
+
+    // The WhatsApp reply stops the WhatsApp participant...
+    expect(fakeDatabase.campaignParticipants.find((p) => p.id === "multi-part-wa")!.status).toBe("replied");
+    // ...and leaves the LinkedIn campaign — a channel the reply never
+    // arrived on — completely untouched. A reply is only ever a reply to
+    // the conversation/channel it actually arrived on; it must not be read
+    // as "this Contact is done with every channel."
+    const linkedinParticipant = fakeDatabase.campaignParticipants.find((p) => p.id === "multi-part-li")!;
+    expect(linkedinParticipant.status).toBe("active");
+    expect(linkedinParticipant.replied_at).toBeFalsy();
   });
 });
