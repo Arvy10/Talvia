@@ -758,9 +758,23 @@ async function backfillChat(workspaceId: string, connectionId: string, config: N
   }
 }
 
+// unipileGet's own thrown Error embeds the request path in its message
+// (`Unipile GET ${path} failed (${status}).`, see unipile.ts) — and a chat's
+// path segment can be a provider-derived identifier that, for some WhatsApp
+// accounts, is built from a phone number (see truncateChatId's comment).
+// That path is stripped before this ever reaches connections.metadata.sync,
+// which the Connections UI reads directly — the HTTP status itself is kept,
+// since it's the one useful diagnostic detail in that message. Every other
+// error shape (Postgres/SQL errors, AbortSignal timeouts, generic JS
+// errors) carries no request-specific user data in its .message by
+// construction, so it's preserved as-is (truncated only for length).
+const UNIPILE_HTTP_ERROR_PATTERN = /^Unipile GET .+ failed \((\d+)\)\.$/;
+
 function sanitizeSyncError(error: unknown): string {
-  const message = error instanceof Error ? error.message : "Erreur de synchronisation.";
-  return message.slice(0, 500);
+  if (!(error instanceof Error)) return "Erreur de synchronisation.";
+  const unipileMatch = error.message.match(UNIPILE_HTTP_ERROR_PATTERN);
+  if (unipileMatch) return `Appel à Unipile en échec (HTTP ${unipileMatch[1]}).`;
+  return error.message.slice(0, 500);
 }
 
 // Historical import for an already-connected LinkedIn or WhatsApp account.

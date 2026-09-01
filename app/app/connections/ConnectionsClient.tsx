@@ -45,7 +45,13 @@ function syncLabel(channel: ChannelId, sync: SyncState | null | undefined): stri
     if (sync.chatsFailed) parts.push(`${sync.chatsFailed} échec${sync.chatsFailed === 1 ? "" : "s"}`);
     return `Synchronisation terminée — ${parts.join(" · ")}.`;
   }
-  return sync.error ?? "Échec de la synchronisation.";
+  // The real technical detail already lives in connections.metadata.sync.error
+  // (sanitized server-side — see sanitizeSyncError in unipile-adapter.ts,
+  // which strips anything request-specific but keeps the HTTP status, SQL
+  // error text, timeout wording, or constraint name). Surface it here
+  // instead of a bare, undiagnosable "failed" — this is the whole point of
+  // exposing `sync` from GET /api/connections in the first place.
+  return `Synchronisation échouée : ${sync.error ?? "erreur inconnue."}`;
 }
 
 export function ConnectionsClient() {
@@ -82,7 +88,7 @@ export function ConnectionsClient() {
     const data = await response.json().catch(() => null) as SyncState | { error: string } | null;
     setSyncingChannel(null);
     if (!response.ok || !data || "error" in data) {
-      setSyncStates((current) => ({ ...current, [channel]: { status: "failed", chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 0, error: data && "error" in data ? data.error : "Échec de la synchronisation." } }));
+      setSyncStates((current) => ({ ...current, [channel]: { status: "failed", chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 0, error: data && "error" in data ? data.error : "la requête a échoué." } }));
       return;
     }
     setSyncStates((current) => ({ ...current, [channel]: data }));

@@ -1078,6 +1078,45 @@ describe("backfillConnectionHistory — generalization (LinkedIn + WhatsApp)", (
   });
 });
 
+describe("backfillConnectionHistory — error sanitization on failure (connections.metadata.sync.error)", () => {
+  it("a Unipile HTTP error's request path is stripped, but the HTTP status is kept — the whole point of showing something useful in the Connections UI", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockRejectedValueOnce(new Error("Unipile GET /api/v1/chats?account_id=acct-whatsapp-1&limit=100 failed (429)."));
+
+    await expect(backfillConnectionHistory(connectionId)).rejects.toThrow();
+
+    const sync = (fakeDatabase.connections[0]!.metadata as { sync: { status: string; error: string | null } }).sync;
+    expect(sync.status).toBe("failed");
+    expect(sync.error).toBe("Appel à Unipile en échec (HTTP 429).");
+    expect(sync.error).not.toContain("acct-whatsapp-1");
+    expect(sync.error).not.toContain("/api/v1/chats");
+  });
+
+  it("a genuinely useful diagnostic message (SQL error, constraint name, timeout wording) is preserved as-is — sanitization must not gut it", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockRejectedValueOnce(new Error("ON CONFLICT DO UPDATE command cannot affect row a second time"));
+
+    await expect(backfillConnectionHistory(connectionId)).rejects.toThrow();
+
+    const sync = (fakeDatabase.connections[0]!.metadata as { sync: { error: string | null } }).sync;
+    expect(sync.error).toBe("ON CONFLICT DO UPDATE command cannot affect row a second time");
+  });
+
+  it("a non-Error thrown value falls back to a generic message — never leaks a raw payload/object", async () => {
+    await connectWhatsAppAccount();
+    const connectionId = fakeDatabase.connections[0]!.id as string;
+    listChatsMock.mockRejectedValueOnce({ some: "raw-object-not-an-error", token: "secret-token-xyz" });
+
+    await expect(backfillConnectionHistory(connectionId)).rejects.toBeTruthy();
+
+    const sync = (fakeDatabase.connections[0]!.metadata as { sync: { error: string | null } }).sync;
+    expect(sync.error).toBe("Erreur de synchronisation.");
+    expect(sync.error).not.toContain("secret-token-xyz");
+  });
+});
+
 describe("backfillConnectionHistory — WhatsApp group handling", () => {
   it("0 non-self attendee: chat is processed but yields no message, no Contact created", async () => {
     await connectWhatsAppAccount();
