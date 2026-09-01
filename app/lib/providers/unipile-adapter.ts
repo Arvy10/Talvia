@@ -482,7 +482,7 @@ async function ingestMessageBody(payload: UnipileNewMessagePayload): Promise<Ing
     // server-side, regardless of whether the user has Inbox open
     // (docs/product/ARCHITECTURE.md §6, DECISIONS.md "LinkedIn campaign
     // behavior").
-    const stoppedParticipants = isOutbound ? [] : await stopParticipantsOnReply(client, workspaceId, contactId, acceptedInvites.map((p) => p.id));
+    const stoppedParticipants = isOutbound ? [] : await stopParticipantsOnReply(client, workspaceId, contactId, channelType, acceptedInvites.map((p) => p.id));
     // The acceptance advances the participant off the invite step, in the
     // SAME transaction as invite_accepted_at itself — a crash between the
     // two would otherwise leave a participant permanently stuck (accepted,
@@ -564,14 +564,44 @@ async function markProspectingInvitesAccepted(client: import("pg").PoolClient, w
 // fire) and 'completed' (nothing left to stop, but the participant should
 // still reflect that the prospect actually engaged). Idempotent via
 // `replied_at is null` — a second reply is a no-op here, not a second stop.
-async function stopParticipantsOnReply(client: import("pg").PoolClient, workspaceId: string, contactId: string, excludeParticipantIds: string[]): Promise<Array<{ id: string; campaign_id: string }>> {
+//
+// Channel-scoped (`c.channel_type=$3`) — a reply is only ever a reply to the
+// conversation it actually arrived on, so it stops that contact's active
+// participants on THAT channel only, never a campaign on a different
+// channel the same Contact happens to also be enrolled in. This closes a
+// real gap: the previous version filtered by workspace only, so a LinkedIn
+// reply could (in theory) have stopped an unrelated WhatsApp campaign for
+// the same Contact and vice versa — never actually observed, but a real
+// latent bug given campaign_participants carries no channel of its own.
+//
+// invite_accepted_at is kept, but ONLY inside the LinkedIn branch — it
+// remains exactly what it always meant there (this LinkedIn prospecting
+// participant has genuinely started conversing, not just been invited), a
+// condition that is semantically meaningless for WhatsApp (no invite/accept
+// concept exists — see whatsapp-executor.ts, which only ever claims
+// step_type='message') and would previously have permanently excluded every
+// WhatsApp participant from ever being stopped, since invite_accepted_at can
+// never become non-null for them. It is deliberately NOT expressed via a
+// join on campaign_steps.step_type: current_step_id is only ever
+// initialized for LinkedIn prospecting participants today (see
+// prospecting.ts's approveProspects) — a separate, pre-existing gap, out of
+// scope here — so a step-type join would silently fail to match real
+// WhatsApp participants in production today, exactly the kind of "passes in
+// tests, breaks for real" risk to avoid.
+async function stopParticipantsOnReply(client: import("pg").PoolClient, workspaceId: string, contactId: string, channelType: string, excludeParticipantIds: string[]): Promise<Array<{ id: string; campaign_id: string }>> {
   const result = await client.query<{ id: string; campaign_id: string }>(
-    `update campaign_participants set status='replied',replied_at=now(),updated_at=now()
-     where contact_id=$1 and status in ('active','completed') and invite_accepted_at is not null and replied_at is null
-       and campaign_id in (select id from campaigns where workspace_id=$2)
-       and not (id = any($3::uuid[]))
-     returning id,campaign_id`,
-    [contactId, workspaceId, excludeParticipantIds],
+    `update campaign_participants p set status='replied',replied_at=now(),updated_at=now()
+     from campaigns c
+     where p.campaign_id=c.id
+       and p.contact_id=$1
+       and c.workspace_id=$2
+       and c.channel_type=$3
+       and p.status in ('active','completed')
+       and p.replied_at is null
+       and ($3::varchar<>'linkedin' or p.invite_accepted_at is not null)
+       and not (p.id = any($4::uuid[]))
+     returning p.id,p.campaign_id`,
+    [contactId, workspaceId, channelType, excludeParticipantIds],
   );
   return result.rows;
 }
