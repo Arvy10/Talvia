@@ -321,11 +321,19 @@ type PersonalizationState = {
   evidence: { observedFacts: Array<{ type: string; value: string; source: string }>; uncertainties: string[] };
   outreachAngle: { whyContactThisPerson: string; relevantOffer: string; evidenceUsed: string[]; conversationGoal: string; tone: string } | null;
   invitation: GeneratedTextState;
-  messages: Array<GeneratedTextState & { stepId: string }>;
+  // generationMode (WhatsApp only — see app/lib/campaign-personalization.ts)
+  // distinguishes a genuinely conversation-grounded proposal from a safe
+  // deterministic fallback; undefined for LinkedIn artifacts and any
+  // pre-C2 record, rendered as no badge at all rather than a guess.
+  messages: Array<GeneratedTextState & { stepId: string; generationMode?: "ai_grounded" | "deterministic_fallback" }>;
   generatedAt: string | null;
   aiModel: string | null;
 };
 const TEXT_STATUS_LABEL: Record<GeneratedTextState["status"], string> = { not_generated: "non générée", generated: "générée", edited: "modifiée", approved: "approuvée" };
+const GENERATION_MODE_LABEL: Record<"ai_grounded" | "deterministic_fallback", string> = {
+  ai_grounded: "Basé sur votre conversation WhatsApp",
+  deterministic_fallback: "Personnalisation limitée — vérifiez le message avant d'approuver",
+};
 
 // Qualified Candidate -> Evidence -> Outreach Angle -> Generated text ->
 // Human review -> Approved text (docs spec §1) — the executor only ever
@@ -430,6 +438,7 @@ function PersonalizationCard({ campaignId, candidate, showInvitation = true }: {
         <label><span>{messageLabel(index)} ({TEXT_STATUS_LABEL[message.status]})</span>
           <textarea disabled={message.status === "approved"} onChange={(event) => setMessageDrafts((drafts) => ({ ...drafts, [message.stepId]: event.target.value }))} rows={3} value={messageDrafts[message.stepId] ?? ""} />
         </label>
+        {message.generationMode ? <p className="campaign-helper">{GENERATION_MODE_LABEL[message.generationMode]}</p> : null}
         <div className="campaign-wizard__actions">
           {message.status === "approved"
             ? <small className="prospecting-strategy__badge prospecting-strategy__badge--validated">{index === 0 ? "Message" : "Relance"} approuvé — c’est exactement ce texte qui sera envoyé</small>

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceContext } from "./workspace-context";
 import type { CampaignStrategy } from "./campaign-strategy";
 import type { BusinessContextRecord } from "./business-context/business-context-service";
+import type { MessageArtifact } from "./campaign-personalization";
 
 function createFakeDatabase() {
   const campaigns: Array<Record<string, unknown>> = [];
@@ -9,6 +10,12 @@ function createFakeDatabase() {
   const campaignSteps: Array<Record<string, unknown>> = [];
   const candidates: Array<Record<string, unknown>> = [];
   const contacts: Array<Record<string, unknown>> = [];
+  // C2 — backs buildWhatsAppConversationContext (C1, reused verbatim) via
+  // conversation-resolution.ts's canonical query and conversation-context.ts's
+  // bounded messages fetch. Same shape/semantics as
+  // campaign-execution/conversation-context.test.ts's own fake DB.
+  const conversations: Array<Record<string, unknown>> = [];
+  const messages: Array<Record<string, unknown>> = [];
 
   async function query(sql: string, params: unknown[] = []) {
     const text = sql.replace(/\s+/g, " ").trim();
@@ -59,11 +66,46 @@ function createFakeDatabase() {
       const row = contacts.find((c) => c.workspace_id === workspaceId && c.id === contactId);
       return { rows: row ? [{ first_name: row.first_name, display_name: row.display_name, company: row.company ?? null }] : [] };
     }
+    if (text.startsWith("select objective from campaigns where workspace_id=$1 and id=$2")) {
+      const [workspaceId, campaignId] = params as string[];
+      const row = campaigns.find((c) => c.id === campaignId && c.workspace_id === workspaceId);
+      return { rows: row ? [{ objective: row.objective ?? "follow_up" }] : [] };
+    }
+    // conversation-resolution.ts's canonical query — same tie-break as C1/Phase B.
+    if (text.startsWith("select id from conversations where workspace_id=$1 and contact_id=$2 and channel_type=$3")) {
+      const [workspaceId, contactId, channelType] = params as [string, string, string];
+      const rows = conversations
+        .filter((c) => c.workspace_id === workspaceId && c.contact_id === contactId && c.channel_type === channelType)
+        .slice()
+        .sort((a, b) => {
+          const aKey = (a.last_message_at as string | null) ?? (a.created_at as string);
+          const bKey = (b.last_message_at as string | null) ?? (b.created_at as string);
+          if (aKey !== bKey) return aKey < bKey ? 1 : -1;
+          if (a.created_at !== b.created_at) return (a.created_at as string) < (b.created_at as string) ? 1 : -1;
+          return (a.id as string) < (b.id as string) ? 1 : -1;
+        });
+      return { rows: rows.length ? [{ id: rows[0]!.id }] : [] };
+    }
+    // conversation-context.ts's bounded messages fetch — newest-first with a
+    // limit, draft-excluded, deterministic tie-break on id.
+    if (text.startsWith("select direction, body, effective_time from messages where workspace_id=$1 and conversation_id=$2 and status<>'draft'")) {
+      const [workspaceId, conversationId, limit] = params as [string, string, number];
+      const rows = messages
+        .filter((m) => m.workspace_id === workspaceId && m.conversation_id === conversationId && m.status !== "draft")
+        .slice()
+        .sort((a, b) => {
+          if (a.effective_time !== b.effective_time) return (a.effective_time as string) < (b.effective_time as string) ? 1 : -1;
+          return (a.id as string) < (b.id as string) ? 1 : -1;
+        })
+        .slice(0, limit)
+        .map((m) => ({ direction: m.direction, body: m.body, effective_time: m.effective_time }));
+      return { rows };
+    }
 
     throw new Error(`unhandled query in fake database: ${text}`);
   }
 
-  return { query, connect: async () => ({ query, release: () => {} }), campaigns, campaignParticipants, campaignSteps, candidates, contacts };
+  return { query, connect: async () => ({ query, release: () => {} }), campaigns, campaignParticipants, campaignSteps, candidates, contacts, conversations, messages };
 }
 
 let fakeDatabase = createFakeDatabase();
@@ -129,11 +171,26 @@ function seedContact(contactId: string, overrides: Partial<Record<string, unknow
 }
 // message(0) -> wait(1) -> message(2) — WhatsApp's own canonical shape
 // (no invite step, matching CampaignsClient.tsx's non-prospecting wizard).
-function seedWhatsAppCampaign(campaignId: string, forWorkspaceId = workspaceId) {
-  fakeDatabase.campaigns.push({ id: campaignId, workspace_id: forWorkspaceId });
+function seedWhatsAppCampaign(campaignId: string, opts: { forWorkspaceId?: string; objective?: "follow_up" | "reactivation" } = {}) {
+  fakeDatabase.campaigns.push({ id: campaignId, workspace_id: opts.forWorkspaceId ?? workspaceId, objective: opts.objective ?? "follow_up" });
   fakeDatabase.campaignSteps.push({ id: `${campaignId}-msg1`, campaign_id: campaignId, position: 0, step_type: "message", message_template: "Bonjour {first_name}, ravi d'échanger avec {company} !" });
   fakeDatabase.campaignSteps.push({ id: `${campaignId}-wait`, campaign_id: campaignId, position: 1, step_type: "wait", delay_value: 3, delay_unit: "days" });
   fakeDatabase.campaignSteps.push({ id: `${campaignId}-msg2`, campaign_id: campaignId, position: 2, step_type: "message", message_template: null });
+}
+// C2 evidence fixtures — mirrors campaign-execution/conversation-context.test.ts's
+// own seedConversation/seedMessage exactly (same fake-DB shape/semantics).
+function seedConversation(id: string, contactId: string, opts: { workspaceId?: string; lastMessageAt?: string | null; createdAt?: string } = {}) {
+  fakeDatabase.conversations.push({
+    id, workspace_id: opts.workspaceId ?? workspaceId, contact_id: contactId, channel_type: "whatsapp",
+    last_message_at: opts.lastMessageAt ?? null, created_at: opts.createdAt ?? "2026-01-01T00:00:00.000Z",
+  });
+}
+function seedMessage(id: string, conversationId: string, opts: { workspaceId?: string; direction?: "inbound" | "outbound"; body?: string; status?: string; effectiveTime?: string } = {}) {
+  fakeDatabase.messages.push({
+    id, workspace_id: opts.workspaceId ?? workspaceId, conversation_id: conversationId,
+    direction: opts.direction ?? "inbound", body: opts.body ?? "Bonjour", status: opts.status ?? "received",
+    effective_time: opts.effectiveTime ?? "2026-01-01T00:00:00.000Z",
+  });
 }
 
 const sampleStrategy = {
@@ -717,5 +774,588 @@ describe("generateWhatsAppParticipantPersonalization — Contact-sourced, no cam
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error("unreachable");
     for (const message of result.personalization.messages) expect(message.approvedText).toBeNull();
+  });
+});
+
+// C2 — grounded WhatsApp personalization. Single-step campaigns throughout
+// this block so each test's single generateStructuredMock queue entry maps
+// unambiguously to the one message step under test — seedWhatsAppCampaign's
+// second "msg2" step (used above) would otherwise trigger a second,
+// separately-mocked AI call.
+function seedWhatsAppCampaignSingleStep(campaignId: string, opts: { forWorkspaceId?: string; objective?: "follow_up" | "reactivation" } = {}) {
+  fakeDatabase.campaigns.push({ id: campaignId, workspace_id: opts.forWorkspaceId ?? workspaceId, objective: opts.objective ?? "follow_up" });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-msg1`, campaign_id: campaignId, position: 0, step_type: "message", message_template: null });
+}
+// C2 correction — the model no longer returns free `text` + independent
+// `claims[]`; it returns an ordered `segments[]` (kind "generic" | "factual"
+// + supportedByEvidenceIds), and the server reconstructs the sent text by
+// concatenating validated segments. See campaign-personalization.ts's
+// isAcceptableWhatsAppGeneration for why: a free-text field left a span of
+// the message that neither claim validation nor the old regex backstop
+// necessarily covered.
+type MockSegment = { kind: "generic" | "factual"; text: string; supportedByEvidenceIds?: string[] };
+function mockSegmentedWhatsAppGeneration(segments: MockSegment[], uncertain = false) {
+  getAIProviderMock.mockReturnValue({ model: "test-model", generateStructured: generateStructuredMock });
+  generateStructuredMock.mockResolvedValueOnce({
+    data: { segments: segments.map((segment) => ({ supportedByEvidenceIds: [], ...segment })), uncertain },
+    model: "test-model",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+}
+function firstMessage(personalization: { messages: MessageArtifact[] }, campaignId = "camp-1") {
+  return personalization.messages.find((m) => m.stepId === `${campaignId}-msg1`)!;
+}
+
+describe("C2.1 — server-owned evidence, evidenceId construction, workspace isolation", () => {
+  it("1/5. evidenceIds are positional, deterministic, and sent to the model as [eN] markers over real message text", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-a", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?", effectiveTime: "2026-02-01T09:00:00.000Z" });
+    seedMessage("msg-b", "conv-1", { direction: "outbound", body: "Je vous recontacte au sujet du devis.", effectiveTime: "2026-02-01T10:00:00.000Z" });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Une question simple, sans affirmation ?" }]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    const prompt = generateStructuredMock.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("[e0] Le prospect a écrit");
+    expect(prompt).toContain("[e1] Vous avez écrit");
+    expect(prompt).toContain("Le devis vous intéresse toujours ?");
+  });
+
+  it("4. an empty body is excluded from evidence — never becomes a synthesized fact", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-empty", "conv-1", { direction: "inbound", body: "", effectiveTime: "2026-02-01T09:00:00.000Z" });
+    seedMessage("msg-real", "conv-1", { direction: "inbound", body: "Bonjour, merci pour votre message.", effectiveTime: "2026-02-01T10:00:00.000Z" });
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.personalization.evidence.observedFacts.some((fact) => fact.value === "")).toBe(false);
+    expect(result.personalization.evidence.observedFacts.filter((fact) => fact.type === "conversation_inbound")).toHaveLength(1);
+  });
+
+  it("16. no Conversation at all -> deterministic fallback, no AI call attempted", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré" });
+    getAIProviderMock.mockReturnValue({ model: "test-model", generateStructured: generateStructuredMock });
+    // Deliberately no seedConversation() call at all.
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+    expect(firstMessage(result.personalization).generatedText).toBe("Bonjour Awa, je me permets de revenir vers vous.");
+    expect(generateStructuredMock).not.toHaveBeenCalled();
+  });
+
+  it("17. a Conversation with zero exploitable (non-empty) messages -> deterministic fallback, no AI call", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-draft", "conv-1", { status: "draft", body: "brouillon" });
+    getAIProviderMock.mockReturnValue({ model: "test-model", generateStructured: generateStructuredMock });
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+    expect(generateStructuredMock).not.toHaveBeenCalled();
+  });
+
+  it("2/17b. outbound-only Conversation never calls the AI provider — no inbound evidence can ever ground a prospect claim", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-out", "conv-1", { direction: "outbound", body: "Je peux vous envoyer le devis demain." });
+    getAIProviderMock.mockReturnValue({ model: "test-model", generateStructured: generateStructuredMock });
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+    expect(generateStructuredMock).not.toHaveBeenCalled();
+  });
+
+  it("30. workspace isolation — a Conversation belonging to another workspace is never used as evidence", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré" });
+    seedConversation("conv-other-ws", "contact-1", { workspaceId: "ws-2" });
+    seedMessage("msg-other-ws", "conv-other-ws", { workspaceId: "ws-2", direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    getAIProviderMock.mockReturnValue({ model: "test-model", generateStructured: generateStructuredMock });
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+    expect(generateStructuredMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("C2.2 — segment validation, inbound/outbound provenance", () => {
+  it("1/11/25. a factual segment genuinely supported by real inbound evidence is accepted as ai_grounded", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse, vous devez en reparler avec votre associé." });
+    mockSegmentedWhatsAppGeneration([
+      { kind: "generic", text: "Je reviens vers vous." },
+      { kind: "factual", text: "Le devis vous intéresse toujours", supportedByEvidenceIds: ["e0"] },
+    ]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = firstMessage(result.personalization);
+    expect(message.generationMode).toBe("ai_grounded");
+    expect(message.generatedText).toBe("Je reviens vers vous. Le devis vous intéresse toujours");
+    expect(result.personalization.aiModel).toBe("test-model");
+  });
+
+  it("3. mixed inbound+outbound — a factual segment citing the inbound message is accepted, provenance respected", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-out", "conv-1", { direction: "outbound", body: "Je vous envoie le devis dans la journée.", effectiveTime: "2026-02-01T09:00:00.000Z" });
+    seedMessage("msg-in", "conv-1", { direction: "inbound", body: "Le devis vous intéresse, merci !", effectiveTime: "2026-02-01T10:00:00.000Z" });
+    mockSegmentedWhatsAppGeneration([{ kind: "factual", text: "le devis vous intéresse", supportedByEvidenceIds: ["e1"] }]); // e1 = inbound
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("ai_grounded");
+  });
+
+  it("6/7. a factual segment citing a hallucinated evidenceId (never constructed server-side) rejects the whole generation", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré" });
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Merci pour votre message, à bientôt." });
+    mockSegmentedWhatsAppGeneration([{ kind: "factual", text: "une relance simple", supportedByEvidenceIds: ["e99"] }]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = firstMessage(result.personalization);
+    expect(message.generationMode).toBe("deterministic_fallback");
+    expect(message.generatedText).toBe("Bonjour Awa, je me permets de revenir vers vous.");
+  });
+
+  it("8. a factual segment declared with zero supportedByEvidenceIds is rejected (an admitted-unsupported claim)", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    mockSegmentedWhatsAppGeneration([{ kind: "factual", text: "le devis vous intéresse", supportedByEvidenceIds: [] }]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("9/19. a prospect-state factual segment citing only an outbound evidence is rejected — what-we-said never becomes prospect intent", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { company: "Acme" });
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-out", "conv-1", { direction: "outbound", body: "Le devis vous intéresse, je vous le confirme.", effectiveTime: "2026-02-01T09:00:00.000Z" });
+    seedMessage("msg-in", "conv-1", { direction: "inbound", body: "Merci, à bientôt.", effectiveTime: "2026-02-01T10:00:00.000Z" });
+    mockSegmentedWhatsAppGeneration([{ kind: "factual", text: "le devis vous intéresse", supportedByEvidenceIds: ["e0"] }]); // e0 = outbound
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("10. a factual segment with insufficient lexical overlap with its cited evidence is rejected (conservative, no fuzzy matching)", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "On verra ça plus tard, merci." });
+    mockSegmentedWhatsAppGeneration([{ kind: "factual", text: "le budget du projet est confirmé", supportedByEvidenceIds: ["e0"] }]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("a genuine open question with a single generic segment (no factual content) is accepted", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré" });
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Merci pour votre message, je reviens vers vous bientôt." });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Bonjour Awa, avez-vous eu l'occasion d'avancer de votre côté ?" }]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("ai_grounded");
+  });
+});
+
+describe("C2.5 — adversarial: an undeclared/mislabeled factual claim can no longer hide in a \"generic\" segment", () => {
+  it("adversarial 1/3. a paraphrase of real evidence, mislabeled \"generic\" and using vocabulary outside the closed regex, is rejected", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    // Neither "déménagement", "bureaux" nor "mars" appear in
+    // PROSPECT_STATE_ASSERTION's closed word list — the OLD regex-only
+    // backstop would never have caught this reformulation.
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Nous prévoyons un déménagement de nos bureaux en mars." });
+    mockSegmentedWhatsAppGeneration([
+      { kind: "generic", text: "Le déménagement de vos bureaux prévu en mars, ça avance ?" }, // mislabeled: this IS a prospect-state claim
+    ]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("adversarial 2. an innocent declared segment does not launder a second, undeclared factual segment elsewhere in the message", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré" });
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Nous prévoyons un déménagement de nos bureaux en mars." });
+    mockSegmentedWhatsAppGeneration([
+      { kind: "generic", text: "Bonjour Awa," }, // genuinely innocent
+      { kind: "generic", text: "le déménagement de vos bureaux en mars avance-t-il ?" }, // hidden claim, no evidence cited
+    ]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = firstMessage(result.personalization);
+    expect(message.generationMode).toBe("deterministic_fallback");
+    expect(message.generatedText).toBe("Bonjour Awa, je me permets de revenir vers vous.");
+  });
+
+  it("adversarial 7. a correctly-declared factual segment does not save the message when another segment hides a second, undeclared claim", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse, et nous prévoyons un déménagement de nos bureaux en mars." });
+    mockSegmentedWhatsAppGeneration([
+      { kind: "factual", text: "le devis vous intéresse", supportedByEvidenceIds: ["e0"] }, // legitimate, correctly declared
+      { kind: "generic", text: "et le déménagement de vos bureaux en mars avance bien ?" }, // second, hidden claim
+    ]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("adversarial 4/8. purely generic/relational segments with no real connection to evidence content are accepted, not rejected artificially", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré" });
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Nous prévoyons un déménagement de nos bureaux en mars." });
+    mockSegmentedWhatsAppGeneration([
+      { kind: "generic", text: "Bonjour Awa, j'espère que vous allez bien." },
+      { kind: "generic", text: "Je me permets de revenir vers vous — est-ce toujours d'actualité ?" },
+    ]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = firstMessage(result.personalization);
+    expect(message.generationMode).toBe("ai_grounded");
+    expect(message.generatedText).toBe("Bonjour Awa, j'espère que vous allez bien. Je me permets de revenir vers vous — est-ce toujours d'actualité ?");
+  });
+
+  it("a generic segment citing an evidenceId is a contradiction and is rejected outright", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Merci pour votre message." });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Merci pour votre retour !", supportedByEvidenceIds: ["e0"] }]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("a factual segment matching the closed PROSPECT_STATE_ASSERTION vocabulary but mislabeled generic is still caught by the cheap regex layer", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Merci pour votre message." });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Votre priorité est de signer le devis rapidement." }]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+});
+
+describe("C2.3 — uncertain flag, provider failure modes, length limit", () => {
+  it("12. uncertain=true forces the deterministic fallback even when every other check would have passed", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    mockSegmentedWhatsAppGeneration(
+      [{ kind: "factual", text: "le devis vous intéresse", supportedByEvidenceIds: ["e0"] }],
+      true,
+    );
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("13/26. provider null falls back safely without throwing", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré" });
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    // getAIProviderMock defaults to null (see beforeEach).
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = firstMessage(result.personalization);
+    expect(message.generationMode).toBe("deterministic_fallback");
+    expect(message.generatedText).toBe("Bonjour Awa, je me permets de revenir vers vous.");
+  });
+
+  it("14. a provider exception falls back safely without throwing", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    getAIProviderMock.mockReturnValue({ model: "test-model", generateStructured: generateStructuredMock });
+    generateStructuredMock.mockRejectedValueOnce(new Error("Le fournisseur IA a mis trop de temps à répondre."));
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("15. a malformed structured output (missing segments entirely) falls back safely without throwing", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    getAIProviderMock.mockReturnValue({ model: "test-model", generateStructured: generateStructuredMock });
+    generateStructuredMock.mockResolvedValueOnce({ data: { text: "incomplet" }, model: "test-model", usage: { inputTokens: 1, outputTokens: 1 } });
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("15b. an empty segments array falls back safely", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    mockSegmentedWhatsAppGeneration([]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("22. a reconstructed message exactly at the 320-character limit is accepted when otherwise grounded", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    const prefix = "Merci pour votre retour, je reviens vers vous tres vite ";
+    const text = prefix + "x".repeat(320 - prefix.length);
+    expect(text.length).toBe(320);
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text }]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("ai_grounded");
+  });
+
+  it("23. a reconstructed message over 320 characters is rejected OUTRIGHT — never truncated to fit", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { first_name: "Awa", display_name: "Awa Traoré" });
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    const longText = `Merci pour votre retour, je reviens vers vous tres vite ${"x".repeat(300)}`;
+    expect(longText.length).toBeGreaterThan(320);
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: longText }]);
+
+    const result = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = firstMessage(result.personalization);
+    expect(message.generationMode).toBe("deterministic_fallback");
+    expect(message.generatedText).toBe("Bonjour Awa, je me permets de revenir vers vous.");
+    expect(message.generatedText).not.toContain(longText.slice(0, 320)); // never a truncated slice of the rejected text
+    expect(message.generatedText!.length).toBeLessThanOrEqual(320);
+  });
+});
+
+describe("C2.4 — Business Context / Contact separation, follow_up vs reactivation, approved-artifact safety", () => {
+  it("18. Business Context is placed in its own labeled section, never inside CONVERSATION EVIDENCE", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Merci pour votre message." });
+    getActiveBusinessContextMock.mockResolvedValue({
+      companyName: "Talvia", businessDescription: "Nous aidons les agences à automatiser leurs relances commerciales.",
+    } as BusinessContextRecord);
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Merci pour votre retour, à bientôt !" }]);
+
+    await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    const prompt = generateStructuredMock.mock.calls[0]![0].prompt as string;
+    const evidenceSection = prompt.split("=== CONTACT FACTS")[0]!;
+    expect(prompt).toContain("=== BUSINESS FACTS");
+    expect(prompt).toContain("Nous aidons les agences à automatiser leurs relances commerciales.");
+    expect(evidenceSection).not.toContain("automatiser leurs relances");
+  });
+
+  it("19b. Contact company is placed in its own labeled section, never inside CONVERSATION EVIDENCE", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { company: "Nova Studio" });
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Merci pour votre message." });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Merci pour votre retour, à bientôt !" }]);
+
+    await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    const prompt = generateStructuredMock.mock.calls[0]![0].prompt as string;
+    const evidenceSection = prompt.split("=== CONTACT FACTS")[0]!;
+    expect(prompt).toContain("=== CONTACT FACTS");
+    expect(prompt).toContain("Nova Studio");
+    expect(evidenceSection).not.toContain("Nova Studio");
+  });
+
+  it("20. objective=follow_up shapes the tone-policy prompt section and forbids inventing an open action", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1", { objective: "follow_up" });
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Merci pour votre message." });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Merci pour votre retour, à bientôt !" }]);
+
+    await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    const prompt = generateStructuredMock.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("Suivi (follow_up)");
+    expect(prompt).toMatch(/N'affirme JAMAIS qu'une action précise/);
+  });
+
+  it("21. objective=reactivation shapes a softer tone-policy prompt section without inventing a reason for silence", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1", { objective: "reactivation" });
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Merci pour votre message." });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Cela fait un moment, comment allez-vous ?" }]);
+
+    await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    const prompt = generateStructuredMock.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("Réactivation");
+    expect(prompt).toMatch(/sans jamais supposer ou expliquer pourquoi/);
+  });
+
+  it("24. an approved artifact is never overwritten even when a fresh AI-grounded generation would otherwise succeed", async () => {
+    seedWhatsAppCampaignSingleStep("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    const before = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+    if (!before.ok) throw new Error("unreachable");
+    await approveParticipantMessage(context, "camp-1", "part-1", "camp-1-msg1");
+    const approvedTextBefore = (await getParticipantPersonalization(context, "camp-1", "part-1"))!.messages.find((m) => m.stepId === "camp-1-msg1")!.approvedText;
+
+    seedConversation("conv-1", "contact-1");
+    seedMessage("msg-1", "conv-1", { direction: "inbound", body: "Le devis vous intéresse toujours ?" });
+    mockSegmentedWhatsAppGeneration([{ kind: "factual", text: "le devis vous intéresse", supportedByEvidenceIds: ["e0"] }]);
+
+    const after = await generateWhatsAppParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(after.ok).toBe(true);
+    if (!after.ok) throw new Error("unreachable");
+    const message = firstMessage(after.personalization);
+    expect(message.status).toBe("approved");
+    expect(message.approvedText).toBe(approvedTextBefore);
+    expect(generateStructuredMock).not.toHaveBeenCalled(); // never even attempted for an approved step
+  });
+
+  it("27. LinkedIn personalization is unaffected — its message artifacts never carry a generationMode", async () => {
+    seedCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1", { headline: "Fondatrice", company: "Acme" });
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    for (const message of result.personalization.messages) expect(message.generationMode).toBeUndefined();
   });
 });

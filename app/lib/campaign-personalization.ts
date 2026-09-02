@@ -1,11 +1,12 @@
 import { database } from "./database";
 import { getAIProvider } from "./ai";
-import { getCampaignStrategy } from "./campaigns";
+import { getCampaignStrategy, type CampaignObjective } from "./campaigns";
 import type { CampaignStrategy } from "./campaign-strategy";
 import { getActiveBusinessContext, type BusinessContextRecord } from "./business-context/business-context-service";
 import type { CandidateQualification } from "./prospecting";
 import type { ReasonCode } from "./campaign-execution/reason-codes";
 import type { WorkspaceContext } from "./workspace-context";
+import { buildWhatsAppConversationContext } from "./campaign-execution/conversation-context";
 
 // Phase 3: Qualified Candidate -> Evidence -> Outreach Angle -> Generated
 // text -> Human review -> Approved text -> Executor sends EXACTLY that.
@@ -63,10 +64,19 @@ export type GeneratedText = {
   approvedAt: string | null;
 };
 
+// C2: how a message artifact's generatedText actually came to be — set only
+// by generators that can genuinely distinguish the two (today, WhatsApp's
+// grounded pipeline below); left undefined by LinkedIn's own generators, so
+// existing behavior/shape is unaffected. Never inferred from aiModel alone
+// in the UI — it's the one explicit signal a caller should trust to show
+// "based on your conversation" vs "limited personalization" without turning
+// PersonalizationCard into a technical dashboard.
+export type GenerationMode = "ai_grounded" | "deterministic_fallback";
+
 // One entry per message-type campaign_steps row — an array, not a single
 // object, so a future follow-up step needs no further migration (docs spec
 // §14).
-export type MessageArtifact = GeneratedText & { stepId: string };
+export type MessageArtifact = GeneratedText & { stepId: string; generationMode?: GenerationMode };
 
 export type ParticipantPersonalization = {
   evidence: PersonalizationEvidence;
@@ -471,10 +481,10 @@ async function savePersonalization(context: WorkspaceContext, campaignId: string
   return (result.rowCount ?? 0) > 0;
 }
 
-function mergeMessageArtifact(existing: MessageArtifact[], stepId: string, generatedText: string): MessageArtifact[] {
+function mergeMessageArtifact(existing: MessageArtifact[], stepId: string, generatedText: string, generationMode?: GenerationMode): MessageArtifact[] {
   const current = existing.find((artifact) => artifact.stepId === stepId);
   if (current?.status === "approved") return existing; // never silently overwrite an approved message (docs spec §9/§16)
-  const next: MessageArtifact = { stepId, status: "generated", generatedText, editedText: null, approvedText: null, approvedAt: null };
+  const next: MessageArtifact = { stepId, status: "generated", generatedText, editedText: null, approvedText: null, approvedAt: null, ...(generationMode ? { generationMode } : {}) };
   return [...existing.filter((artifact) => artifact.stepId !== stepId), next];
 }
 
@@ -558,14 +568,16 @@ export async function generateParticipantPersonalization(context: WorkspaceConte
 
 // WhatsApp minimal executor spec §3: a WhatsApp participant is an existing
 // Contact, never a row in campaign_prospect_candidates (that table is
-// LinkedIn-search-specific) — so this never touches it, and never calls the
-// AI evidence-grounding pipeline above at all. There is nothing to
-// hallucinate because there is nothing generated beyond substituting the
-// Contact's own real, already-known fields into the step's own
-// human-authored message_template; an unknown field degrades to a safe,
-// generic phrase, never an invented company/problem/intent. Storage,
-// mergeMessageArtifact's never-overwrite-approved rule, and the human
-// approval requirement are all reused unchanged from the pipeline above.
+// LinkedIn-search-specific) — so this never touches it. Unlike LinkedIn,
+// there is no candidate-search step to draw structured attributes from — the
+// only genuine source of evidence about the prospect is the real WhatsApp
+// Conversation already exchanged with them (C1's buildWhatsAppConversationContext).
+// Deterministic Contact-field substitution (below) remains the fallback in
+// every case where that evidence is absent, insufficient, or the generated
+// proposal fails grounding — never an invented company/problem/intent.
+// Storage, mergeMessageArtifact's never-overwrite-approved rule, and the
+// human approval requirement are all reused unchanged from the pipeline
+// above.
 type WhatsAppContactFacts = { name: string; firstName: string; company: string | null };
 
 function substituteContactPlaceholders(template: string, contact: WhatsAppContactFacts): string {
@@ -576,6 +588,255 @@ function substituteContactPlaceholders(template: string, contact: WhatsAppContac
 
 function deterministicWhatsAppMessage(contact: WhatsAppContactFacts): string {
   return `Bonjour ${contact.firstName || contact.name}, je me permets de revenir vers vous.`;
+}
+
+// C2 — grounded WhatsApp personalization. server-owned evidence -> structured
+// generation -> server-side claim/evidence validation -> grounded proposal OR
+// deterministic fallback. No change to how approvedText is produced/consumed
+// afterward (edit/approve/executor are all untouched).
+
+// One evidence per real, non-empty WhatsApp message — never a summary, never
+// an inference, never fabricated. `evidenceId` is positional and
+// deterministic (C1's recentMessages is already ordered oldest->newest with
+// its own deterministic tie-break), scoped to a single generation call only
+// — never persisted, never reused across calls, so it needs no relation to
+// the real messages.id.
+export type WhatsAppEvidence = { evidenceId: string; direction: "inbound" | "outbound"; text: string; at: string };
+
+// Attachment-only / genuinely empty messages carry no textual claim to make
+// — never turned into a synthesized placeholder (C1 already preserves body
+// as-is; this is where an empty one is simply excluded from evidence).
+function buildWhatsAppEvidence(recentMessages: Array<{ direction: "inbound" | "outbound"; body: string; at: string }>): WhatsAppEvidence[] {
+  return recentMessages
+    .filter((message) => message.body.trim() !== "")
+    .map((message, index) => ({ evidenceId: `e${index}`, direction: message.direction, text: message.body, at: message.at }));
+}
+
+// C2 correction — closes a structural gap found in the first C2 review: a
+// free `text` field plus an independent, self-declared `claims[]` gave the
+// model a way to write a factual assertion inside `text` without declaring
+// it as a claim at all — invisible to claim validation, and only caught by
+// the backstop regex if it happened to use one of a closed list of French
+// words. A reformulation of real evidence in different words (the realistic
+// failure mode for an LLM, which paraphrases far more often than it invents
+// from nothing) could slip through undetected. Fixed not by adding more
+// regex, but by removing the free-text field entirely: the model now
+// returns an ORDERED list of segments, each explicitly typed "generic" (no
+// claim about the prospect — greeting, pleasantry, open question) or
+// "factual" (a new assertion about the prospect/conversation, mandatorily
+// evidence-backed). The server reconstructs the final text by concatenating
+// only segments it has individually validated — there is no longer any
+// span of the output text that isn't accounted for by one of these two
+// checked categories.
+type WhatsAppSegmentKind = "generic" | "factual";
+type WhatsAppSegment = { kind: WhatsAppSegmentKind; text: string; supportedByEvidenceIds: string[] };
+type WhatsAppGenerationOutput = { segments: WhatsAppSegment[]; uncertain: boolean };
+
+const MAX_WHATSAPP_TEXT_LENGTH = 320;
+
+const WHATSAPP_SEGMENT_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: { type: "string", enum: ["generic", "factual"] },
+    text: { type: "string" },
+    // Only meaningful for kind="factual" — validated server-side against the
+    // real evidence set either way (a "generic" segment citing an evidenceId
+    // is itself a contradiction, rejected below).
+    supportedByEvidenceIds: { type: "array", items: { type: "string" } },
+  },
+  required: ["kind", "text", "supportedByEvidenceIds"],
+  additionalProperties: false,
+};
+
+const WHATSAPP_ARTIFACT_SCHEMA = {
+  type: "object",
+  properties: {
+    // Ordered — concatenated in this order (space-joined) to reconstruct the
+    // final message text server-side. Nothing outside this array ever
+    // becomes part of the sent text.
+    segments: { type: "array", items: WHATSAPP_SEGMENT_SCHEMA },
+    // The model's own signal that context was too thin to personalize
+    // confidently. Never trusted as sufficient on its own (false=>skip
+    // checks) NOR as the final word when true (uncertain=true always forces
+    // fallback, regardless of what the other checks would have said) — see
+    // isAcceptableWhatsAppGeneration.
+    uncertain: { type: "boolean" },
+  },
+  required: ["segments", "uncertain"],
+  additionalProperties: false,
+};
+
+// A small, fixed French stopword list — just enough to stop trivial common
+// words (vous/avec/dans/chez/cette/notre/votre/avez/êtes...) from counting as
+// "shared vocabulary" between a claim and an evidence. Deliberately not a
+// general-purpose stopword library — this only needs to be conservative
+// enough for the closed word-overlap check below, not linguistically
+// complete.
+const FRENCH_STOPWORDS = new Set([
+  "avec", "dans", "chez", "cette", "notre", "votre", "avez", "etes", "vous", "nous",
+  "mais", "donc", "pour", "sans", "comme", "plus", "bien", "tres", "cela", "sur",
+  "leur", "leurs", "elle", "elles", "ils", "sont", "sera", "sont", "meme", "aussi",
+]);
+
+// Lowercased, accent-stripped, alnum-only tokens of length >= 4, minus a
+// small stopword list — deliberately crude (no stemming, no lemmatization)
+// so behavior stays fully deterministic and easy to reason about in tests.
+function significantWords(text: string): Set<string> {
+  const normalized = text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9\s]/g, " ");
+  return new Set(normalized.split(/\s+/).filter((word) => word.length >= 4 && !FRENCH_STOPWORDS.has(word)));
+}
+
+// The claim<->evidence support check (docs C2 audit §D/§E) — intentionally
+// NOT isGroundedText/isSupportedFactualClaim from the LinkedIn pipeline
+// above: those are built around a closed set of fact *types*, which has no
+// equivalent in free-form conversation text. This is instead a simple,
+// conservative word-overlap heuristic: a claim is considered supported by an
+// evidence only if they share at least 2 significant words (or all of the
+// claim's significant words, if it has fewer than 2) — no embeddings, no
+// fuzzy similarity, no second LLM call. A claim with fewer than 2 shared
+// words with EVERY cited evidence is rejected — a false negative here costs
+// nothing but a safe fallback (docs C2 audit: preferred over a false
+// positive that would expose a hallucination).
+const MIN_SHARED_SIGNIFICANT_WORDS = 2;
+
+function hasLexicalSupport(claimText: string, evidenceText: string): boolean {
+  const claimWords = significantWords(claimText);
+  if (claimWords.size === 0) return false;
+  const evidenceWords = significantWords(evidenceText);
+  const shared = [...claimWords].filter((word) => evidenceWords.has(word));
+  return shared.length >= Math.min(MIN_SHARED_SIGNIFICANT_WORDS, claimWords.size);
+}
+
+// A fixed, narrow category of claim about the PROSPECT's own state — the
+// one category that can never be honestly supported by an outbound (our
+// own) message alone, no matter how it's phrased (docs C2 audit §E/§correction
+// point 6/7). Matches both a self-declared claim's own text (below) and a
+// backstop scan of the whole generated text, independent of what the model
+// chose to self-report as a claim — a model that simply omits a claim must
+// not be a way around this check (same principle as LinkedIn's
+// NEED_OR_PROBLEM_ASSERTION backstop, re-derived here for WhatsApp's
+// evidence shape rather than forced from it).
+const PROSPECT_STATE_ASSERTION = /\b(int[ée]ress[ée]e?s?|besoins?|priorit[ée]s?|d[ée]fis?|objections?|pr[ée]occupations?|difficult[ée]s?|devis|rendez-vous|rdv|budget|d[ée]cisions?|engag[ée]?e?s?|promis(?:e|es)?|attend(?:iez|ez|u|ait|ons)?|convenus?|accord[ée]?s?)\b/i;
+
+// A "factual" segment must be evidence-backed exactly like the old
+// per-claim check (unchanged reasoning): every cited evidenceId must be
+// real, a prospect-state assertion needs at least one INBOUND citation
+// (docs C2 audit §E, correction §7), and the segment's own words must
+// lexically overlap the cited evidence.
+function isAcceptableFactualSegment(segment: WhatsAppSegment, evidenceById: Map<string, WhatsAppEvidence>): boolean {
+  if (segment.supportedByEvidenceIds.length === 0) return false; // an admitted-unsupported factual segment
+  const cited: WhatsAppEvidence[] = [];
+  for (const id of segment.supportedByEvidenceIds) {
+    const evidence = evidenceById.get(id);
+    if (!evidence) return false; // citing an evidenceId that doesn't exist — never trusted
+    cited.push(evidence);
+  }
+  const eligible = PROSPECT_STATE_ASSERTION.test(segment.text) ? cited.filter((evidence) => evidence.direction === "inbound") : cited;
+  if (eligible.length === 0) return false;
+  return eligible.some((evidence) => hasLexicalSupport(segment.text, evidence.text));
+}
+
+// A "generic" segment claims to assert NOTHING about the prospect — so the
+// server holds it to that claim instead of trusting the label: (1) it may
+// not cite any evidence at all (a generic segment has nothing to prove; a
+// citation is itself a contradiction), (2) it still must not match the
+// closed PROSPECT_STATE_ASSERTION vocabulary (cheap, catches the easy
+// mislabeling case), and (3) — the actual close of the gap this correction
+// is for — it must not lexically resemble any real evidence message. A
+// model that reformulates real evidence in different words and mislabels
+// the result "generic" to dodge the evidence requirement will, in practice,
+// still share real vocabulary with the evidence it paraphrased; that
+// resemblance is exactly what this check is built to catch, and it doesn't
+// depend on any fixed list of forbidden words the way (2) does.
+function isAcceptableGenericSegment(segment: WhatsAppSegment, evidence: WhatsAppEvidence[]): boolean {
+  if (segment.supportedByEvidenceIds.length > 0) return false;
+  if (PROSPECT_STATE_ASSERTION.test(segment.text)) return false;
+  return !evidence.some((item) => hasLexicalSupport(segment.text, item.text));
+}
+
+function isAcceptableSegment(segment: WhatsAppSegment, evidence: WhatsAppEvidence[], evidenceById: Map<string, WhatsAppEvidence>): boolean {
+  if (!segment.text.trim()) return false; // no empty segments padding the reconstructed message
+  return segment.kind === "factual" ? isAcceptableFactualSegment(segment, evidenceById) : isAcceptableGenericSegment(segment, evidence);
+}
+
+// The single acceptance gate (docs C2 audit §J/§correction) — a generation is
+// used ONLY if every segment passes, and the text sent is reconstructed
+// SERVER-SIDE from those validated segments, never the model's own
+// free-form string: there is no text span left unaccounted for by either
+// isAcceptableFactualSegment or isAcceptableGenericSegment. `uncertain` is
+// checked first and unconditionally: true always forces fallback regardless
+// of what follows, and false never skips the checks below — the model is
+// never its own final judge either way.
+function isAcceptableWhatsAppGeneration(output: WhatsAppGenerationOutput, evidence: WhatsAppEvidence[]): { ok: true; text: string } | { ok: false } {
+  if (output.uncertain) return { ok: false };
+  if (!output.segments.length) return { ok: false };
+  const evidenceById = new Map(evidence.map((item) => [item.evidenceId, item]));
+  if (!output.segments.every((segment) => isAcceptableSegment(segment, evidence, evidenceById))) return { ok: false };
+  const text = output.segments.map((segment) => segment.text.trim()).filter(Boolean).join(" ");
+  if (!text) return { ok: false };
+  if (text.length > MAX_WHATSAPP_TEXT_LENGTH) return { ok: false }; // rejected outright — never truncated (docs C2 correction §2)
+  return { ok: true, text };
+}
+
+function buildWhatsAppEvidenceBlock(evidence: WhatsAppEvidence[]): string {
+  if (!evidence.length) return "(aucun message exploitable)";
+  return evidence.map((item) => `- [${item.evidenceId}] ${item.direction === "inbound" ? "Le prospect a écrit" : "Vous avez écrit"} : "${item.text}"`).join("\n");
+}
+
+// follow_up vs reactivation is a TONE policy, never a fact (docs C2 audit
+// §F/§correction) — neither branch may assert that a specific action is
+// pending, nor invent a reason for silence; only daysSinceLastMessage (a
+// real, observed number from C1) may inform the reactivation tone.
+function buildWhatsAppObjectivePolicy(objective: CampaignObjective, daysSinceLastMessage: number | null): string {
+  if (objective === "reactivation") {
+    return `Réactivation : cette relation est devenue inactive${daysSinceLastMessage !== null ? ` (${daysSinceLastMessage} jour(s) depuis le dernier message)` : ""}. Reprends contact de façon douce, sans reproche, sans jamais supposer ou expliquer pourquoi le prospect n'a pas répondu — le silence n'est la preuve d'aucun sentiment ni d'aucune raison précise.`;
+  }
+  return `Suivi (follow_up) : continuité directe de la conversation. N'affirme JAMAIS qu'une action précise (devis, rendez-vous, décision, engagement) est en attente ou promise, sauf si un message du prospect (CONVERSATION EVIDENCE, direction "reçu du prospect") le prouve explicitement.`;
+}
+
+function buildWhatsAppPrompt(evidence: WhatsAppEvidence[], contact: WhatsAppContactFacts, businessContext: BusinessContextRecord | null, objective: CampaignObjective, daysSinceLastMessage: number | null, guidance?: string): string {
+  return [
+    `=== CONVERSATION EVIDENCE (seule source de vérité sur ce que le prospect a dit ou fait — chaque ligne porte son identifiant [eN]) ===\n${buildWhatsAppEvidenceBlock(evidence)}`,
+    `=== CONTACT FACTS (identité connue — permet une salutation ou une référence à l'entreprise, ne prouve AUCUNE intention ni situation commerciale) ===\nPrénom : ${contact.firstName || contact.name}${contact.company ? `\nEntreprise : ${contact.company}` : ""}`,
+    `=== BUSINESS FACTS (décrit VOTRE entreprise, l'expéditeur — ne prouve RIEN sur le prospect) ===\n${businessContext?.companyName ?? "inconnue"}${businessContext?.businessDescription ? ` — ${businessContext.businessDescription}` : ""}`,
+    `=== CAMPAIGN OBJECTIVE / TONE POLICY (politique de ton uniquement — n'est JAMAIS une preuve) ===\n${buildWhatsAppObjectivePolicy(objective, daysSinceLastMessage)}`,
+    guidance ? `Consigne du fondateur pour ce message : ${guidance}` : null,
+    `INSTRUCTIONS :\nRédige une relance WhatsApp courte et humaine, découpée en une liste ORDONNÉE de \`segments\` qui, mis bout à bout dans l'ordre, forment le message final — n'écris aucun texte en dehors de ces segments.\n\nChaque segment est soit :\n- "generic" : formulation relationnelle qui n'affirme RIEN de spécifique sur ce prospect ou cette conversation — salutation ("Bonjour Marc"), politesse ("j'espère que vous allez bien"), relance conversationnelle ("je me permets de revenir vers vous"), question ouverte générique ("est-ce toujours d'actualité ?"). Un segment "generic" ne cite AUCUN identifiant dans \`supportedByEvidenceIds\` (tableau vide) — s'il en cite un, ce n'est pas générique.\n- "factual" : affirmation NOUVELLE portant sur le prospect ou la conversation (intérêt, besoin, situation, engagement, objection, action attendue). \`supportedByEvidenceIds\` DOIT alors citer UNIQUEMENT les identifiants [eN] de CONVERSATION EVIDENCE qui la justifient réellement — jamais un identifiant inventé.\n\nUne information tirée de CONTACT FACTS ou BUSINESS FACTS (prénom, entreprise, ce que vous proposez) reste "generic" : ce n'est pas une preuve sur le prospect, juste une identité déjà connue.\n\nNe classe JAMAIS un segment "generic" s'il affirme réellement quelque chose de spécifique sur ce prospect — un tel segment sera rejeté, et le rejet d'un seul segment invalide tout le message. S'il n'y a aucune affirmation à faire, un seul segment "generic" (question ouverte ou relance conversationnelle) est le cas normal et attendu.\n\nLe message final (tous les segments concaténés) doit faire ${MAX_WHATSAPP_TEXT_LENGTH} caractères maximum — sois concis dès la rédaction, un message trop long sera rejeté entièrement, jamais coupé.\n\nIndique \`uncertain: true\` si le contexte disponible est trop pauvre pour une relance vraiment pertinente — dans ce cas garde un contenu simple plutôt que de forcer une personnalisation qui dépasserait ce que tu sais réellement. Réponds en français.`,
+  ].filter(Boolean).join("\n\n");
+}
+
+// The one AI call for one message step. Always returns a usable text —
+// either a validated, grounded proposal or the same deterministic
+// `fallbackText` the caller already computed from the Contact's own known
+// fields — never a rejected/ungrounded text exposed as a valid proposition
+// (docs C2 correction: "Le texte IA rejeté ne doit jamais être exposé comme
+// proposition valide").
+async function generateGroundedWhatsAppMessage(
+  evidence: WhatsAppEvidence[],
+  contact: WhatsAppContactFacts,
+  businessContext: BusinessContextRecord | null,
+  objective: CampaignObjective,
+  daysSinceLastMessage: number | null,
+  fallbackText: string,
+  guidance?: string,
+): Promise<{ text: string; generationMode: GenerationMode; aiModel: string | null }> {
+  const provider = getAIProvider();
+  if (!provider) return { text: fallbackText, generationMode: "deterministic_fallback", aiModel: null };
+
+  try {
+    const result = await provider.generateStructured<WhatsAppGenerationOutput>({
+      system: "Tu écris des relances WhatsApp humaines et courtes, découpées en segments \"generic\" ou \"factual\", fondées STRICTEMENT sur les messages réellement échangés (CONVERSATION EVIDENCE) pour tout segment factual. Le Contact et le Business Context ne sont que des informations d'identité, jamais des preuves sur l'état ou l'intention du prospect. Réponds en français.",
+      prompt: buildWhatsAppPrompt(evidence, contact, businessContext, objective, daysSinceLastMessage, guidance),
+      schemaName: "WhatsAppPersonalization",
+      schema: WHATSAPP_ARTIFACT_SCHEMA,
+      maxTokens: 400,
+    });
+    const verdict = isAcceptableWhatsAppGeneration(result.data, evidence);
+    if (!verdict.ok) return { text: fallbackText, generationMode: "deterministic_fallback", aiModel: null };
+    return { text: verdict.text, generationMode: "ai_grounded", aiModel: result.model };
+  } catch {
+    return { text: fallbackText, generationMode: "deterministic_fallback", aiModel: null };
+  }
 }
 
 export async function generateWhatsAppParticipantPersonalization(context: WorkspaceContext, campaignId: string, participantId: string): Promise<GenerateOutcome> {
@@ -600,18 +861,50 @@ export async function generateWhatsAppParticipantPersonalization(context: Worksp
   );
   if (messageSteps.rows.length === 0) return { ok: false, reason: "NO_STEP_CONFIGURED" };
 
+  // Separate, minimal lookup — kept apart from the participant/contact
+  // queries above so their existing SQL (and every test built around it)
+  // stays untouched; objective is a tone-policy input only (docs C2 audit
+  // §F), never merged into any fact-bearing query.
+  const campaignRow = await database.query<{ objective: CampaignObjective }>(
+    `select objective from campaigns where workspace_id=$1 and id=$2`,
+    [context.workspaceId, campaignId],
+  );
+  const objective: CampaignObjective = campaignRow.rows[0]?.objective ?? "follow_up";
+
+  const businessContext = await getActiveBusinessContext(context);
+  // C1's canonical Context Builder — reused verbatim, workspace isolation
+  // and canonical Conversation resolution already guaranteed there. Null
+  // (no eligible Conversation) degrades to an empty evidence set below,
+  // never an error.
+  const conversationContext = await buildWhatsAppConversationContext(context.workspaceId, participant.contact_id);
+  const evidence = conversationContext ? buildWhatsAppEvidence(conversationContext.recentMessages) : [];
+  const daysSinceLastMessage = conversationContext?.daysSinceLastMessage ?? null;
+  // No AI call at all when there's no inbound message to ground on (docs C2
+  // audit §Audit 13/K — never spend a provider call when the outcome is
+  // knowable in advance): an outbound-only or empty evidence set can never
+  // support a prospect-state claim, so the deterministic fallback is not
+  // just safer here, it's guaranteed to be what validation would produce
+  // anyway.
+  const hasInboundEvidence = evidence.some((item) => item.direction === "inbound");
+
   const observedFacts: ObservedFact[] = [{ type: "name", value: contact.name, source: "contact" }];
   if (contact.company) observedFacts.push({ type: "company", value: contact.company, source: "contact" });
+  for (const item of evidence) observedFacts.push({ type: item.direction === "inbound" ? "conversation_inbound" : "conversation_outbound", value: item.text, source: "whatsapp_conversation" });
 
   const existing = (await getParticipantPersonalization(context, campaignId, participantId)) ?? emptyPersonalization();
   let messages = existing.messages;
+  let lastAiModel: string | null = existing.aiModel;
   for (const step of messageSteps.rows) {
     const current = messages.find((entry) => entry.stepId === step.id);
     if (current?.status === "approved") continue; // never silently overwrite an approved message (docs spec §9/§16)
-    const text = step.message_template?.trim()
+    const fallbackText = step.message_template?.trim()
       ? substituteContactPlaceholders(step.message_template, contact).slice(0, 1000)
       : deterministicWhatsAppMessage(contact);
-    messages = mergeMessageArtifact(messages, step.id, text);
+    const generated = hasInboundEvidence
+      ? await generateGroundedWhatsAppMessage(evidence, contact, businessContext, objective, daysSinceLastMessage, fallbackText, step.message_template ?? undefined)
+      : { text: fallbackText, generationMode: "deterministic_fallback" as const, aiModel: null };
+    if (generated.generationMode === "ai_grounded") lastAiModel = generated.aiModel;
+    messages = mergeMessageArtifact(messages, step.id, generated.text, generated.generationMode);
   }
 
   const next: ParticipantPersonalization = {
@@ -620,7 +913,7 @@ export async function generateWhatsAppParticipantPersonalization(context: Worksp
     invitation: existing.invitation,
     messages,
     generatedAt: new Date().toISOString(),
-    aiModel: null,
+    aiModel: lastAiModel,
   };
   const ok = await savePersonalization(context, campaignId, participantId, next);
   if (!ok) return { ok: false, reason: "NOT_ELIGIBLE" };
