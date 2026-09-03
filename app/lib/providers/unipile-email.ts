@@ -7,6 +7,7 @@ import {
   PROVIDER,
   type IngestResult,
 } from "./unipile-adapter";
+import { normalizeEmail } from "../../app/contacts/contact-utils";
 import { getEmailByMessageId, getUnipileConfig, sendEmail, type UnipileEmail, type UnipileEmailAttendee, type UnipileNewEmailPayload } from "./unipile";
 
 // Email ingestion. Deliberately a separate module from unipile-adapter.ts's
@@ -288,68 +289,161 @@ export type EmailBackfillResult = { messagesInserted: number; threadsTouched: nu
 // new inbound. That is enforced structurally here — this function simply
 // never calls stopParticipantsOnReply — rather than by a flag some future
 // caller could forget to pass.
+type ImportableEmail = {
+  threadKey: string;
+  direction: "inbound" | "outbound";
+  address: string;
+  normalizedAddress: string;
+  displayName: string;
+  email: UnipileEmail;
+};
+
+// Pure, no I/O: decides what a raw provider email means before any
+// connection is opened. An email with no thread key or no resolvable
+// counterparty is skipped rather than failing the page — the same tolerance
+// the per-email version had, kept deliberately.
+function toImportable(email: UnipileEmail): ImportableEmail | null {
+  const threadKey = email.thread_id ?? email.message_id ?? email.id;
+  if (!threadKey) return null;
+  // role is the provider's own folder classification; 'sent' is the only one
+  // that unambiguously means we authored it.
+  const direction = email.role === "sent" ? "outbound" : "inbound";
+  const counterparty = direction === "inbound" ? email.from_attendee : email.to_attendees?.[0];
+  const address = attendeeAddress(counterparty);
+  if (!address) return null;
+  return { threadKey, direction, address, normalizedAddress: normalizeEmail(address), displayName: counterparty?.display_name ?? "", email };
+}
+
+function importedMetadata(item: ImportableEmail): string {
+  const { email, direction, address } = item;
+  return JSON.stringify({
+    ...(email.subject ? { subject: email.subject } : {}),
+    ...(email.message_id ? { emailMessageId: email.message_id } : {}),
+    ...(email.provider_id ? { emailProviderId: email.provider_id } : {}),
+    ...(direction === "inbound" ? { from: address } : {}),
+    ...(email.attachments?.length ? { attachments: email.attachments.map((a) => ({ id: a.id, ...(a.name ? { name: a.name } : {}), ...(a.mime ? { mime: a.mime } : {}) })) } : {}),
+    imported: true,
+  } satisfies EmailMessageMetadata);
+}
+
+type ImportedMessageRow = {
+  workspaceId: string; conversationId: string; direction: "inbound" | "outbound";
+  senderContactId: string | null; body: string; status: "sent" | "received";
+  providerMessageId: string; timestamp: string; metadataJson: string;
+};
+
+// ONE multi-row INSERT for a whole page instead of one round trip per email.
+// Same idempotence as before — ON CONFLICT DO NOTHING on
+// (conversation_id, provider_message_id) — and `returning` still yields
+// exactly the rows that were genuinely new, which is what the caller counts.
+// DO NOTHING rather than the chat backfill's DO UPDATE: a historical email is
+// immutable here, and re-importing must never rewrite a row (nor clear its
+// imported flag).
+function buildImportedEmailInsert(rows: ImportedMessageRow[]): { sql: string; params: unknown[] } {
+  const values: string[] = [];
+  const params: unknown[] = [];
+  rows.forEach((row, index) => {
+    const base = index * 9;
+    const [p1, p2, p3, p4, p5, p6, p7, p8, p9] = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => base + n);
+    values.push(`($${p1},$${p2},$${p3},$${p4},$${p5},$${p6},$${p7},case when $${p3}::varchar='outbound' then $${p8}::timestamptz else null end,case when $${p3}::varchar='inbound' then $${p8}::timestamptz else null end,$${p9}::jsonb)`);
+    params.push(row.workspaceId, row.conversationId, row.direction, row.senderContactId, row.body, row.status, row.providerMessageId, row.timestamp, row.metadataJson);
+  });
+  return {
+    sql: `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at,metadata)
+     values ${values.join(",")}
+     on conflict(conversation_id,provider_message_id) where provider_message_id is not null do nothing
+     returning id,conversation_id,provider_message_id`,
+    params,
+  };
+}
+
 export async function persistImportedEmails(workspaceId: string, connectionId: string, emails: UnipileEmail[]): Promise<EmailBackfillResult> {
-  let messagesInserted = 0;
-  const threadsTouched = new Set<string>();
+  // Decided before opening anything — no connection is held while parsing.
+  const items = emails.map(toImportable).filter((item): item is ImportableEmail => item !== null);
+  if (!items.length) return { messagesInserted: 0, threadsTouched: 0 };
 
-  for (const email of emails) {
-    const threadKey = email.thread_id ?? email.message_id ?? email.id;
-    if (!threadKey) continue;
-    // role is the provider's own folder classification; 'sent' is the only
-    // one that unambiguously means we authored it.
-    const direction = email.role === "sent" ? "outbound" : "inbound";
-    const counterparty = direction === "inbound" ? email.from_attendee : email.to_attendees?.[0];
-    const address = attendeeAddress(counterparty);
-    if (!address) continue;
+  // ONE connection and ONE short transaction for the whole page. The previous
+  // version opened a connection and a transaction PER EMAIL, which measured
+  // ~1 message/second against Neon on the first real Gmail import — the round
+  // trips, not the work, were the cost. No provider call happens in here:
+  // the page was already fetched by the caller, so this transaction never
+  // spans network I/O.
+  const client = await database.connect();
+  try {
+    await client.query("begin");
 
-    const client = await database.connect();
-    try {
-      await client.query("begin");
-      const contactId = await findOrCreateContact(client, workspaceId, "email", address, undefined, counterparty?.display_name ?? "");
-      const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, "email", threadKey, contactId);
-      if (email.subject) {
-        await client.query(`update conversations set subject=$2 where id=$1 and (subject is null or subject='')`, [conversationId, email.subject]);
+    // Within one page the same address and the same thread recur constantly
+    // (a thread is several emails). Resolving each once collapses the bulk of
+    // the remaining per-email round trips, and makes a thread's Contact
+    // stable across the page instead of being rewritten by each message.
+    const contactByAddress = new Map<string, string>();
+    const conversationByThread = new Map<string, string>();
+    const rows: ImportedMessageRow[] = [];
+
+    for (const item of items) {
+      let contactId = contactByAddress.get(item.normalizedAddress);
+      if (!contactId) {
+        contactId = await findOrCreateContact(client, workspaceId, "email", item.address, undefined, item.displayName);
+        contactByAddress.set(item.normalizedAddress, contactId);
       }
-      const inserted = await client.query<{ id: string }>(
-        `insert into messages(workspace_id,conversation_id,direction,sender_contact_id,body,status,provider_message_id,sent_at,received_at,metadata)
-         values($1,$2,$3,$4,$5,$6,$7,case when $3::varchar='outbound' then $8::timestamptz else null end,case when $3::varchar='inbound' then $8::timestamptz else null end,$9)
-         on conflict(conversation_id,provider_message_id) where provider_message_id is not null do nothing
-         returning id`,
-        [
-          workspaceId,
-          conversationId,
-          direction,
-          direction === "inbound" ? contactId : null,
-          toPlainTextBody(email),
-          direction === "inbound" ? "received" : "sent",
-          email.id,
-          email.date,
-          JSON.stringify({
-            ...(email.subject ? { subject: email.subject } : {}),
-            ...(email.message_id ? { emailMessageId: email.message_id } : {}),
-            ...(email.provider_id ? { emailProviderId: email.provider_id } : {}),
-            ...(address ? { from: direction === "inbound" ? address : undefined } : {}),
-            ...(email.attachments?.length ? { attachments: email.attachments.map((a) => ({ id: a.id, ...(a.name ? { name: a.name } : {}), ...(a.mime ? { mime: a.mime } : {}) })) } : {}),
-            imported: true,
-          } satisfies EmailMessageMetadata),
-        ],
-      );
-      if (inserted.rows[0]) {
-        messagesInserted += 1;
-        await client.query(
-          `update conversations set last_message_at=greatest(coalesce(last_message_at,$2::timestamptz),$2::timestamptz),updated_at=now() where id=$1`,
-          [conversationId, email.date],
-        );
+
+      let conversationId = conversationByThread.get(item.threadKey);
+      if (!conversationId) {
+        conversationId = await findOrCreateConversation(client, workspaceId, connectionId, "email", item.threadKey, contactId);
+        conversationByThread.set(item.threadKey, conversationId);
+        if (item.email.subject) {
+          // First subject seen wins — a "Re:" must not rewrite the original.
+          await client.query(`update conversations set subject=$2 where id=$1 and (subject is null or subject='')`, [conversationId, item.email.subject]);
+        }
       }
-      threadsTouched.add(threadKey);
-      await client.query("commit");
-    } catch (error) {
-      await client.query("rollback");
-      throw error;
-    } finally {
-      client.release();
+
+      rows.push({
+        workspaceId,
+        conversationId,
+        direction: item.direction,
+        senderContactId: item.direction === "inbound" ? contactId : null,
+        body: toPlainTextBody(item.email),
+        status: item.direction === "inbound" ? "received" : "sent",
+        providerMessageId: item.email.id,
+        timestamp: item.email.date,
+        metadataJson: importedMetadata(item),
+      });
     }
-  }
 
-  return { messagesInserted, threadsTouched: threadsTouched.size };
+    const insert = buildImportedEmailInsert(rows);
+    const inserted = await client.query<{ id: string; conversation_id: string; provider_message_id: string }>(insert.sql, insert.params);
+
+    // Only conversations that actually received a new message move their
+    // last_message_at, exactly as before — and only to the newest date among
+    // the rows just inserted, applied in ONE statement rather than one per
+    // message. greatest() keeps this monotonic against realtime ingestion.
+    const newestByConversation = new Map<string, string>();
+    const dateByProviderId = new Map(rows.map((row) => [row.providerMessageId, row.timestamp]));
+    for (const row of inserted.rows) {
+      const date = dateByProviderId.get(row.provider_message_id);
+      if (!date) continue;
+      const current = newestByConversation.get(row.conversation_id);
+      if (!current || current < date) newestByConversation.set(row.conversation_id, date);
+    }
+    if (newestByConversation.size) {
+      await client.query(
+        `update conversations c set last_message_at=greatest(coalesce(c.last_message_at,v.ts),v.ts),updated_at=now()
+         from (select unnest($1::uuid[]) as id, unnest($2::timestamptz[]) as ts) v
+         where c.id=v.id`,
+        [[...newestByConversation.keys()], [...newestByConversation.values()]],
+      );
+    }
+
+    await client.query("commit");
+    return { messagesInserted: inserted.rows.length, threadsTouched: conversationByThread.size };
+  } catch (error) {
+    // A page fails as a unit and is re-tried whole on the next run — safe
+    // precisely because every insert is idempotent. The error is never
+    // swallowed: it propagates to backfillConnectionHistory, which counts the
+    // page as failed and logs it.
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
