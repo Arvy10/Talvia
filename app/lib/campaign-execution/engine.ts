@@ -1,6 +1,7 @@
 import { database } from "../database";
 import type { CampaignChannel, CampaignObjective } from "../campaigns";
 import type { WorkspaceContext } from "../workspace-context";
+import { emailExecutor } from "./email-executor";
 import { linkedInExecutor } from "./linkedin-executor";
 import { consumeDueWaitSteps } from "./step-progression";
 import type { ChannelExecutor, EngineRunSummary } from "./types";
@@ -18,6 +19,11 @@ const EXECUTORS: Array<{ channel: CampaignChannel; objective: CampaignObjective;
   { channel: "linkedin", objective: "prospecting", executor: linkedInExecutor },
   { channel: "whatsapp", objective: "follow_up", executor: whatsAppExecutor },
   { channel: "whatsapp", objective: "reactivation", executor: whatsAppExecutor },
+  // Email, same two objectives as WhatsApp: 'prospecting' stays LinkedIn-only
+  // (it is the invite/accept flow), so an email campaign is always a
+  // follow-up or a reactivation of a relationship that already exists.
+  { channel: "email", objective: "follow_up", executor: emailExecutor },
+  { channel: "email", objective: "reactivation", executor: emailExecutor },
 ];
 
 function pickExecutor(channel: CampaignChannel, objective: CampaignObjective): ChannelExecutor | null {
@@ -46,9 +52,10 @@ export async function runDueCampaignActions(context: WorkspaceContext, campaignI
   await consumeDueWaitSteps(context.workspaceId, campaignId);
 
   const executor = pickExecutor(row.channel_type, row.objective);
-  // Not every (channel, objective) has an executor yet (WhatsApp/Email
-  // are deliberately not built) — that is not a failure, just nothing this
-  // engine currently automates for this campaign.
+  // Not every (channel, objective) pair has an executor — e.g. email or
+  // WhatsApp with objective 'prospecting', which is LinkedIn's invite/accept
+  // flow and has no meaning on those channels. That is not a failure, just
+  // nothing this engine automates for that campaign.
   if (!executor) return { attempted: 0, sent: 0, skipped: 0, failed: 0 };
 
   return executor.runDueActions(context, campaignId, opts);

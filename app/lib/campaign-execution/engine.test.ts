@@ -105,6 +105,16 @@ function createFakeDatabase() {
       return { rows: eligible.map((p) => ({ id: p.id, current_step_id: p.current_step_id })) };
     }
 
+    // --- email-executor.ts (same shape the WhatsApp executor uses) ---
+    if (text.startsWith("select exists(select 1 from connections where workspace_id=$1 and provider='unipile' and channel_type='email' and status='connected')")) {
+      const [workspaceId] = params as string[];
+      return { rows: [{ connected: connections.some((c) => c.workspace_id === workspaceId && c.channel_type === "email" && c.status === "connected") }] };
+    }
+    if (text.startsWith("select step_type from campaign_steps where campaign_id=$1 and step_type='message'")) {
+      const [campaignId] = params as string[];
+      return { rows: campaignSteps.filter((s) => s.campaign_id === campaignId && s.step_type === "message").map((s) => ({ step_type: s.step_type })) };
+    }
+
     // --- linkedin-executor.ts ---
     if (text.startsWith("select external_account_id from connections")) {
       const [workspaceId] = params as string[];
@@ -188,9 +198,15 @@ function createFakeDatabase() {
       if (row) { row.last_error_code = null; row.last_error_at = null; }
       return { rows: [] };
     }
+    // conversation-resolution.ts's canonical rule. The channel comes from $3
+    // — it used to be hardcoded to 'linkedin' here, which was invisible while
+    // only LinkedIn had an executor but would have hidden a real
+    // channel-crossing bug (executeMessageStep passes channelType precisely so
+    // a Contact's LinkedIn thread can never receive an email campaign's
+    // message, and vice versa).
     if (text.startsWith("select id from conversations where workspace_id=$1 and contact_id=$2")) {
-      const [workspaceId, contactId] = params as string[];
-      const row = conversations.find((c) => c.workspace_id === workspaceId && c.contact_id === contactId && c.channel_type === "linkedin");
+      const [workspaceId, contactId, channelType] = params as string[];
+      const row = conversations.find((c) => c.workspace_id === workspaceId && c.contact_id === contactId && c.channel_type === channelType);
       return { rows: row ? [{ id: row.id }] : [] };
     }
 
@@ -209,7 +225,10 @@ vi.mock("../providers/unipile", async (importOriginal) => ({
   getUnipileConfig: () => ({ apiKey: "test-key", apiUrl: "https://api.test", webhookSecret: "test-secret", appBaseUrl: "https://app.test" }),
   sendLinkedInInvitation: sendLinkedInInvitationMock,
 }));
-const sendMessageMock = vi.hoisted(() => vi.fn(async () => ({ id: "msg-1", body: "", direction: "outbound" as const, status: "sent" as const, createdAt: new Date().toISOString() })));
+// Declared with sendMessage's real signature (including the 4th
+// idempotency-key argument) so mock.calls is typed and the key assertions
+// below can read call[3] instead of casting.
+const sendMessageMock = vi.hoisted(() => vi.fn(async (_workspaceId: string, _conversationId: string, _text: string, _idempotencyKey?: string) => ({ id: "msg-1", body: "", direction: "outbound" as const, status: "sent" as const, createdAt: new Date().toISOString() })));
 vi.mock("../providers/unipile-adapter", () => ({ sendMessage: sendMessageMock }));
 vi.mock("../ai", () => ({ getAIProvider: () => null }));
 vi.mock("../business-context/business-context-service", () => ({ getActiveBusinessContext: async () => null }));
@@ -271,7 +290,8 @@ describe("runDueCampaignActions — combined E2E: WAIT consumed then message att
 
     await runDueCampaignActions(context, "camp-1");
 
-    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-part-1", "Message 2 approuvé.");
+    // 4th arg: the provider idempotency key for this (participant, step).
+    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-part-1", "Message 2 approuvé.", "part-1:camp-1-msg2");
     expect(participant.current_step_id).toBe("camp-1-end");
     expect(participant.status).toBe("completed");
   });
@@ -319,5 +339,163 @@ describe("runDueCampaignActions — combined E2E: reply lands after WAIT consump
     expect(participant.status).toBe("replied");
     // The one invariant this whole test exists to prove:
     expect(sendMessageMock).not.toHaveBeenCalled();
+  });
+});
+
+// Email routes through the SAME engine: same dispatch table, same WAIT
+// consumption, same claim/reverify/send path — the only email-specific part
+// is which connection must exist and which channel resolves the
+// conversation. These tests exist to prove there is no second engine.
+function seedConnectedEmailAccount() {
+  fakeDatabase.connections.push({ workspace_id: workspaceId, provider: "unipile", channel_type: "email", external_account_id: "acct-google-1", status: "connected" });
+}
+
+// message(0) -> wait 3d(1) -> message(2) -> end(3) — no invite step, the
+// same shape a WhatsApp follow-up uses.
+function seedEmailSequence(campaignId: string, objective = "follow_up", status = "active") {
+  fakeDatabase.campaigns.push({ id: campaignId, workspace_id: workspaceId, status, channel_type: "email", objective });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-msg1`, campaign_id: campaignId, position: 0, step_type: "message", message_template: null });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-wait`, campaign_id: campaignId, position: 1, step_type: "wait", delay_value: 3, delay_unit: "days", message_template: null });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-msg2`, campaign_id: campaignId, position: 2, step_type: "message", message_template: null });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-end`, campaign_id: campaignId, position: 3, step_type: "end", message_template: null });
+}
+
+function seedEmailParticipantOnDueWait(campaignId: string, participantId: string, approvedText: string | null = "Relance e-mail approuvée.") {
+  fakeDatabase.conversations.push({ id: `conv-${participantId}`, workspace_id: workspaceId, contact_id: `contact-${participantId}`, channel_type: "email", last_message_at: null, created_at: new Date().toISOString() });
+  fakeDatabase.campaignParticipants.push({
+    id: participantId, campaign_id: campaignId, contact_id: `contact-${participantId}`, status: "active", current_step_id: `${campaignId}-wait`,
+    invite_sent_at: null, invite_accepted_at: null, message_sent_at: null, step_claimed_at: null, last_action_at: ago(3 * DAY + 60_000),
+    personalization: {
+      evidence: { observedFacts: [], qualificationContext: null, strategyContext: null, uncertainties: [] },
+      outreachAngle: null,
+      invitation: EMPTY_TEXT,
+      messages: [approvedText
+        ? { stepId: `${campaignId}-msg2`, ...EMPTY_TEXT, status: "approved", generatedText: approvedText, approvedText, approvedAt: new Date().toISOString() }
+        : { stepId: `${campaignId}-msg2`, ...EMPTY_TEXT, status: "generated", generatedText: "Proposition non approuvée." }],
+      generatedAt: new Date().toISOString(), aiModel: null,
+    },
+  });
+  return fakeDatabase.campaignParticipants[fakeDatabase.campaignParticipants.length - 1]!;
+}
+
+describe("runDueCampaignActions — email dispatch (one engine, not a second one)", () => {
+  it("consumes the WAIT and sends the approved email through the shared send path", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    const participant = seedEmailParticipantOnDueWait("camp-email", "part-email");
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-part-email", "Relance e-mail approuvée.", "part-email:camp-email-msg2");
+    expect(summary.sent).toBe(1);
+    expect(participant.current_step_id).toBe("camp-email-end");
+    expect(participant.status).toBe("completed");
+  });
+
+  it("never sends without an approvedText, exactly like every other channel", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    seedEmailParticipantOnDueWait("camp-email", "part-email", null);
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(summary.sent).toBe(0);
+    expect(summary.failed).toBe(1);
+  });
+
+  it("blocks with NO_EMAIL_CONNECTION rather than pretending to send when no email account is connected", async () => {
+    seedEmailSequence("camp-email");
+    seedEmailParticipantOnDueWait("camp-email", "part-email");
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(summary.blockedReason).toBe("NO_EMAIL_CONNECTION");
+    expect(sendMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("does not send for a paused email campaign", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email", "follow_up", "paused");
+    seedEmailParticipantOnDueWait("camp-email", "part-email");
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(summary.blockedReason).toBe("CAMPAIGN_PAUSED");
+    expect(sendMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("has no executor for email + prospecting — that flow is LinkedIn's invite/accept, not an error", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email", "prospecting");
+    seedEmailParticipantOnDueWait("camp-email", "part-email");
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(summary).toEqual({ attempted: 0, sent: 0, skipped: 0, failed: 0 });
+    expect(sendMessageMock).not.toHaveBeenCalled();
+  });
+});
+
+// The double-send window this closes: the provider accepts the email, the
+// HTTP response is lost, nothing records message_sent_at, the claim is
+// released, and the next engine run retries. Only the provider can
+// deduplicate that — and only if Talvia hands it the SAME key both times.
+describe("email send idempotency key (provider-side double-send protection)", () => {
+  const keyOf = (callIndex: number) => sendMessageMock.mock.calls[callIndex]![3];
+
+  it("sends the same key on a retry of the same participant+step after a provider failure", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    const participant = seedEmailParticipantOnDueWait("camp-email", "part-email");
+
+    // Attempt 1: the provider call throws (timeout). The engine must not
+    // record a send, and must leave the participant retryable.
+    sendMessageMock.mockRejectedValueOnce(new Error("Unipile send email failed (504)."));
+    await runDueCampaignActions(context, "camp-email");
+    expect(participant.message_sent_at).toBeFalsy();
+    expect(participant.step_claimed_at).toBeNull(); // claim released -> retryable
+
+    // Attempt 2: the retry of that same business action.
+    await runDueCampaignActions(context, "camp-email");
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(2);
+    expect(keyOf(0)).toBe(keyOf(1));
+    expect(keyOf(0)).toBe("part-email:camp-email-msg2");
+  });
+
+  it("gives a different key to a different participant and to a different step", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    seedEmailParticipantOnDueWait("camp-email", "part-a");
+    seedEmailParticipantOnDueWait("camp-email", "part-b");
+
+    await runDueCampaignActions(context, "camp-email");
+
+    const keys = sendMessageMock.mock.calls.map((call) => call[3]);
+    expect(new Set(keys).size).toBe(keys.length); // no two sends share a key
+    expect(keys).toContain("part-a:camp-email-msg2");
+    expect(keys).toContain("part-b:camp-email-msg2");
+
+    // A different step of the same participant is a different action.
+    sendMessageMock.mockClear();
+    seedEmailSequence("camp-two");
+    seedEmailParticipantOnDueWait("camp-two", "part-a2");
+    await runDueCampaignActions(context, "camp-two");
+    expect(sendMessageMock.mock.calls[0]![3]).toBe("part-a2:camp-two-msg2");
+  });
+
+  it("never derives the key from anything random — the same run twice produces the identical key", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    seedEmailParticipantOnDueWait("camp-email", "part-email");
+    sendMessageMock.mockRejectedValueOnce(new Error("boom"));
+    await runDueCampaignActions(context, "camp-email");
+    sendMessageMock.mockRejectedValueOnce(new Error("boom"));
+    await runDueCampaignActions(context, "camp-email");
+    await runDueCampaignActions(context, "camp-email");
+
+    const keys = sendMessageMock.mock.calls.map((call) => call[3]);
+    expect(new Set(keys).size).toBe(1);
   });
 });

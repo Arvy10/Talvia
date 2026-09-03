@@ -203,7 +203,7 @@ describe("runDueWhatsAppActions — message step (A)", () => {
     const result = await runDueWhatsAppActions(context, "camp-1");
 
     expect(result).toEqual({ attempted: 1, sent: 1, skipped: 0, failed: 0 });
-    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-wa-part-1", "Bonjour Jean, je me permets de revenir vers vous.");
+    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-wa-part-1", "Bonjour Jean, je me permets de revenir vers vous.", "part-1:camp-1-message");
     expect(participant.message_sent_at).not.toBeNull();
     expect(participant.current_step_id).toBe("camp-1-end");
     expect(participant.status).toBe("completed");
@@ -224,7 +224,7 @@ describe("runDueWhatsAppActions — conversation resolution guard (§2)", () => 
     expect(result).toEqual({ attempted: 1, sent: 1, skipped: 0, failed: 0 });
     // Exactly the WhatsApp conversation id — never the LinkedIn one for the
     // same contact.
-    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-wa-part-1", "Message WhatsApp réel.");
+    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-wa-part-1", "Message WhatsApp réel.", "part-1:camp-1-message");
     expect(participant.current_step_id).toBe("camp-1-end");
   });
 });

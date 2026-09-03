@@ -25,6 +25,23 @@ export function channelForProvider(accountType: string): ChannelId | null {
   return CHANNEL_BY_PROVIDER[accountType.toUpperCase() as UnipileProvider] ?? null;
 }
 
+// Talvia's DOMAIN channel vocabulary, which is NOT the UI's: every
+// channel_type column (connections, contact_identities, conversations,
+// campaigns, connection_auth_attempts) constrains values to
+// ('linkedin','whatsapp','email','instagram','other') — 'gmail' is a
+// presentation label owned by ChannelId/the Connections cards, and the
+// Connections UI already converts back the other way when it reads
+// connections.channel_type (ConnectionsClient.tsx). Persisting the UI id
+// straight into those columns violated their CHECK constraint, which is why
+// a Gmail connection failed on its very first INSERT before Unipile was ever
+// called. One conversion point, at the provider-adapter boundary, rather
+// than a ternary at each call site.
+export type DomainChannel = "linkedin" | "whatsapp" | "email";
+
+export function toDomainChannel(channel: ChannelId): DomainChannel {
+  return channel === "gmail" ? "email" : channel;
+}
+
 export type UnipileConfig = { apiKey: string; apiUrl: string; webhookSecret: string; appBaseUrl: string };
 
 // Mirrors the database.ts lesson from the production outage: a module that
@@ -128,7 +145,7 @@ export type UnipileNewMessagePayload = {
   attendees?: Array<{ attendee_id: string; attendee_name?: string; attendee_provider_id: string; attendee_profile_url?: string }>;
 };
 
-export type UnipileWebhookPayload = UnipileHostedAuthNotifyPayload | UnipileAccountStatusPayload | UnipileNewMessagePayload;
+export type UnipileWebhookPayload = UnipileHostedAuthNotifyPayload | UnipileAccountStatusPayload | UnipileNewMessagePayload | UnipileNewEmailPayload;
 
 export function isHostedAuthNotifyPayload(payload: UnipileWebhookPayload): payload is UnipileHostedAuthNotifyPayload {
   return "status" in payload && "name" in payload;
@@ -250,6 +267,156 @@ export async function editChatMessage(config: UnipileConfig, messageId: string, 
     signal: AbortSignal.timeout(20_000),
   });
   if (!response.ok) throw new Error(`Unipile edit message failed (${response.status}).`);
+}
+
+// --- Email (Gmail / Outlook / IMAP) ---
+// Email is NOT the /chats API: Unipile models mail as its own resource with
+// its own payload shape, so none of the chat helpers above apply to it.
+// Every field below is taken from Unipile's published schema
+// (https://developer.unipile.com/reference/mailscontroller_listmails,
+// /reference/mailscontroller_sendmail, /docs/new-emails-webhook) — nothing
+// here is inferred. Fields Talvia does not use are deliberately omitted
+// rather than guessed.
+//
+// Optionality discipline: only `id`/`date` (list) and `email_id`/`account_id`/
+// `event`/`date` (webhook) are treated as guaranteed. Everything else is
+// optional at the type level so a payload variation can never crash
+// ingestion — the adapter decides what a missing field means, per field.
+
+export type UnipileEmailAttendee = { display_name?: string; identifier: string; identifier_type?: string };
+
+export type UnipileEmailAttachment = { id: string; name?: string; size?: number; extension?: string; mime?: string; cid?: string; inline?: boolean };
+
+export type UnipileEmailReference = { message_id?: string; id?: string };
+
+// One item of GET /api/v1/emails. `thread_id` is the provider's own thread
+// grouping and is what Talvia keys conversations.external_thread_id on;
+// `provider_id` is what a later reply passes back as `reply_to`.
+export type UnipileEmail = {
+  id: string;
+  account_id?: string;
+  message_id?: string;
+  provider_id?: string;
+  thread_id?: string;
+  subject?: string;
+  date: string;
+  read_date?: string | null;
+  role?: string;
+  folders?: string[];
+  from_attendee?: UnipileEmailAttendee;
+  to_attendees?: UnipileEmailAttendee[];
+  cc_attendees?: UnipileEmailAttendee[];
+  bcc_attendees?: UnipileEmailAttendee[];
+  body?: string;
+  body_plain?: string;
+  has_attachments?: boolean;
+  attachments?: UnipileEmailAttachment[];
+  in_reply_to?: UnipileEmailReference;
+  origin?: "unipile" | "external";
+};
+
+// https://developer.unipile.com/docs/new-emails-webhook — note this payload
+// carries NO thread_id (unlike the list endpoint above), which is why
+// realtime ingestion has to resolve the thread another way rather than
+// inventing one. `origin` distinguishes a mail Unipile itself sent for us
+// ("unipile") from one that arrived/was sent outside Talvia ("external").
+export type UnipileNewEmailPayload = {
+  email_id: string;
+  account_id: string;
+  event: "mail_received" | "mail_sent" | "mail_moved";
+  date: string;
+  webhook_name?: string;
+  subject?: string;
+  body?: string;
+  body_plain?: string;
+  message_id?: string;
+  provider_id?: string;
+  folders?: string[];
+  role?: string;
+  from_attendee?: UnipileEmailAttendee;
+  to_attendees?: UnipileEmailAttendee[];
+  cc_attendees?: UnipileEmailAttendee[];
+  bcc_attendees?: UnipileEmailAttendee[];
+  reply_to_attendees?: UnipileEmailAttendee[];
+  has_attachments?: boolean;
+  attachments?: UnipileEmailAttachment[];
+  read_date?: string | null;
+  is_complete?: boolean;
+  in_reply_to?: UnipileEmailReference;
+  origin?: "unipile" | "external";
+  tracking_id?: string;
+};
+
+export function isNewEmailPayload(payload: UnipileWebhookPayload): payload is UnipileNewEmailPayload {
+  const event = (payload as UnipileNewEmailPayload).event;
+  return "email_id" in payload && typeof event === "string" && event.startsWith("mail_");
+}
+
+// https://developer.unipile.com/reference/mailscontroller_listmails — newest
+// first, cursor-paginated exactly like listChats. `limit` is capped at 250 by
+// the API; 100 matches the chat backfill's page size.
+export async function listEmails(config: UnipileConfig, accountId: string, cursor?: string): Promise<{ items: UnipileEmail[]; cursor: string | null }> {
+  const params = new URLSearchParams({ account_id: accountId, limit: "100" });
+  if (cursor) params.set("cursor", cursor);
+  const data = await unipileGet<{ items: UnipileEmail[]; cursor: string | null }>(config, `/api/v1/emails?${params.toString()}`);
+  return { items: data.items ?? [], cursor: data.cursor ?? null };
+}
+
+// The webhook payload has no thread_id, but the list endpoint accepts
+// `message_id` as a filter — so the canonical thread for a just-received
+// mail is looked up here rather than guessed. Returns null when the provider
+// genuinely has no match; throws on a transport/API failure so the caller
+// can let Unipile retry instead of persisting a half-resolved conversation.
+export async function getEmailByMessageId(config: UnipileConfig, accountId: string, messageId: string): Promise<UnipileEmail | null> {
+  const params = new URLSearchParams({ account_id: accountId, message_id: messageId, limit: "1" });
+  const data = await unipileGet<{ items: UnipileEmail[] }>(config, `/api/v1/emails?${params.toString()}`);
+  return data.items?.[0] ?? null;
+}
+
+export type SendEmailParams = {
+  accountId: string;
+  to: UnipileEmailAttendee[];
+  body: string;
+  subject?: string;
+  cc?: UnipileEmailAttendee[];
+  bcc?: UnipileEmailAttendee[];
+  // Unipile or provider id of the parent mail — this is what threads a reply
+  // (per the send reference); the subject should also keep its "Re: " prefix.
+  replyTo?: string;
+  // https://developer.unipile.com/reference/mailscontroller_sendmail — up to
+  // 255 chars, retained 24h. Retrying with the SAME key returns the original
+  // result instead of sending twice; reusing it with a different request is
+  // rejected as a conflict. This is the provider-side guarantee Talvia's
+  // campaign executor relies on so a retry can never double-send.
+  idempotencyKey?: string;
+};
+
+export type SendEmailResult = { providerId: string | null; trackingId: string | null };
+
+// The one call in this section with a real, irreversible external effect: a
+// real person receives a real email. JSON rather than multipart — both are
+// documented, and JSON avoids encoding recipient arrays as JSON strings
+// inside form fields.
+export async function sendEmail(config: UnipileConfig, params: SendEmailParams): Promise<SendEmailResult> {
+  const headers: Record<string, string> = { "X-API-KEY": config.apiKey, accept: "application/json", "content-type": "application/json" };
+  if (params.idempotencyKey) headers["Idempotency-Key"] = params.idempotencyKey;
+  const response = await fetch(`${config.apiUrl}/api/v1/emails`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      account_id: params.accountId,
+      to: params.to,
+      body: params.body,
+      ...(params.subject ? { subject: params.subject } : {}),
+      ...(params.cc?.length ? { cc: params.cc } : {}),
+      ...(params.bcc?.length ? { bcc: params.bcc } : {}),
+      ...(params.replyTo ? { reply_to: params.replyTo } : {}),
+    }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error(`Unipile send email failed (${response.status}).`);
+  const data = await response.json() as { object?: string; provider_id?: string | null; tracking_id?: string | null };
+  return { providerId: data.provider_id ?? null, trackingId: data.tracking_id ?? null };
 }
 
 // --- LinkedIn prospecting (search + invite) ---

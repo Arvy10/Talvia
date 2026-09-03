@@ -258,7 +258,7 @@ describe("runDueLinkedInActions — message step (C)", () => {
     expect(result).toEqual({ attempted: 1, sent: 1, skipped: 0, failed: 0 });
     // The executor sends exactly the persisted approved text — no
     // generation, no substitution, at send time (docs spec §10/§13).
-    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-part-msg-1", "Bonjour Jane, ravi de vous compter parmi mes relations !");
+    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-part-msg-1", "Bonjour Jane, ravi de vous compter parmi mes relations !", "part-msg-1:camp-1-message");
     expect(participant.message_sent_at).not.toBeNull();
     expect(participant.current_step_id).toBe("camp-1-end");
     expect(participant.status).toBe("completed");
@@ -521,7 +521,7 @@ describe("runDueLinkedInActions — follow-up step (J, K, M)", () => {
 
     expect(result).toEqual({ attempted: 1, sent: 1, skipped: 0, failed: 0 });
     // M: the follow-up's own text is sent — never message #1's.
-    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-part-1", "Texte de la relance.");
+    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-part-1", "Texte de la relance.", "part-1:camp-1-followup");
     const participant = fakeDatabase.campaignParticipants.find((p) => p.id === "part-1")!;
     expect(participant.current_step_id).toBe("camp-1-end");
   });
