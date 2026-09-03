@@ -21,14 +21,7 @@ const apiChannel = (channel: ChannelId) => channel === "gmail" ? "email" : chann
 // deliberate click rather than something that starts by itself on connect.
 const syncableChannels = new Set<ChannelId>(["linkedin", "whatsapp", "gmail"]);
 
-type SyncState = {
-  status: "pending" | "running" | "completed" | "failed";
-  chatsProcessed: number;
-  messagesImported: number;
-  chatsSkippedGroups: number;
-  chatsFailed: number;
-  error: string | null;
-};
+import { readSyncResponse, type SyncState } from "./sync-state";
 
 // Polls only while at least one channel actually has a sync in flight — a
 // completed/failed/absent state needs no polling at all.
@@ -89,13 +82,13 @@ export function ConnectionsClient() {
   const syncHistory = async (channel: ChannelId) => {
     setSyncingChannel(channel);
     const response = await fetch(`/api/connections/${channel}/sync`, { method: "POST" });
-    const data = await response.json().catch(() => null) as SyncState | { error: string } | null;
+    const data = await response.json().catch(() => null) as unknown;
     setSyncingChannel(null);
-    if (!response.ok || !data || "error" in data) {
-      setSyncStates((current) => ({ ...current, [channel]: { status: "failed", chatsProcessed: 0, messagesImported: 0, chatsSkippedGroups: 0, chatsFailed: 0, error: data && "error" in data ? data.error : "la requête a échoué." } }));
-      return;
-    }
-    setSyncStates((current) => ({ ...current, [channel]: data }));
+    // Discriminated on `status`, not on the presence of an `error` key — see
+    // readSyncResponse for why the latter reported every healthy sync as
+    // failed. A pending/running state returned here also keeps the polling
+    // effect below alive, which the fabricated "failed" used to kill.
+    setSyncStates((current) => ({ ...current, [channel]: readSyncResponse(response.ok, data) }));
   };
   const refreshConnections = () => fetch("/api/connections").then(async (response) => response.ok ? response.json() : null).then((data) => {
     if (!data) return;

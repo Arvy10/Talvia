@@ -18,12 +18,17 @@ function createFakeDatabase() {
   let seq = 0;
   const nextId = (prefix: string) => `${prefix}-${(seq += 1)}`;
   let openTransactions = 0;
+  // Counters proving the transactional N+1 is gone: a page must cost ONE
+  // connection and ONE transaction, not one per email.
+  let connectCount = 0;
+  let beginCount = 0;
+  let batchInsertCount = 0;
   // Proves no provider fetch is ever held inside an open transaction.
   const transactionDepth = () => openTransactions;
 
   async function query(sql: string, params: unknown[] = []) {
     const text = sql.replace(/\s+/g, " ").trim();
-    if (text === "begin") { openTransactions += 1; return { rows: [] }; }
+    if (text === "begin") { openTransactions += 1; beginCount += 1; return { rows: [] }; }
     if (text === "commit" || text === "rollback") { openTransactions -= 1; return { rows: [] }; }
 
     if (text.startsWith("select id,workspace_id,channel_type from connections where provider=$1 and external_account_id=$2")) {
@@ -87,13 +92,25 @@ function createFakeDatabase() {
       return { rows: [] };
     }
 
+    if (text.startsWith("update conversations c set last_message_at=greatest(coalesce(c.last_message_at,v.ts),v.ts)")) {
+      const [ids, ts] = params as [string[], string[]];
+      ids.forEach((id, i) => { const row = conversations.find((c) => c.id === id); if (row && (!row.last_message_at || (row.last_message_at as string) < ts[i]!)) row.last_message_at = ts[i]; });
+      return { rows: [] };
+    }
+    // Serves BOTH shapes: the realtime path's single row and the backfill's
+    // multi-row batch. Params always arrive in groups of 9, so the batch is
+    // simply N groups — mirroring ON CONFLICT DO NOTHING per row.
     if (text.startsWith("insert into messages(")) {
-      const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId, date, metadataJson] = params as string[];
-      const duplicate = messages.find((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId);
-      if (duplicate) return { rows: [] }; // mirrors ON CONFLICT DO NOTHING
-      const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, direction, sender_contact_id: senderContactId, body, status, provider_message_id: providerMessageId, date, metadata: metadataJson ? JSON.parse(metadataJson) : {} };
-      messages.push(row);
-      return { rows: [{ id: row.id }] };
+      if (params.length > 9) batchInsertCount += 1;
+      const inserted: Array<Record<string, unknown>> = [];
+      for (let offset = 0; offset < params.length; offset += 9) {
+        const [workspaceId, conversationId, direction, senderContactId, body, status, providerMessageId, date, metadataJson] = params.slice(offset, offset + 9) as string[];
+        if (messages.some((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId)) continue;
+        const row = { id: nextId("msg"), workspace_id: workspaceId, conversation_id: conversationId, direction, sender_contact_id: senderContactId, body, status, provider_message_id: providerMessageId, date, metadata: metadataJson ? JSON.parse(metadataJson) : {} };
+        messages.push(row);
+        inserted.push({ id: row.id, conversation_id: conversationId, provider_message_id: providerMessageId });
+      }
+      return { rows: inserted };
     }
 
     // stopParticipantsOnReply — imported verbatim from unipile-adapter.ts, so
@@ -126,7 +143,10 @@ function createFakeDatabase() {
 
   return {
     query,
-    connect: async () => ({ query, release: () => {} }),
+    connect: async () => { connectCount += 1; return { query, release: () => {} }; },
+    get connectCount() { return connectCount; },
+    get beginCount() { return beginCount; },
+    get batchInsertCount() { return batchInsertCount; },
     connections, contacts, contactIdentities, conversations, conversationParticipants, messages, campaigns, campaignParticipants, activities,
     transactionDepth,
   };
@@ -478,5 +498,150 @@ describe("toPlainTextBody", () => {
 
   it("returns an empty string for an attachment-only mail rather than inventing a placeholder", () => {
     expect(toPlainTextBody({})).toBe("");
+  });
+});
+
+// The first real Gmail import measured ~1 message/second because the previous
+// implementation opened a connection AND a transaction per email. These tests
+// pin the batched shape structurally — no benchmark, just round-trip counts.
+describe("persistImportedEmails — batching (transactional N+1 removed)", () => {
+  function page(count: number, opts: { threads?: number; addresses?: number } = {}) {
+    const threads = opts.threads ?? count;
+    const addresses = opts.addresses ?? count;
+    return Array.from({ length: count }, (_, i) => ({
+      id: `hist-${i}`,
+      date: `2026-01-0${(i % 9) + 1}T09:00:00.000Z`,
+      thread_id: `thread-${i % threads}`,
+      message_id: `<hist-${i}@mail.example>`,
+      subject: `Sujet ${i % threads}`,
+      body_plain: `Corps ${i}`,
+      role: "inbox",
+      from_attendee: { display_name: `Contact ${i % addresses}`, identifier: `person${i % addresses}@example.com` },
+    })) as unknown as UnipileEmail[];
+  }
+
+  it("3. a page of 25 emails costs ONE connection and ONE transaction, not one per email", async () => {
+    const connectionId = seedEmailConnection();
+
+    const result = await persistImportedEmails(workspaceId, connectionId, page(25));
+
+    expect(result.messagesInserted).toBe(25);
+    expect(fakeDatabase.connectCount).toBe(1);
+    expect(fakeDatabase.beginCount).toBe(1);
+    expect(fakeDatabase.batchInsertCount).toBe(1); // all 25 rows in a single INSERT
+  });
+
+  it("resolves each repeated address and thread once per page rather than per email", async () => {
+    const connectionId = seedEmailConnection();
+
+    // 30 emails, but only 3 distinct threads and 3 distinct correspondents.
+    const result = await persistImportedEmails(workspaceId, connectionId, page(30, { threads: 3, addresses: 3 }));
+
+    expect(result.messagesInserted).toBe(30);
+    expect(result.threadsTouched).toBe(3);
+    expect(fakeDatabase.contacts).toHaveLength(3);
+    expect(fakeDatabase.conversations).toHaveLength(3);
+    expect(fakeDatabase.connectCount).toBe(1);
+    expect(fakeDatabase.beginCount).toBe(1);
+  });
+
+  it("holds no transaction open across a provider call — the page is already fetched", async () => {
+    const connectionId = seedEmailConnection();
+    await persistImportedEmails(workspaceId, connectionId, page(5));
+
+    // Every begin was matched by a commit/rollback.
+    expect(fakeDatabase.transactionDepth()).toBe(0);
+  });
+
+  it("4/5. re-importing the same page stays idempotent and inserts nothing new", async () => {
+    const connectionId = seedEmailConnection();
+    await persistImportedEmails(workspaceId, connectionId, page(10));
+
+    const second = await persistImportedEmails(workspaceId, connectionId, page(10));
+
+    expect(second.messagesInserted).toBe(0);
+    expect(fakeDatabase.messages).toHaveLength(10);
+  });
+
+  it("9. persists inbound and outbound correctly within one batched page", async () => {
+    const connectionId = seedEmailConnection();
+    const mixed = [
+      { id: "in-1", date: "2026-02-01T09:00:00.000Z", thread_id: "t-1", subject: "Devis", body_plain: "Reçu", role: "inbox", from_attendee: { identifier: "marc@example.com" } },
+      { id: "out-1", date: "2026-02-01T10:00:00.000Z", thread_id: "t-1", body_plain: "Envoyé", role: "sent", from_attendee: { identifier: "moi@talvia.app" }, to_attendees: [{ identifier: "marc@example.com" }] },
+    ] as unknown as UnipileEmail[];
+
+    await persistImportedEmails(workspaceId, connectionId, mixed);
+
+    const inbound = fakeDatabase.messages.find((m) => m.provider_message_id === "in-1")!;
+    const outbound = fakeDatabase.messages.find((m) => m.provider_message_id === "out-1")!;
+    expect(inbound.direction).toBe("inbound");
+    expect(inbound.status).toBe("received");
+    expect(inbound.sender_contact_id).not.toBeNull();
+    expect(outbound.direction).toBe("outbound");
+    expect(outbound.status).toBe("sent");
+    expect(outbound.sender_contact_id).toBeNull();
+    // 10. Same thread + same counterparty -> one reconciled Conversation.
+    expect(fakeDatabase.conversations).toHaveLength(1);
+    expect(fakeDatabase.contacts).toHaveLength(1);
+  });
+
+  it("advances last_message_at to the newest message of the page, once", async () => {
+    const connectionId = seedEmailConnection();
+    const emails = [
+      { id: "a", date: "2026-03-01T08:00:00.000Z", thread_id: "t-1", body_plain: "1", role: "inbox", from_attendee: { identifier: "marc@example.com" } },
+      { id: "b", date: "2026-03-05T08:00:00.000Z", thread_id: "t-1", body_plain: "2", role: "inbox", from_attendee: { identifier: "marc@example.com" } },
+    ] as unknown as UnipileEmail[];
+
+    await persistImportedEmails(workspaceId, connectionId, emails);
+
+    expect(fakeDatabase.conversations[0]!.last_message_at).toBe("2026-03-05T08:00:00.000Z");
+  });
+
+  it("keeps the original subject when a later message in the page is a reply", async () => {
+    const connectionId = seedEmailConnection();
+    const emails = [
+      { id: "a", date: "2026-03-01T08:00:00.000Z", thread_id: "t-1", subject: "Votre devis", body_plain: "1", role: "inbox", from_attendee: { identifier: "marc@example.com" } },
+      { id: "b", date: "2026-03-02T08:00:00.000Z", thread_id: "t-1", subject: "Re: Votre devis", body_plain: "2", role: "inbox", from_attendee: { identifier: "marc@example.com" } },
+    ] as unknown as UnipileEmail[];
+
+    await persistImportedEmails(workspaceId, connectionId, emails);
+
+    expect(fakeDatabase.conversations[0]!.subject).toBe("Votre devis");
+  });
+
+  it("skips an unusable email without failing the rest of the page", async () => {
+    const connectionId = seedEmailConnection();
+    const emails = [
+      { id: "ok-1", date: "2026-03-01T08:00:00.000Z", thread_id: "t-1", body_plain: "ok", role: "inbox", from_attendee: { identifier: "marc@example.com" } },
+      { id: "bad-1", date: "2026-03-01T09:00:00.000Z", thread_id: "t-2", body_plain: "no counterparty", role: "inbox" },
+    ] as unknown as UnipileEmail[];
+
+    const result = await persistImportedEmails(workspaceId, connectionId, emails);
+
+    expect(result.messagesInserted).toBe(1);
+    expect(fakeDatabase.messages).toHaveLength(1);
+  });
+
+  it("6/7. a batched historical import triggers no reply-stop and no Activity", async () => {
+    const connectionId = seedEmailConnection();
+    fakeDatabase.contacts.push({ id: "contact-1", workspace_id: workspaceId, display_name: "Marc" });
+    fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: "contact-1", channel_type: "email", identifier_normalized: "person0@example.com" });
+    const participant = seedCampaignParticipant("email", "contact-1");
+
+    await persistImportedEmails(workspaceId, connectionId, page(12, { threads: 2, addresses: 1 }));
+
+    expect(participant.status).toBe("active");
+    expect(fakeDatabase.activities).toHaveLength(0);
+    expect(dispatchCommittedActivityMock).not.toHaveBeenCalled();
+  });
+
+  it("8. workspace isolation — every batched row carries the importing workspace", async () => {
+    const connectionId = seedEmailConnection();
+
+    await persistImportedEmails(workspaceId, connectionId, page(6, { threads: 2, addresses: 2 }));
+
+    expect(fakeDatabase.messages.every((m) => m.workspace_id === workspaceId)).toBe(true);
+    expect(fakeDatabase.conversations.every((c) => c.workspace_id === workspaceId)).toBe(true);
+    expect(fakeDatabase.contactIdentities.every((i) => i.workspace_id === workspaceId)).toBe(true);
   });
 });
