@@ -410,6 +410,10 @@ const editChatMessageMock = vi.hoisted(() => vi.fn(async () => undefined));
 const listChatsMock = vi.hoisted(() => vi.fn(async () => ({ items: [] as Array<{ id: string; account_id: string; account_type: string; timestamp: string | null; archived: number }>, cursor: null as string | null })));
 const listChatMessagesMock = vi.hoisted(() => vi.fn(async () => ({ items: [] as Array<{ id: string; chat_id: string; text: string; is_sender: 0 | 1; sender_id: string; timestamp: string; deleted: 0 | 1; attachments?: Array<{ id: string; type: string; mimetype?: string; file_size?: number }> }>, cursor: null as string | null })));
 const listChatAttendeesMock = vi.hoisted(() => vi.fn(async () => [] as Array<{ id: string; provider_id: string; name?: string; is_self: 0 | 1; profile_url?: string; picture_url?: string; specifics?: { occupation?: string } }>));
+// The email backfill's single provider read. Defaults to one empty page so
+// the routing test drives the state machine without needing message-insert
+// fidelity here (unipile-email.test.ts covers persistence).
+const listEmailsMock = vi.hoisted(() => vi.fn(async () => ({ items: [] as Array<Record<string, unknown>>, cursor: null as string | null })));
 vi.mock("./unipile", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./unipile")>()),
   getUnipileConfig: () => ({ apiKey: "test-key", apiUrl: "https://api.test", webhookSecret: "test-secret", appBaseUrl: "https://app.test" }),
@@ -418,6 +422,7 @@ vi.mock("./unipile", async (importOriginal) => ({
   listChats: listChatsMock,
   listChatMessages: listChatMessagesMock,
   listChatAttendees: listChatAttendeesMock,
+  listEmails: listEmailsMock,
 }));
 
 // ingestMessage only *triggers* the Campaign Engine after an acceptance
@@ -437,6 +442,7 @@ beforeEach(() => {
   listChatsMock.mockReset().mockResolvedValue({ items: [], cursor: null });
   listChatMessagesMock.mockReset().mockResolvedValue({ items: [], cursor: null });
   listChatAttendeesMock.mockReset().mockResolvedValue([]);
+  listEmailsMock.mockReset().mockResolvedValue({ items: [], cursor: null });
 });
 
 const workspaceId = "ws-1";
@@ -462,6 +468,81 @@ function messagePayload(overrides: Partial<UnipileNewMessagePayload> = {}): Unip
     ...overrides,
   };
 }
+
+// The fake database deliberately does not enforce CHECK constraints, which
+// is exactly why the suite never caught the Gmail connection being broken:
+// every existing test only ever used 'linkedin'/'whatsapp'. These tests
+// therefore validate the persisted value against the REAL constraint, parsed
+// out of the migration files themselves — so they fail if the code ever
+// writes a channel value Postgres would reject in production.
+function allowedChannelTypes(migrationFile: string, table: string): string[] {
+  const migration = readFileSync(resolve(process.cwd(), `../db/migrations/${migrationFile}`), "utf8");
+  const tableStart = migration.indexOf(table);
+  expect(tableStart).toBeGreaterThan(-1);
+  const match = /channel_type varchar\(24\) not null check \(channel_type in \(([^)]*)\)\)/.exec(migration.slice(tableStart));
+  expect(match).not.toBeNull();
+  return match![1]!.split(",").map((value) => value.trim().replace(/^'|'$/g, ""));
+}
+
+describe("email channel normalization (UI 'gmail' -> domain 'email')", () => {
+  it("stores a channel_type the real connection_auth_attempts CHECK constraint actually accepts", async () => {
+    await createConnectionAuthAttempt(workspaceId, "gmail");
+
+    const stored = fakeDatabase.connectionAuthAttempts[0]!.channel_type as string;
+    expect(stored).toBe("email");
+    // Before the fix this stored 'gmail', which is absent from the CHECK —
+    // the INSERT threw in production and the connect request 400'd before
+    // Unipile was ever contacted.
+    expect(allowedChannelTypes("020_connection_auth_attempts.sql", "create table connection_auth_attempts")).toContain(stored);
+  });
+
+  it("resolves that attempt back to the domain channel, not the UI id", async () => {
+    const { token } = await createConnectionAuthAttempt(workspaceId, "gmail");
+
+    const attempt = await resolveConnectionAuthAttempt(token, "acct-google-1");
+
+    expect(attempt).toEqual({ workspaceId, channelType: "email" });
+  });
+
+  it("creates the connections row with a channel_type the real connections CHECK accepts", async () => {
+    await ingestHostedAuthNotification(
+      { status: "CREATION_SUCCESS", account_id: "acct-google-1", name: `${workspaceId}::email` } satisfies UnipileHostedAuthNotifyPayload,
+      { workspaceId, channelType: "email" },
+    );
+
+    const row = fakeDatabase.connections.find((c) => c.external_account_id === "acct-google-1")!;
+    expect(row.channel_type).toBe("email");
+    expect(row.status).toBe("connected");
+    expect(row.display_name).toBe("Gmail");
+    expect(allowedChannelTypes("001_initial_schema.sql", "create table connections")).toContain(row.channel_type as string);
+  });
+
+  it("applies a GOOGLE AccountStatus event to the email connection instead of skipping it as a channel mismatch", async () => {
+    await ingestHostedAuthNotification(
+      { status: "CREATION_SUCCESS", account_id: "acct-google-1", name: `${workspaceId}::email` } satisfies UnipileHostedAuthNotifyPayload,
+      { workspaceId, channelType: "email" },
+    );
+
+    // channelForProvider("GOOGLE") speaks ChannelId ('gmail'); the stored
+    // channel_type is 'email'. Compared raw, every GOOGLE lifecycle event
+    // looked like a mismatch and was silently dropped — an email account
+    // would never reflect a real credential error.
+    await ingestAccountStatus({ account_id: "acct-google-1", account_type: "GOOGLE", message: "CREDENTIALS" } satisfies UnipileAccountStatusPayload["AccountStatus"]);
+
+    expect(fakeDatabase.connections.find((c) => c.external_account_id === "acct-google-1")!.status).toBe("error");
+  });
+
+  it("still rejects a genuine account_type mismatch on an email connection", async () => {
+    await ingestHostedAuthNotification(
+      { status: "CREATION_SUCCESS", account_id: "acct-google-1", name: `${workspaceId}::email` } satisfies UnipileHostedAuthNotifyPayload,
+      { workspaceId, channelType: "email" },
+    );
+
+    await ingestAccountStatus({ account_id: "acct-google-1", account_type: "LINKEDIN", message: "ERROR" } satisfies UnipileAccountStatusPayload["AccountStatus"]);
+
+    expect(fakeDatabase.connections.find((c) => c.external_account_id === "acct-google-1")!.status).toBe("connected");
+  });
+});
 
 describe("createConnectionAuthAttempt / resolveConnectionAuthAttempt", () => {
   it("creates a pending auth attempt row scoped to the workspace and channel, storing only the token's hash", async () => {
@@ -1083,9 +1164,25 @@ describe("backfillConnectionHistory — generalization (LinkedIn + WhatsApp)", (
     expect(fakeDatabase.contactIdentities[0]!.channel_type).toBe("whatsapp");
   });
 
-  it("rejects a channel that isn't linkedin or whatsapp", async () => {
+  // Email used to be rejected here. It is now a supported channel — it pages
+  // GET /api/v1/emails instead of /chats, through the SAME job record, state
+  // machine, heartbeat and counters. Persistence itself is covered by
+  // unipile-email.test.ts against that module's own fake DB; what matters
+  // here is that the runner routes to the right provider resource and drives
+  // the shared state machine to completion.
+  it("Email: pages the mail resource rather than /chats, and completes through the same state machine", async () => {
     fakeDatabase.connections.push({ id: "conn-gmail", workspace_id: workspaceId, provider: "unipile", channel_type: "email", external_account_id: "acct-gmail-1", status: "connected", metadata: {} });
-    await expect(backfillConnectionHistory("conn-gmail")).rejects.toThrow();
+
+    const state = await backfillConnectionHistory("conn-gmail");
+
+    expect(state.status).toBe("completed");
+    expect(listEmailsMock).toHaveBeenCalledWith(expect.anything(), "acct-gmail-1", undefined);
+    expect(listChatsMock).not.toHaveBeenCalled(); // never the chat API for mail
+  });
+
+  it("rejects a channel that has no historical import at all", async () => {
+    fakeDatabase.connections.push({ id: "conn-instagram", workspace_id: workspaceId, provider: "unipile", channel_type: "instagram", external_account_id: "acct-ig-1", status: "connected", metadata: {} });
+    await expect(backfillConnectionHistory("conn-instagram")).rejects.toThrow();
   });
 });
 

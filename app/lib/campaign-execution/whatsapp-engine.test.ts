@@ -232,7 +232,7 @@ describe("runDueCampaignActions (WhatsApp) — combined E2E: WAIT consumed then 
 
     await runDueCampaignActions(context, "camp-1");
 
-    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-wa-part-1", "Message 2 approuvé.");
+    expect(sendMessageMock).toHaveBeenCalledWith(workspaceId, "conv-wa-part-1", "Message 2 approuvé.", "part-1:camp-1-msg2");
     expect(participant.current_step_id).toBe("camp-1-end");
     expect(participant.status).toBe("completed");
   });

@@ -66,7 +66,10 @@ Only after the first real loop is working and users are testing.
 
 Potential priorities:
 
-- Gmail integration
+- Gmail integration — **moved into active work (2026-09)**: connection, ingestion,
+  historical import, Inbox conversations and campaign execution are built on the
+  shared domain entities and the single Campaign Engine. First-touch outbound
+  (no existing thread) remains deferred — see DECISIONS.md.
 - WhatsApp integration
 - stronger Inbox context panel
 - conversation summarization

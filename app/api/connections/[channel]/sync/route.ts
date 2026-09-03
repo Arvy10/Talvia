@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import type { ChannelId } from "../../../../app/state/types";
+import { toDomainChannel } from "../../../../lib/providers/unipile";
 import { requestConnectionSync } from "../../../../lib/providers/unipile-adapter";
 import { getCurrentWorkspace, UnauthorizedError } from "../../../../lib/workspace-context";
 
@@ -7,8 +9,10 @@ export const runtime = "nodejs";
 
 type Context = { params: Promise<{ channel: string }> };
 
-function isSyncableChannel(value: string): value is "linkedin" | "whatsapp" {
-  return value === "linkedin" || value === "whatsapp";
+// The path param carries the UI channel id ('gmail'); the adapter and every
+// channel_type column speak the domain vocabulary ('email').
+function isSyncableChannel(value: string): value is ChannelId {
+  return value === "linkedin" || value === "whatsapp" || value === "gmail";
 }
 
 // Fast, non-blocking trigger for the historical import — either the first
@@ -25,7 +29,7 @@ export async function POST(_request: Request, { params }: Context) {
     if (!isSyncableChannel(channel)) {
       return NextResponse.json({ error: "Canal inconnu." }, { status: 400 });
     }
-    const state = await requestConnectionSync(context.workspaceId, channel);
+    const state = await requestConnectionSync(context.workspaceId, toDomainChannel(channel));
     return NextResponse.json(state);
   } catch (error) {
     return NextResponse.json(

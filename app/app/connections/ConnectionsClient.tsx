@@ -15,7 +15,11 @@ const channels: Array<{ id: ChannelId; name: string; description: string }> = [
 ];
 const empty: Record<ChannelId, ConnectionStatus> = { linkedin: "disconnected", whatsapp: "disconnected", gmail: "disconnected" };
 const apiChannel = (channel: ChannelId) => channel === "gmail" ? "email" : channel;
-const syncableChannels = new Set<ChannelId>(["linkedin", "whatsapp"]);
+// Email imports its history through the same job runner as the other two
+// (see backfillConnectionHistory) — manual-trigger only for now: a mailbox
+// is typically far larger than a chat history, so the first import is a
+// deliberate click rather than something that starts by itself on connect.
+const syncableChannels = new Set<ChannelId>(["linkedin", "whatsapp", "gmail"]);
 
 type SyncState = {
   status: "pending" | "running" | "completed" | "failed";

@@ -1,9 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import { database } from "../database";
 import { dispatchCommittedActivity, recordSystemActivity } from "../activities";
-import { normalizeLinkedIn, normalizePhone } from "../../app/contacts/contact-utils";
+import { normalizeEmail, normalizeLinkedIn, normalizePhone } from "../../app/contacts/contact-utils";
 import { advanceParticipantToNextStep } from "../campaign-execution/step-progression";
 import type { WorkspaceContext } from "../workspace-context";
+import type { ChannelId } from "../../app/state/types";
 import {
   channelForProvider,
   editChatMessage,
@@ -11,8 +12,11 @@ import {
   listChatAttendees,
   listChatMessages,
   listChats,
+  listEmails,
   sendChatMessage,
   toConnectionStatus,
+  toDomainChannel,
+  type DomainChannel,
   type UnipileAccountStatusPayload,
   type UnipileAttachment,
   type UnipileHostedAuthNotifyPayload,
@@ -55,12 +59,18 @@ function normalizeAttachments(raw: UnipileAttachment[] | undefined): NormalizedA
 // Activities) per the provider adapter pattern in ARCHITECTURE.md §3.
 // Nothing outside this file should know Unipile's payload shapes.
 
-const PROVIDER = "unipile";
+export const PROVIDER = "unipile";
 
 function splitDisplayName(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   return { firstName: parts[0] ?? "", lastName: parts.slice(1).join(" ") };
 }
+
+// Shown in the Connections list. 'email' reads "Gmail" because GOOGLE is the
+// only email provider PROVIDER_BY_CHANNEL can currently connect — when a
+// second one (Outlook/IMAP) is wired, this must become provider-derived
+// rather than channel-derived, or it would mislabel a real Outlook account.
+const CONNECTION_DISPLAY_NAME: Record<DomainChannel, string> = { linkedin: "LinkedIn", whatsapp: "WhatsApp", email: "Gmail" };
 
 const AUTH_ATTEMPT_TTL_MS = 30 * 60 * 1000; // matches createHostedAuthLink's own expiresOn window
 
@@ -102,6 +112,10 @@ const INITIAL_SYNC_STATE: ConnectionSyncState = {
 // as a separate local constant rather than a cross-domain import, since it's
 // a single literal shared only by convention, not by coupling.
 const SYNC_STALE_AFTER = "10 minutes";
+
+// 100 emails per page (listEmails' page size) x 20 = the most recent ~2000
+// mails on a first import. Bounded on purpose — see the cap's use site.
+const EMAIL_BACKFILL_MAX_PAGES = 20;
 
 async function writeSyncState(connectionId: string, state: ConnectionSyncState): Promise<void> {
   await database.query(
@@ -151,7 +165,9 @@ function statusRankSql(column: string): string {
   return `(case ${column} when 'read' then 2 when 'delivered' then 1 else 0 end)`;
 }
 
-export type ConnectionAuthAttempt = { workspaceId: string; channelType: "linkedin" | "whatsapp" | "gmail" };
+// channelType is the DOMAIN value ('email'), never the UI id ('gmail') —
+// see toDomainChannel in unipile.ts for why the distinction is load-bearing.
+export type ConnectionAuthAttempt = { workspaceId: string; channelType: DomainChannel };
 
 // Minted once per POST /api/connections/[channel]/connect, before Unipile
 // is ever called — this is the ONLY safe place workspace/channel context for
@@ -160,12 +176,15 @@ export type ConnectionAuthAttempt = { workspaceId: string; channelType: "linkedi
 // bytes, base64url-encoded: only its SHA-256 hash is persisted, never the
 // raw value — the raw token exists only in memory here and in the
 // notify_url handed to Unipile.
-export async function createConnectionAuthAttempt(workspaceId: string, channelType: "linkedin" | "whatsapp" | "gmail"): Promise<{ token: string; expiresAt: string }> {
+// Takes the UI channel id (what the route's path param carries) and stores
+// the domain value — connection_auth_attempts.channel_type's CHECK accepts
+// 'email', never 'gmail'.
+export async function createConnectionAuthAttempt(workspaceId: string, channelId: ChannelId): Promise<{ token: string; expiresAt: string }> {
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + AUTH_ATTEMPT_TTL_MS).toISOString();
   await database.query(
     `insert into connection_auth_attempts(workspace_id,channel_type,token_hash,expires_at) values($1,$2,$3,$4)`,
-    [workspaceId, channelType, hashToken(token), expiresAt],
+    [workspaceId, toDomainChannel(channelId), hashToken(token), expiresAt],
   );
   return { token, expiresAt };
 }
@@ -199,7 +218,7 @@ export async function resolveConnectionAuthAttempt(token: string, accountId: str
   );
   const row = result.rows[0];
   if (!row) return null; // unknown token, expired, or already bound to a different account_id
-  if (row.channel_type !== "linkedin" && row.channel_type !== "whatsapp" && row.channel_type !== "gmail") return null;
+  if (row.channel_type !== "linkedin" && row.channel_type !== "whatsapp" && row.channel_type !== "email") return null;
   return { workspaceId: row.workspace_id, channelType: row.channel_type };
 }
 
@@ -223,7 +242,7 @@ export async function ingestHostedAuthNotification(payload: UnipileHostedAuthNot
        connected_at=case when excluded.status='connected' then now() else connections.connected_at end,
        last_synced_at=case when excluded.status='connected' then now() else connections.last_synced_at end
      returning id`,
-    [workspaceId, PROVIDER, channel, payload.account_id, channel === "gmail" ? "Gmail" : channel === "linkedin" ? "LinkedIn" : "WhatsApp", status],
+    [workspaceId, PROVIDER, channel, payload.account_id, CONNECTION_DISPLAY_NAME[channel], status],
   );
   console.log(`[unipile-adapter] ingestHostedAuthNotification: workspace=${workspaceId} channel=${channel} account_id=${payload.account_id} status=${status} connection_id=${result.rows[0]?.id}`);
   await initializeAutoSyncIfNeeded(result.rows[0]?.id, channel, status);
@@ -254,8 +273,13 @@ export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["
     console.error(`[unipile-adapter] ingestAccountStatus: no existing connection for account_id=${payload.account_id} — nothing updated (a connection can only be created by ingestHostedAuthNotification)`);
     return;
   }
+  // Compared in the DOMAIN vocabulary: channelForProvider speaks ChannelId
+  // ('gmail'), connections.channel_type stores 'email'. Comparing the two
+  // raw would make every GOOGLE AccountStatus event look like a channel
+  // mismatch and be silently skipped — an email connection would then never
+  // reflect a real disconnection/credential error.
   const reportedChannel = channelForProvider(payload.account_type);
-  if (reportedChannel && reportedChannel !== row.channel_type) {
+  if (reportedChannel && toDomainChannel(reportedChannel) !== row.channel_type) {
     console.error(`[unipile-adapter] ingestAccountStatus: account_type mismatch for connection ${row.id} — stored channel_type=${row.channel_type}, payload reported account_type=${payload.account_type} — update skipped`);
     return;
   }
@@ -274,13 +298,15 @@ export async function ingestAccountStatus(payload: UnipileAccountStatusPayload["
 }
 
 // contact_identities.channel_type only accepts ('linkedin','whatsapp','email',
-// 'instagram','other') — connections.channel_type can only validly be
-// 'linkedin' or 'whatsapp' today (a 'gmail' hosted-auth connection fails its
-// own check constraint before it ever gets this far — a Connections-side
-// bug, out of scope for this pass). Anything unexpected falls back to
-// 'other' rather than crashing on a constraint violation.
-function toContactChannelType(channelType: string): "linkedin" | "whatsapp" | "other" {
-  return channelType === "linkedin" || channelType === "whatsapp" ? channelType : "other";
+// 'instagram','other'). connections.channel_type now legitimately carries
+// 'email' too (the 'gmail' check-constraint violation that used to make an
+// email connection impossible is fixed — see toDomainChannel in unipile.ts),
+// so an email identity is filed as 'email' instead of collapsing to the
+// 'other' bucket, where it could never be matched by an email-channel
+// lookup. Anything still unexpected falls back to 'other' rather than
+// crashing on a constraint violation.
+function toContactChannelType(channelType: string): "linkedin" | "whatsapp" | "email" | "other" {
+  return channelType === "linkedin" || channelType === "whatsapp" || channelType === "email" ? channelType : "other";
 }
 
 // Dedup key matches the one contacts.ts already uses for manually-entered
@@ -304,7 +330,13 @@ export async function findOrCreateContact(client: import("pg").PoolClient, works
     ? (profileUrl ? normalizeLinkedIn(profileUrl) : providerId)
     : contactChannelType === "whatsapp"
       ? normalizePhone(profileUrl || providerId)
-      : (profileUrl || providerId).trim().toLowerCase();
+      // Explicit rather than relying on the generic lowercase fallback: this
+      // must stay byte-identical to contacts.ts's own normalizedEmail, or an
+      // email that arrives from the provider would create a second Contact
+      // beside the one a user already typed in by hand.
+      : contactChannelType === "email"
+        ? normalizeEmail(providerId)
+        : (profileUrl || providerId).trim().toLowerCase();
 
   const existing = await client.query<{ contact_id: string }>(
     `select contact_id from contact_identities where workspace_id=$1 and channel_type=$3 and identifier_normalized=$2`,
@@ -345,7 +377,11 @@ export async function findOrCreateContact(client: import("pg").PoolClient, works
   return contactId;
 }
 
-async function findOrCreateConversation(client: import("pg").PoolClient, workspaceId: string, connectionId: string, channelType: string, externalThreadId: string, contactId: string) {
+// Exported for unipile-email.ts: an email thread maps onto exactly this
+// (connection_id, external_thread_id) grouping — conversations already model
+// the concept, so email reuses it rather than introducing a parallel
+// email_threads table.
+export async function findOrCreateConversation(client: import("pg").PoolClient, workspaceId: string, connectionId: string, channelType: string, externalThreadId: string, contactId: string) {
   const existing = await client.query<{ id: string; contact_id: string | null }>(
     `select id,contact_id from conversations where connection_id=$1 and external_thread_id=$2`,
     [connectionId, externalThreadId],
@@ -383,7 +419,11 @@ async function findOrCreateConversation(client: import("pg").PoolClient, workspa
   return conversationId;
 }
 
-export type IngestResult = { status: "ingested" | "duplicate" | "unknown_account" };
+// "ignored" covers events that are real and correctly delivered but carry no
+// new business message (an email moved between folders, for instance) — kept
+// distinct from "unknown_account" so a diagnostic never conflates "we don't
+// know this account" with "nothing to do".
+export type IngestResult = { status: "ingested" | "duplicate" | "unknown_account" | "ignored" };
 
 type Attendee = NonNullable<UnipileNewMessagePayload["sender"]>;
 
@@ -588,7 +628,10 @@ async function markProspectingInvitesAccepted(client: import("pg").PoolClient, w
 // scope here — so a step-type join would silently fail to match real
 // WhatsApp participants in production today, exactly the kind of "passes in
 // tests, breaks for real" risk to avoid.
-async function stopParticipantsOnReply(client: import("pg").PoolClient, workspaceId: string, contactId: string, channelType: string, excludeParticipantIds: string[]): Promise<Array<{ id: string; campaign_id: string }>> {
+// Exported for unipile-email.ts, which must apply this EXACT rule for an
+// inbound email — a second implementation of "a reply stops the sequence"
+// is precisely the duplicate engine the architecture forbids.
+export async function stopParticipantsOnReply(client: import("pg").PoolClient, workspaceId: string, contactId: string, channelType: string, excludeParticipantIds: string[]): Promise<Array<{ id: string; campaign_id: string }>> {
   const result = await client.query<{ id: string; campaign_id: string }>(
     `update campaign_participants p set status='replied',replied_at=now(),updated_at=now()
      from campaigns c
@@ -833,10 +876,55 @@ export async function backfillConnectionHistory(connectionId: string): Promise<C
     );
     const connection = connectionResult.rows[0];
     if (!connection) throw new Error("Connexion introuvable ou non connectée.");
-    if (connection.channel_type !== "linkedin" && connection.channel_type !== "whatsapp") {
+    if (connection.channel_type !== "linkedin" && connection.channel_type !== "whatsapp" && connection.channel_type !== "email") {
       throw new Error(`Synchronisation de l'historique non disponible pour ${connection.channel_type} pour le moment.`);
     }
     const { workspace_id: workspaceId, external_account_id: accountId, channel_type: channelType } = connection;
+
+    // Email pages through a different provider resource (GET /api/v1/emails,
+    // newest first) and has no chats/attendees, so it gets its own loop —
+    // but the SAME job record, state machine, heartbeat, counters, failure
+    // handling and "never dispatch a business event during a backfill" rule.
+    // Counters are reused rather than renamed: chatsProcessed counts threads
+    // touched, so the existing Connections UI stays truthful without a
+    // metadata migration.
+    if (channelType === "email") {
+      let emailCursor: string | undefined;
+      let pages = 0;
+      do {
+        const page = await listEmails(config, accountId, emailCursor);
+        try {
+          const { persistImportedEmails } = await import("./unipile-email");
+          const result = await persistImportedEmails(workspaceId, connectionId, page.items);
+          state.chatsProcessed += result.threadsTouched;
+          state.messagesImported += result.messagesInserted;
+        } catch (error) {
+          // One bad page must not abort an otherwise-successful import; a
+          // re-run retries it, and every insert is idempotent.
+          state.chatsFailed += 1;
+          console.error(`[unipile] email backfill failed for a page on connection ${connectionId}`, error);
+        }
+        state.heartbeatAt = new Date().toISOString();
+        await writeSyncState(connectionId, state);
+        emailCursor = page.cursor ?? undefined;
+        pages += 1;
+        if (pages >= EMAIL_BACKFILL_MAX_PAGES) {
+          // A mailbox can hold hundreds of thousands of messages. Since the
+          // provider returns newest-first, stopping here means Talvia has the
+          // most recent EMAIL_BACKFILL_MAX_PAGES*100 mails — a bounded,
+          // predictable first import rather than a job that runs for hours.
+          // Re-running picks up from the top again (idempotently); paging
+          // deeper is a deliberate future change, not an accident.
+          console.log(`[unipile] email backfill stopped at the ${EMAIL_BACKFILL_MAX_PAGES}-page cap for connection ${connectionId}`);
+          break;
+        }
+      } while (emailCursor);
+
+      state.status = "completed";
+      state.completedAt = new Date().toISOString();
+      await writeSyncState(connectionId, state);
+      return state;
+    }
 
     let chatsCursor: string | undefined;
     do {
@@ -936,7 +1024,7 @@ const SYNC_FRESH_MS = 10 * 60 * 1000; // matches SYNC_STALE_AFTER
 // decides whether to (re)enqueue and returns immediately, leaving the actual
 // work to the next runDueConnectionSyncs pass. Idempotent: a pending or
 // still-fresh running sync is returned as-is, never duplicated.
-export async function requestConnectionSync(workspaceId: string, channelType: "linkedin" | "whatsapp"): Promise<ConnectionSyncState> {
+export async function requestConnectionSync(workspaceId: string, channelType: DomainChannel): Promise<ConnectionSyncState> {
   const result = await database.query<{ id: string; metadata: { sync?: ConnectionSyncState } }>(
     `select id,metadata from connections where workspace_id=$1 and provider=$2 and channel_type=$3 and status='connected'`,
     [workspaceId, PROVIDER, channelType],
@@ -960,12 +1048,12 @@ export type SendMessageResult = { id: string; body: string; direction: "outbound
 // api/inbox/conversations/[id]/messages falls back to a local draft
 // (createDraft in lib/inbox.ts) for everything else, same as before this
 // existed.
-export async function sendMessage(workspaceId: string, conversationId: string, text: string): Promise<SendMessageResult> {
+export async function sendMessage(workspaceId: string, conversationId: string, text: string, idempotencyKey?: string): Promise<SendMessageResult> {
   const config = getUnipileConfig();
   if (!config) throw new Error("Unipile n'est pas configuré sur cet environnement.");
 
-  const result = await database.query<{ external_thread_id: string | null; external_account_id: string; status: string }>(
-    `select v.external_thread_id,c.external_account_id,c.status
+  const result = await database.query<{ external_thread_id: string | null; external_account_id: string; status: string; channel_type: string }>(
+    `select v.external_thread_id,c.external_account_id,c.status,v.channel_type
      from conversations v join connections c on c.id=v.connection_id
      where v.workspace_id=$1 and v.id=$2 and c.provider=$3`,
     [workspaceId, conversationId, PROVIDER],
@@ -974,7 +1062,16 @@ export async function sendMessage(workspaceId: string, conversationId: string, t
   if (!row?.external_thread_id) throw new Error("Ce canal n'est pas encore relié à un fournisseur réel.");
   if (row.status !== "connected") throw new Error("Ce canal n'est pas connecté.");
 
-  const messageId = await sendChatMessage(config, row.external_thread_id, text);
+  // Email is not the /chats API — sendChatMessage would address an email
+  // thread id as if it were a chat id. Dispatch on the conversation's own
+  // channel so there stays exactly ONE send entry point: both the Inbox
+  // reply route and the Campaign Engine's executeMessageStep call this and
+  // remain channel-agnostic. Dynamic import because unipile-email.ts imports
+  // this module's Contact/Conversation helpers — a static import would be
+  // circular, the same reason the engine trigger above uses one.
+  const messageId = row.channel_type === "email"
+    ? (await (await import("./unipile-email")).sendEmailForConversation(workspaceId, conversationId, text, row.external_account_id, idempotencyKey)).providerMessageId
+    : await sendChatMessage(config, row.external_thread_id, text);
 
   // ON CONFLICT DO UPDATE (a no-op update, not DO NOTHING) so this always
   // returns a row even in the rare race where the webhook for this exact

@@ -124,7 +124,25 @@ export async function executeMessageStep(context: WorkspaceContext, campaignId: 
   const finalIssue = await checkParticipantStillActive(participant.id, step.id);
   if (finalIssue) return { result: "failed", reason: finalIssue };
 
-  await sendMessage(context.workspaceId, conversationId, approvedMessage);
+  // Idempotency key for the provider, not for us: (participant, step) IS the
+  // business action "this participant's send for this step". It is stable
+  // across every retry of that action — a claim is released and re-claimed
+  // with the same participant id on the same current_step_id — and distinct
+  // for any other participant or step. Server-derived only; never random,
+  // which would defeat the whole point on the retry that matters.
+  //
+  // The failure it closes is real and otherwise unprotected: the provider
+  // accepts the send, the HTTP response is lost (timeout), so nothing sets
+  // message_sent_at, the claim is released, and the next engine run sends a
+  // SECOND real message to a real person. Talvia's own DB guards
+  // (message_sent_at, the unique provider_message_id) cannot help here —
+  // they only ever see the reply we never received. Only the provider can
+  // deduplicate it, and Unipile's email API does exactly that when given
+  // this header (keys are retained 24h, which covers the retry window since
+  // a successfully-recorded send would have set message_sent_at and stopped
+  // being claimable). Channels whose provider call has no such mechanism
+  // (the /chats API) simply ignore this argument.
+  await sendMessage(context.workspaceId, conversationId, approvedMessage, `${participant.id}:${step.id}`);
   await database.query(`update campaign_participants set message_sent_at=now(),step_claimed_at=null where id=$1`, [participant.id]);
 
   const activity = await recordSystemActivity(context.workspaceId, { eventType: "campaign.message_sent", entityType: "campaign", entityId: campaignId, metadata: { campaignId, participantId: participant.id, contactId: participant.contact_id } });

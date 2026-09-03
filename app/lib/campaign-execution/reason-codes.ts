@@ -10,6 +10,9 @@ export type ReasonCode =
   // never reused across channels so a diagnostic always names the actual
   // channel that's missing a connection.
   | "NO_WHATSAPP_CONNECTION"
+  // Email executor — same rule as the two above: a diagnostic always names
+  // the channel that is actually missing a connection, never a generic one.
+  | "NO_EMAIL_CONNECTION"
   | "INVALID_IDENTITY"
   | "NOT_ELIGIBLE"
   | "WAITING_FOR_ACCEPTANCE"

@@ -181,3 +181,33 @@ The next major product priority is real provider integration, starting with Link
 **Reason**
 
 Real conversations and real commercial workflows create more user value than further polishing secondary configuration surfaces.
+
+---
+
+## 2026-09 — Email channel foundation
+
+**Decision**
+
+Email becomes the third real channel, after LinkedIn and WhatsApp, and is built on the existing domain entities rather than new ones:
+
+- an email thread is a `conversation` (`channel_type='email'`, keyed on the provider `thread_id` via `external_thread_id`) — no parallel `email_threads` table;
+- an email address is a `contact_identity` (`channel_type='email'`), normalized the same way `contacts.ts` already normalizes a hand-entered address, so an inbound mail resolves to the Contact the user already knows;
+- an email campaign runs on the SAME Campaign Engine, registered as one more `(channel, objective)` entry with its own executor — there is no second engine and no email-specific participant state.
+
+Talvia's DOMAIN channel vocabulary is `linkedin | whatsapp | email`. `gmail` is a UI label only, converted once at the provider-adapter boundary.
+
+**Reason**
+
+Email's product role (follow-up, relances, proposals, re-engagement, controlled outbound) is the same commercial cycle the other channels serve. Modelling it separately would fragment the conversation source of truth and duplicate the stop/qualification rules that must stay identical across channels.
+
+---
+
+## 2026-09 — Email V1 requires an existing conversation
+
+**Decision**
+
+The V1 email executor only sends to a participant who already has a real email conversation. First-touch controlled outbound to a Contact whose address is known but who has no thread yet is deliberately deferred.
+
+**Reason**
+
+The provider only assigns a `thread_id` once a mail exists. Creating a conversation before that would require a Talvia-side placeholder thread key and reconciliation against the real thread later; done hastily this splits one human conversation across two Conversations. The capability is legitimate and planned — it needs its own design, not an improvised one.

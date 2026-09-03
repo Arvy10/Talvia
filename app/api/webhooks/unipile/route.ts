@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 
-import { getUnipileConfig, isAccountStatusPayload, isHostedAuthNotifyPayload, type UnipileNewMessagePayload, type UnipileWebhookPayload } from "../../../lib/providers/unipile";
+import { getUnipileConfig, isAccountStatusPayload, isHostedAuthNotifyPayload, isNewEmailPayload, type UnipileNewMessagePayload, type UnipileWebhookPayload } from "../../../lib/providers/unipile";
 import { ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, resolveConnectionAuthAttempt } from "../../../lib/providers/unipile-adapter";
+import { ingestEmail } from "../../../lib/providers/unipile-email";
 
 export const runtime = "nodejs";
 
@@ -73,6 +74,14 @@ export async function POST(request: Request) {
     if (isAccountStatusPayload(payload)) {
       console.log(`[webhooks/unipile] account-status received: message=${payload.AccountStatus.message} account_id=${payload.AccountStatus.account_id}`);
       await ingestAccountStatus(payload.AccountStatus);
+    } else if (isNewEmailPayload(payload)) {
+      // Mail events carry a completely different payload from chat events
+      // (no chat_id/attendees) — without this branch they fell through to
+      // ingestMessage, which reads fields an email payload does not have and
+      // would silently discard every incoming email.
+      console.log(`[webhooks/unipile] email received: event=${payload.event} account_id=${payload.account_id}`);
+      const result = await ingestEmail(payload);
+      console.log(`[webhooks/unipile] email ingestion result=${result.status} account_id=${payload.account_id}`);
     } else {
       await ingestMessage(payload as UnipileNewMessagePayload);
     }
