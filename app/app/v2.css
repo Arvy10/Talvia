@@ -92,3 +92,125 @@
 .prospecting-personalization__head{display:flex;align-items:center;gap:8px;margin-bottom:8px}
 .prospecting-personalization label{display:block;margin-top:8px}
 .prospecting-personalization label span{display:block;margin-bottom:4px;color:#948b99;font-size:9px}
+
+/* ============================================================
+   INBOX APPEARANCE — scoped to .talvia-inbox-layout only.
+   Talvia's global theme is untouched: every rule below is nested
+   under the Inbox root, so it has higher specificity than the
+   original single-class rules and wins deterministically without
+   editing them. Colours come from tokens redefined per
+   data-inbox-theme, so dark/light is one switch, not two
+   stylesheets. Deliberately neutral: the coral/violet gradients
+   made the Inbox read as a consumer chat app rather than a
+   commercial workspace, and a saturated fill on every outbound
+   bubble competed with the message text itself.
+   ============================================================ */
+.talvia-inbox-layout[data-inbox-theme="dark"]{
+  --ibx-bg:#0b0b0d; --ibx-surface:#121214; --ibx-surface-2:#171719; --ibx-surface-3:#1d1d20;
+  --ibx-border:#ffffff14; --ibx-border-strong:#ffffff24;
+  --ibx-text:#ededef; --ibx-text-2:#a1a1a8; --ibx-text-3:#71717a;
+  --ibx-accent:#e4e4e7; --ibx-accent-soft:#ffffff10; --ibx-unread:#e4e4e7;
+  --ibx-in-bg:#161618; --ibx-in-border:#ffffff12;
+  --ibx-out-bg:#232327; --ibx-out-border:#ffffff1f;
+  --ibx-scroll:#ffffff1f;
+}
+.talvia-inbox-layout[data-inbox-theme="light"]{
+  --ibx-bg:#fafafa; --ibx-surface:#ffffff; --ibx-surface-2:#fbfbfc; --ibx-surface-3:#f4f4f5;
+  --ibx-border:#00000012; --ibx-border-strong:#00000022;
+  --ibx-text:#18181b; --ibx-text-2:#52525b; --ibx-text-3:#8a8a93;
+  --ibx-accent:#18181b; --ibx-accent-soft:#0000000a; --ibx-unread:#18181b;
+  --ibx-in-bg:#ffffff; --ibx-in-border:#00000014;
+  --ibx-out-bg:#f4f4f5; --ibx-out-border:#00000014;
+  --ibx-scroll:#00000024;
+}
+
+/* Shell + columns */
+.talvia-inbox-layout{background:var(--ibx-bg);border-color:var(--ibx-border);grid-template-columns:300px minmax(420px,1fr)}
+.talvia-inbox-layout[data-context="open"]{grid-template-columns:300px minmax(390px,1fr) 320px}
+.talvia-inbox-layout[data-context="closed"] .talvia-inbox-context{display:none}
+.talvia-inbox-layout .talvia-inbox-list{border-right:1px solid var(--ibx-border);background:var(--ibx-surface)}
+.talvia-inbox-layout .talvia-inbox-chat{border-right:0;background:var(--ibx-bg)}
+.talvia-inbox-layout .talvia-inbox-context{border-left:1px solid var(--ibx-border);background:var(--ibx-surface);position:relative}
+
+/* Thread list */
+.talvia-inbox-layout .inbox-list-heading strong{color:var(--ibx-text)}
+.talvia-inbox-layout .inbox-list-heading span{background:var(--ibx-accent-soft);color:var(--ibx-text-2)}
+.talvia-inbox-layout .inbox-dense-search{border-color:var(--ibx-border);background:var(--ibx-surface-3)}
+.talvia-inbox-layout .inbox-dense-search input{color:var(--ibx-text)}
+.talvia-inbox-layout .inbox-dense-search svg{color:var(--ibx-text-3)}
+.talvia-inbox-layout .inbox-brand-filters button{border-color:var(--ibx-border);background:transparent;color:var(--ibx-text-2)}
+.talvia-inbox-layout .inbox-brand-filters button:hover{background:var(--ibx-accent-soft)}
+.talvia-inbox-layout .inbox-brand-filters button.is-active{border-color:var(--ibx-border-strong);background:var(--ibx-accent-soft);color:var(--ibx-text)}
+.talvia-inbox-layout .inbox-dense-thread{border-radius:9px}
+.talvia-inbox-layout .inbox-dense-thread:hover{background:var(--ibx-accent-soft)}
+.talvia-inbox-layout .inbox-dense-thread.is-active{border-color:var(--ibx-border-strong);background:var(--ibx-surface-3)}
+.talvia-inbox-layout .inbox-dense-thread strong{color:var(--ibx-text);font-size:12px}
+.talvia-inbox-layout .inbox-dense-thread small,.talvia-inbox-layout .inbox-thread-meta time{color:var(--ibx-text-3)}
+.talvia-inbox-layout .inbox-dense-thread p{color:var(--ibx-text-2);font-size:11px}
+/* Unread reads as weight + a neutral dot, not a coral alarm. */
+.talvia-inbox-layout .inbox-thread-meta i{background:var(--ibx-unread)}
+.talvia-inbox-layout .inbox-avatar{border:1px solid var(--ibx-border);background:var(--ibx-surface-3);color:var(--ibx-text-2);font-weight:600}
+
+/* Conversation header */
+.talvia-inbox-layout .inbox-chat-heading{padding:0 12px;border-bottom:1px solid var(--ibx-border);background:var(--ibx-surface)}
+.talvia-inbox-layout .inbox-chat-person{padding:4px 6px 4px 4px;border:0;border-radius:9px;background:transparent;color:inherit;cursor:pointer;text-align:left}
+.talvia-inbox-layout .inbox-chat-person:hover{background:var(--ibx-accent-soft)}
+.talvia-inbox-layout .inbox-chat-person strong{color:var(--ibx-text);font-size:13px}
+.talvia-inbox-layout .inbox-chat-person small{color:var(--ibx-text-3);max-width:46ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.talvia-inbox-layout .inbox-chat-actions{gap:4px}
+.inbox-icon-button{width:30px;height:30px;padding:0;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--ibx-text-3,#8b8b94);display:grid;place-items:center;cursor:pointer;transition:background .12s,color .12s}
+.inbox-icon-button svg{width:15px;height:15px}
+.inbox-icon-button:hover{background:var(--ibx-accent-soft,#ffffff10);color:var(--ibx-text,#ededef)}
+.inbox-icon-button.is-active{border-color:var(--ibx-border-strong,#ffffff24);background:var(--ibx-accent-soft,#ffffff10);color:var(--ibx-text,#ededef)}
+.inbox-icon-button:focus-visible{outline:2px solid var(--ibx-border-strong,#ffffff40);outline-offset:1px}
+
+/* Messages — one main scroll, no nested scrollers. */
+.talvia-inbox-layout .inbox-message-scroll{padding:20px 20px 26px;background:var(--ibx-bg);scrollbar-width:thin;scrollbar-color:var(--ibx-scroll) transparent}
+.talvia-inbox-layout .inbox-message-scroll::-webkit-scrollbar{width:10px}
+.talvia-inbox-layout .inbox-message-scroll::-webkit-scrollbar-thumb{border:3px solid transparent;border-radius:99px;background-clip:content-box;background-color:var(--ibx-scroll)}
+.talvia-inbox-layout .inbox-message{width:min(70%,600px);margin-bottom:10px;padding:11px 14px;border:1px solid var(--ibx-in-border);border-radius:14px 14px 14px 5px;background:var(--ibx-in-bg);box-shadow:none}
+.talvia-inbox-layout .inbox-message p{color:var(--ibx-text);font-size:13.5px;line-height:1.65}
+/* Direction is carried by alignment + surface level + border, never by a saturated fill. */
+.talvia-inbox-layout .inbox-message--outbound{border-color:var(--ibx-out-border);border-radius:14px 14px 5px 14px;background:var(--ibx-out-bg)}
+/* Email: correspondence, not chat. */
+.talvia-inbox-layout .inbox-message--email{width:min(92%,760px);padding:16px 20px;border-radius:12px}
+.talvia-inbox-layout .inbox-message--email p{font-size:14px;line-height:1.75}
+.talvia-inbox-layout .inbox-message--email.inbox-message--outbound{margin-left:auto;border-radius:12px}
+.talvia-inbox-layout .inbox-conversation-empty h2,.talvia-inbox-layout .empty-state h2{color:var(--ibx-text)}
+.talvia-inbox-layout .inbox-conversation-empty p,.talvia-inbox-layout .empty-state p{color:var(--ibx-text-3)}
+.talvia-inbox-layout .inbox-conversation-empty>svg{color:var(--ibx-text-3)}
+
+/* Composer */
+.talvia-inbox-layout .talvia-composer{border-top:1px solid var(--ibx-border);background:var(--ibx-surface)}
+.talvia-inbox-layout .talvia-composer>textarea{border-color:var(--ibx-border);background:var(--ibx-surface-3);color:var(--ibx-text);font-size:13.5px}
+.talvia-inbox-layout .talvia-composer>textarea:focus{border-color:var(--ibx-border-strong)}
+.talvia-inbox-layout .talvia-composer__bar button{border-color:var(--ibx-border);background:transparent;color:var(--ibx-text-2)}
+.talvia-inbox-layout .talvia-composer__bar button:hover{background:var(--ibx-accent-soft)}
+.talvia-inbox-layout .talvia-composer__bar .talvia-send-button{border-color:transparent;background:var(--ibx-accent);color:var(--ibx-bg);font-weight:650}
+.talvia-inbox-layout .talvia-composer__bar .talvia-ai-trigger{border-color:var(--ibx-border);color:var(--ibx-text-2)}
+
+/* Contact panel */
+.talvia-inbox-layout .inbox-contact-identity h2{color:var(--ibx-text)}
+.talvia-inbox-layout .inbox-contact-identity>p,.talvia-inbox-layout .inbox-context-data span{color:var(--ibx-text-3)}
+.talvia-inbox-layout .talvia-inbox-context>section:not(.inbox-contact-identity){border-top:1px solid var(--ibx-border)}
+.talvia-inbox-layout .inbox-context-label{color:var(--ibx-text-3)}
+.talvia-inbox-layout .inbox-context-channels span{border-color:var(--ibx-border);background:transparent;color:var(--ibx-text-2)}
+.talvia-inbox-layout .inbox-contact-identity>a,.talvia-inbox-layout .inbox-opportunity a{color:var(--ibx-text-2);text-decoration:underline;text-underline-offset:2px}
+.talvia-inbox-layout .inbox-no-opportunity button{border-color:var(--ibx-border);background:transparent;color:var(--ibx-text-2)}
+.talvia-inbox-layout .talvia-inbox-context textarea{border-color:var(--ibx-border);background:var(--ibx-surface-3);color:var(--ibx-text)}
+.inbox-context-close{position:absolute;top:10px;right:10px;z-index:2}
+
+/* Inbox page header actions */
+.inbox-header-actions{display:flex;align-items:center;gap:8px}
+.inbox-quiet-button{min-height:32px;padding:0 10px;border:1px solid #ffffff16;border-radius:8px;background:transparent;color:#a1a1a8;display:flex;align-items:center;gap:6px;font-size:10px;cursor:pointer}
+.inbox-quiet-button:hover{background:#ffffff0c;color:#ededef}
+.inbox-quiet-button:disabled{opacity:.5;cursor:default}
+.inbox-quiet-button svg{width:13px;height:13px}
+
+@media(max-width:1100px){
+  /* Narrow viewport: the panel is a full-screen sheet, never a squeezed
+     third column — the existing mobile-view-context class already drives
+     that, so only the desktop-open rule needs neutralising here. */
+  .talvia-inbox-layout[data-context="open"]{grid-template-columns:none}
+  .mobile-view-context .talvia-inbox-layout[data-context="closed"] .talvia-inbox-context{display:block}
+}

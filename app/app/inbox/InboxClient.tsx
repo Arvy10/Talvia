@@ -14,10 +14,13 @@ import {
   LuFile,
   LuInbox,
   LuMessageCircle,
+  LuMoon,
   LuPencil,
   LuPlus,
   LuSearch,
+  LuSun,
   LuUserRound,
+  LuX,
 } from "react-icons/lu";
 import SendIcon from "../components/icons/SendIcon";
 import SparklesIcon from "../components/icons/SparklesIcon";
@@ -77,6 +80,10 @@ export type InboxInitialData = {
 
 const NEAR_BOTTOM_THRESHOLD = 120;
 const LOAD_OLDER_THRESHOLD = 80;
+// Inbox-only appearance preference. Deliberately not a global Talvia theme
+// and deliberately not server state — it changes nothing a colleague or
+// another device needs to agree on.
+const INBOX_THEME_KEY = "talvia.inbox.theme";
 const POLL_INTERVAL_MS = 20_000;
 
 function isSameDay(a: string, b: string) {
@@ -243,6 +250,17 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
   const [isNearBottom, setIsNearBottom] = useState(true);
   const [showNewMessagePill, setShowNewMessagePill] = useState(false);
   const [scrollToBottomToken, setScrollToBottomToken] = useState(0);
+  // The contact panel is a deliberate, on-demand third column rather than a
+  // permanent one: the conversation is what the user came for, and keeping
+  // 285px of profile always on screen squeezed the messages for no reason.
+  const [contextOpen, setContextOpen] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  // Inbox-scoped appearance only — this never touches Talvia's global theme.
+  // Starts on "dark" (the current look) so the server-rendered markup and the
+  // first client render always agree; the stored preference is applied after
+  // mount, which is the only hydration-safe way to read localStorage.
+  const [inboxTheme, setInboxTheme] = useState<"dark" | "light">("dark");
+  const [markingAllRead, setMarkingAllRead] = useState(false);
 
   // Which conversations already hold a full, paginated message page —
   // switching back to one of these must not refetch (tic-tac navigation,
@@ -312,8 +330,14 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
         ),
     [conversations, filter, search],
   );
-  const activeThread =
-    threads.find((thread) => thread.id === activeKey) ?? threads[0] ?? null;
+  // `activeKey` alone cannot express "the user deliberately closed the
+  // conversation": the `?? threads[0]` fallback exists so the Inbox opens on
+  // the newest thread, but it also meant clearing the selection instantly
+  // re-opened that same thread — which is exactly why leaving a conversation
+  // felt impossible. `dismissed` is the explicit third state.
+  const activeThread = dismissed
+    ? null
+    : threads.find((thread) => thread.id === activeKey) ?? threads[0] ?? null;
   const threadMessages = activeThread?.messages ?? [];
   const activeContact = contacts.find(
     (contact) => contact.id === activeThread?.contactId,
@@ -469,6 +493,76 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
     setShowNewMessagePill(false);
   };
 
+  // Read once after mount. A purely visual preference needs no backend, and
+  // reading it during render would desynchronise server and client markup.
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(INBOX_THEME_KEY);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      if (stored === "light" || stored === "dark") setInboxTheme(stored);
+    } catch {
+      // Private mode / blocked storage: keep the default, never crash.
+    }
+  }, []);
+
+  const toggleInboxTheme = () => {
+    setInboxTheme((current) => {
+      const next = current === "dark" ? "light" : "dark";
+      try { window.localStorage.setItem(INBOX_THEME_KEY, next); } catch { /* preference simply won't persist */ }
+      return next;
+    });
+  };
+
+  // Read state is genuinely persisted per user (conversation_member_states.
+  // last_read_at — see lib/inbox.ts's setRead), so these are real writes, not
+  // a local-only badge. `unread` is recomputed server-side from last_read_at
+  // vs last_message_at, which is why the response replaces the row.
+  const markConversationRead = async (conversationId: string, read = true) => {
+    const response = await fetch(`/api/inbox/conversations/${conversationId}/read`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ read }),
+    });
+    if (!response.ok) { setError("Impossible de mettre à jour le statut de lecture."); return; }
+    setConversations((current) => current.map((item) => (item.id === conversationId ? { ...item, unread: !read } : item)));
+  };
+
+  const markAllRead = async () => {
+    const unreadIds = conversations.filter((item) => item.unread).map((item) => item.id);
+    if (!unreadIds.length) return;
+    setMarkingAllRead(true);
+    try {
+      // Fans out over the same per-conversation endpoint rather than
+      // inventing a bulk one — the read model already exists and this stays a
+      // UI pass. A dedicated bulk route is the right follow-up once inboxes
+      // get large; see the report.
+      const results = await Promise.all(unreadIds.map((id) =>
+        fetch(`/api/inbox/conversations/${id}/read`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ read: true }),
+        }).then((response) => (response.ok ? id : null)).catch(() => null),
+      ));
+      const succeeded = new Set(results.filter((id): id is string => id !== null));
+      if (succeeded.size < unreadIds.length) setError("Certaines conversations n'ont pas pu être marquées comme lues.");
+      setConversations((current) => current.map((item) => (succeeded.has(item.id) ? { ...item, unread: false } : item)));
+    } finally {
+      setMarkingAllRead(false);
+    }
+  };
+
+  // Leaving a conversation must actually leave it — no stale thread left
+  // rendered behind an empty state.
+  const closeConversation = () => {
+    setDismissed(true);
+    setActiveKey(null);
+    setContextOpen(false);
+    setMobileView("list");
+  };
+
+  const unreadCount = conversations.filter((item) => item.unread).length;
+  const activeThreadUnread = Boolean(activeThread && conversations.find((item) => item.id === activeThread.id)?.unread);
+
   // Background sync for the currently-open thread and the conversation
   // list — a new incoming message shows up without a manual refresh and
   // without ever reloading the whole Inbox (only messages strictly after
@@ -532,6 +626,7 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
       return;
     }
     loadedConversationsRef.current.add(data.conversation.id);
+    setDismissed(false);
     setActiveKey(data.conversation.id);
     setNewOpen(false);
     setContactId("");
@@ -704,16 +799,38 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
             Retrouvez le contexte, le contact et la prochaine action derrière chaque conversation.
           </p>
         </div>
-        <button
-          className="connection-button"
-          onClick={() => setNewOpen(true)}
-          type="button"
-        >
-          <LuPlus />
-          Nouvelle conversation
-        </button>
+        <div className="inbox-header-actions">
+          <button
+            aria-label={inboxTheme === "dark" ? "Passer l’Inbox en clair" : "Passer l’Inbox en sombre"}
+            className="inbox-icon-button"
+            onClick={toggleInboxTheme}
+            title={inboxTheme === "dark" ? "Apparence claire" : "Apparence sombre"}
+            type="button"
+          >
+            {inboxTheme === "dark" ? <LuSun /> : <LuMoon />}
+          </button>
+          {unreadCount > 0 ? (
+            <button
+              className="inbox-quiet-button"
+              disabled={markingAllRead}
+              onClick={() => void markAllRead()}
+              type="button"
+            >
+              <LuCheckCheck />
+              {markingAllRead ? "En cours…" : "Tout marquer comme lu"}
+            </button>
+          ) : null}
+          <button
+            className="connection-button"
+            onClick={() => setNewOpen(true)}
+            type="button"
+          >
+            <LuPlus />
+            Nouvelle conversation
+          </button>
+        </div>
       </header>
-      <section className="talvia-inbox-layout">
+      <section className="talvia-inbox-layout" data-context={contextOpen ? "open" : "closed"} data-inbox-theme={inboxTheme}>
         <aside className="talvia-inbox-list">
           <div className="inbox-list-heading">
             <strong>Conversations</strong>
@@ -781,6 +898,7 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
                     }
                     key={thread.key}
                     onClick={() => {
+                      setDismissed(false);
                       setActiveKey(thread.key);
                       setMobileView("chat");
                     }}
@@ -829,27 +947,58 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
             </button>
             {activeContact && activeThread ? (
               <>
-                <div className="inbox-chat-person">
+                {/* The identity itself opens the profile — the expected
+                    affordance in every mail/chat client, so the header does
+                    not need a labelled button competing for space. */}
+                <button
+                  className="inbox-chat-person"
+                  onClick={() => { setContextOpen(true); setMobileView("context"); }}
+                  title="Voir le contact"
+                  type="button"
+                >
                   <ContactAvatar contact={activeContact} />
                   <span>
                     <strong>{activeContact.name}</strong>
                     <small>
                       <ChannelLogo channel={apiChannelToUi(activeThread.channel)} />
-                      {
-                        channelMap.find(
-                          (item) => item.id === activeThread.channel,
-                        )?.label
-                      }
+                      {/* Email leads with the thread subject: that is what
+                          identifies an email exchange, not the channel name. */}
+                      {activeThread.channel === "email" && activeThread.subject
+                        ? activeThread.subject
+                        : channelMap.find((item) => item.id === activeThread.channel)?.label}
                     </small>
                   </span>
-                </div>
+                </button>
                 <div className="inbox-chat-actions">
+                  {activeThreadUnread ? (
+                    <button
+                      aria-label="Marquer comme lu"
+                      className="inbox-icon-button"
+                      onClick={() => void markConversationRead(activeThread.id)}
+                      title="Marquer comme lu"
+                      type="button"
+                    >
+                      <LuCheckCheck />
+                    </button>
+                  ) : null}
                   <button
-                    onClick={() => setMobileView("context")}
+                    aria-label="Informations du contact"
+                    aria-pressed={contextOpen}
+                    className={`inbox-icon-button${contextOpen ? " is-active" : ""}`}
+                    onClick={() => { setContextOpen((open) => !open); setMobileView("context"); }}
+                    title="Informations du contact"
                     type="button"
                   >
                     <LuUserRound />
-                    <span>Contexte</span>
+                  </button>
+                  <button
+                    aria-label="Fermer la conversation"
+                    className="inbox-icon-button"
+                    onClick={closeConversation}
+                    title="Fermer la conversation"
+                    type="button"
+                  >
+                    <LuX />
                   </button>
                 </div>
               </>
@@ -887,7 +1036,11 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
                           <span>{dateSeparatorLabel(message.createdAt)}</span>
                         </div>
                       ) : null}
-                      <div className={`inbox-message inbox-message--${message.direction}`}>
+                      {/* Email reads as correspondence, not chat: the
+                          modifier widens the column, relaxes the leading and
+                          drops the chat-bubble tail. Same component, same
+                          data — one Inbox, presentation adapted per channel. */}
+                      <div className={`inbox-message inbox-message--${message.direction}${activeThread.channel === "email" ? " inbox-message--email" : ""}`}>
                         {editingMessageId === message.id ? (
                           <div className="inbox-message-edit">
                             <textarea
@@ -1051,6 +1204,17 @@ export function InboxClient({ initialData }: { initialData?: InboxInitialData })
               Conversation
             </button>
           </div>
+          {/* Desktop close: the panel is opened on demand, so it must be
+              dismissible without leaving the conversation. */}
+          <button
+            aria-label="Fermer le panneau contact"
+            className="inbox-context-close inbox-icon-button"
+            onClick={() => { setContextOpen(false); setMobileView("chat"); }}
+            title="Fermer"
+            type="button"
+          >
+            <LuX />
+          </button>
           {activeContact && activeThread ? (
             <>
               <section className="inbox-contact-identity">
