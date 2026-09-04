@@ -101,7 +101,35 @@ export async function checkParticipantStillActive(participantId: string, expecte
   return null;
 }
 
-export type StepOutcome = { result: "sent" | "failed"; reason?: ReasonCode };
+// `reason` on a "sent" outcome is a WARNING, never a failure: the provider
+// action genuinely happened and must never be retried, but something
+// secondary (today only email first-touch thread reconciliation) could not
+// be completed and is worth recording on the participant.
+export type StepOutcome = {
+  result: "sent" | "failed";
+  reason?: ReasonCode;
+  // Set on a failure whose provider outcome is genuinely unknown (no answer
+  // at all). The claim is deliberately NOT released, so this participant only
+  // becomes retry-eligible after CLAIM_STALE_AFTER instead of on the very
+  // next engine run — long enough for the provider's own delivery webhook to
+  // arrive and reveal what actually happened. It narrows the window; it does
+  // not close it (see the idempotency-key note in executeMessageStep).
+  retainClaim?: true;
+};
+
+// Supplied only by a channel that can legitimately start a conversation that
+// does not exist yet — today only email (a Contact whose address Talvia
+// already knows, with no thread). Its absence is what keeps LinkedIn and
+// WhatsApp behaving exactly as before: no conversation means NOT_ELIGIBLE,
+// full stop. The handler owns the provider call for that case, so
+// executeMessageStep never sends twice.
+export type FirstTouchSender = (args: {
+  context: WorkspaceContext;
+  campaignId: string;
+  participant: ClaimedParticipant;
+  approvedText: string;
+  idempotencyKey: string;
+}) => Promise<StepOutcome>;
 
 // Phase 3: the executor never generates or substitutes text — it only ever
 // sends the exact `approvedText` a human already reviewed and approved
@@ -110,7 +138,7 @@ export type StepOutcome = { result: "sent" | "failed"; reason?: ReasonCode };
 // invite/acceptance concept) — LinkedIn's own message step also runs through
 // this, parameterized by channelType so conversation resolution can never
 // cross channels for the same Contact.
-export async function executeMessageStep(context: WorkspaceContext, campaignId: string, participant: ClaimedParticipant, step: NonNullable<Awaited<ReturnType<typeof loadCampaignStep>>>, channelType: CampaignChannel): Promise<StepOutcome> {
+export async function executeMessageStep(context: WorkspaceContext, campaignId: string, participant: ClaimedParticipant, step: NonNullable<Awaited<ReturnType<typeof loadCampaignStep>>>, channelType: CampaignChannel, firstTouch?: FirstTouchSender): Promise<StepOutcome> {
   const personalization = await getParticipantPersonalization(context, campaignId, participant.id);
   const approvedMessage = personalization?.messages.find((artifact) => artifact.stepId === step.id)?.approvedText;
   // No silent skip-past-this-step anymore (docs spec §12): a message step
@@ -119,7 +147,10 @@ export async function executeMessageStep(context: WorkspaceContext, campaignId: 
   if (!approvedMessage) return { result: "failed", reason: "MESSAGE_NOT_APPROVED" };
 
   const conversationId = await findConversationId(context.workspaceId, participant.contact_id, channelType);
-  if (!conversationId) return { result: "failed", reason: "NOT_ELIGIBLE" };
+  // Unchanged for every channel without a first-touch capability: no
+  // conversation, no send, and the check happens before the freshness
+  // re-read exactly as it always did.
+  if (!conversationId && !firstTouch) return { result: "failed", reason: "NOT_ELIGIBLE" };
 
   const finalIssue = await checkParticipantStillActive(participant.id, step.id);
   if (finalIssue) return { result: "failed", reason: finalIssue };
@@ -142,7 +173,21 @@ export async function executeMessageStep(context: WorkspaceContext, campaignId: 
   // a successfully-recorded send would have set message_sent_at and stopped
   // being claimable). Channels whose provider call has no such mechanism
   // (the /chats API) simply ignore this argument.
-  await sendMessage(context.workspaceId, conversationId, approvedMessage, `${participant.id}:${step.id}`);
+  // ONE key for this business action, whichever path delivers it: the
+  // threaded reply and the first touch are two implementations of "this
+  // participant's send for this step", never two different actions. A retry
+  // that flips from one path to the other (a conversation created by an
+  // inbound mail between two attempts) therefore still presents the same key
+  // to the provider.
+  const idempotencyKey = `${participant.id}:${step.id}`;
+  let warning: ReasonCode | undefined;
+  if (conversationId) {
+    await sendMessage(context.workspaceId, conversationId, approvedMessage, idempotencyKey);
+  } else {
+    const outcome = await firstTouch!({ context, campaignId, participant, approvedText: approvedMessage, idempotencyKey });
+    if (outcome.result === "failed") return outcome;
+    warning = outcome.reason;
+  }
   await database.query(`update campaign_participants set message_sent_at=now(),step_claimed_at=null where id=$1`, [participant.id]);
 
   const activity = await recordSystemActivity(context.workspaceId, { eventType: "campaign.message_sent", entityType: "campaign", entityId: campaignId, metadata: { campaignId, participantId: participant.id, contactId: participant.contact_id } });
@@ -150,5 +195,5 @@ export async function executeMessageStep(context: WorkspaceContext, campaignId: 
 
   const advance = await advanceParticipantToNextStep(context.workspaceId, campaignId, participant.id, step.id);
   if (advance.activity) await dispatchCommittedActivity(advance.activity);
-  return { result: "sent" };
+  return warning ? { result: "sent", reason: warning } : { result: "sent" };
 }

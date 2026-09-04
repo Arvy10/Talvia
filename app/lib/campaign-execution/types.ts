@@ -4,11 +4,10 @@ import type { ReasonCode } from "./reason-codes";
 
 // One channel's contribution to the shared execution model
 // (docs/product/... spec: "Campaign → Participants → Steps → Execution
-// State → [LinkedIn | WhatsApp | Email] Executor"). Only LinkedIn has a real
-// implementation today — WhatsApp/Email are deliberately not built yet, but
-// adding them later means writing one more file that satisfies this
-// interface and registering it in engine.ts, not touching participants,
-// scheduling, idempotency, or workspace isolation.
+// State → [LinkedIn | WhatsApp | Email] Executor"). All three channels are
+// implemented today; adding a fourth means writing one more file that
+// satisfies this interface and registering it in engine.ts, not touching
+// participants, scheduling, idempotency, or workspace isolation.
 export type EngineRunSummary = {
   attempted: number;
   sent: number;

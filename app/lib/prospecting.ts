@@ -4,6 +4,7 @@ import { getActiveBusinessContext, type BusinessContextRecord } from "./business
 import { getAIProvider } from "./ai";
 import { getCampaignStrategy } from "./campaigns";
 import type { CampaignStrategy } from "./campaign-strategy";
+import { initializeParticipantStep } from "./campaign-execution/step-progression";
 import { getUnipileConfig, searchLinkedInPeople } from "./providers/unipile";
 import { findOrCreateContact } from "./providers/unipile-adapter";
 import type { WorkspaceContext } from "./workspace-context";
@@ -365,20 +366,28 @@ export async function approveProspects(context: WorkspaceContext, campaignId: st
       await client.query(`update contacts set status='lead' where id=$1 and status='new'`, [contactId]);
 
       await client.query(`update campaign_prospect_candidates set status='approved',contact_id=$1 where id=$2`, [contactId, candidateId]);
-      await client.query(
-        `insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,$3) on conflict(campaign_id,contact_id) do nothing`,
+      const inserted = await client.query<{ id: string }>(
+        `insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,$3) on conflict(campaign_id,contact_id) do nothing returning id`,
         [campaignId, contactId, participantStatus],
       );
+      // Only a participant that is genuinely ACTIVE is placed on the first
+      // step, through the canonical initializer — the same rule
+      // campaigns.ts's addParticipants follows, and for the same reason: it
+      // also stamps last_action_at, which is what makes a later WAIT step
+      // become due at all.
+      //
+      // A participant approved while the campaign is still a draft is left
+      // with current_step_id NULL on purpose. Stamping it here (as this used
+      // to, for every participant regardless of status) silently disqualified
+      // it from transitionCampaign's `status='waiting' and current_step_id is
+      // null` activation guard — so "save as draft -> approve prospects ->
+      // activate" produced participants stuck on 'waiting' forever, which the
+      // engine never claims and which reported no error anywhere.
+      if (inserted.rows[0] && participantStatus === "active") {
+        await initializeParticipantStep(context.workspaceId, campaignId, inserted.rows[0].id, client);
+      }
       approved += 1;
     }
-    // Point every newly-added participant at this campaign's first step
-    // (the 'invite' step — the executor only claims participants already
-    // sitting on it).
-    await client.query(
-      `update campaign_participants set current_step_id=(select id from campaign_steps where campaign_id=$1 order by position limit 1)
-       where campaign_id=$1 and current_step_id is null`,
-      [campaignId],
-    );
     const activity = await recordActivity(context, { eventType: "campaign.prospects_approved", entityType: "campaign", entityId: campaignId, metadata: { campaignId, count: approved } }, client);
     await client.query("commit");
     await dispatchCommittedActivity(activity);

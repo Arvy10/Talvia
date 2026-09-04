@@ -66,6 +66,14 @@ function createFakeDatabase() {
       const row = contacts.find((c) => c.workspace_id === workspaceId && c.id === contactId);
       return { rows: row ? [{ first_name: row.first_name, display_name: row.display_name, company: row.company ?? null }] : [] };
     }
+    // generatePersonalizationForCampaign's channel dispatch — the batch
+    // entry point used to call the LinkedIn generator unconditionally, so it
+    // could only ever succeed for LinkedIn.
+    if (text.startsWith("select channel_type from campaigns where workspace_id=$1 and id=$2")) {
+      const [workspaceId, campaignId] = params as string[];
+      const row = campaigns.find((c) => c.id === campaignId && c.workspace_id === workspaceId);
+      return { rows: row ? [{ channel_type: row.channel_type ?? "linkedin" }] : [] };
+    }
     if (text.startsWith("select objective from campaigns where workspace_id=$1 and id=$2")) {
       const [workspaceId, campaignId] = params as string[];
       const row = campaigns.find((c) => c.id === campaignId && c.workspace_id === workspaceId);
@@ -126,6 +134,7 @@ const {
   getParticipantPersonalization,
   generateParticipantPersonalization,
   generateWhatsAppParticipantPersonalization,
+  generateEmailParticipantPersonalization,
   generatePersonalizationForCampaign,
   editParticipantInvitation,
   approveParticipantInvitation,
@@ -1347,7 +1356,13 @@ describe("C2.4 — Business Context / Contact separation, follow_up vs reactivat
     expect(generateStructuredMock).not.toHaveBeenCalled(); // never even attempted for an approved step
   });
 
-  it("27. LinkedIn personalization is unaffected — its message artifacts never carry a generationMode", async () => {
+  // Previously this asserted the opposite — that LinkedIn artifacts carry NO
+  // generationMode — which was only ever true because the LinkedIn pipeline
+  // predated the marker. It made the UI unable to distinguish an AI-grounded
+  // LinkedIn text from the deterministic fallback that silently replaced a
+  // rejected one, on the one channel where that fallback is most likely.
+  // The invariant that actually matters is that the marker tells the truth.
+  it("27. LinkedIn personalization reports its real provenance — deterministic when no provider is configured", async () => {
     seedCampaign("camp-1");
     seedParticipant("camp-1", "part-1", "contact-1");
     seedCandidate("camp-1", "contact-1", { headline: "Fondatrice", company: "Acme" });
@@ -1356,6 +1371,184 @@ describe("C2.4 — Business Context / Contact separation, follow_up vs reactivat
 
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error("unreachable");
-    for (const message of result.personalization.messages) expect(message.generationMode).toBeUndefined();
+    for (const message of result.personalization.messages) expect(message.generationMode).toBe("deterministic_fallback");
+    // And never a model name attached to text no model produced.
+    expect(result.personalization.aiModel).toBeNull();
+  });
+});
+
+// --- Email personalization ---
+// Before this existed, an email campaign was sent to the LinkedIn generator,
+// which requires a campaign_prospect_candidates row — so it always returned
+// NO_PERSONALIZATION_DATA, no approvedText could ever exist, and the email
+// executor could only ever fail with MESSAGE_NOT_APPROVED. Email was a real
+// channel in the engine and a dead end in the product.
+//
+// The pipeline is the WhatsApp one, channel-parameterized: identical segment
+// schema, identical evidence construction, identical validators, identical
+// fallback discipline. Only the register and the length budget differ. These
+// tests pin the parts that must be email-specific and the parts that must NOT
+// diverge.
+
+function seedEmailCampaign(campaignId: string, opts: { forWorkspaceId?: string; objective?: "follow_up" | "reactivation"; template?: string | null } = {}) {
+  fakeDatabase.campaigns.push({ id: campaignId, workspace_id: opts.forWorkspaceId ?? workspaceId, objective: opts.objective ?? "follow_up", channel_type: "email" });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-msg1`, campaign_id: campaignId, position: 0, step_type: "message", message_template: opts.template === undefined ? null : opts.template });
+}
+function seedEmailConversation(id: string, contactId: string, opts: { lastMessageAt?: string | null } = {}) {
+  fakeDatabase.conversations.push({
+    id, workspace_id: workspaceId, contact_id: contactId, channel_type: "email",
+    last_message_at: opts.lastMessageAt ?? null, created_at: "2026-01-01T00:00:00.000Z",
+  });
+}
+
+describe("generateEmailParticipantPersonalization — grounded on the real email thread", () => {
+  it("reads evidence from the EMAIL conversation, never from a WhatsApp one for the same Contact", async () => {
+    seedEmailCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedConversation("conv-wa", "contact-1"); // whatsapp
+    seedMessage("msg-wa", "conv-wa", { direction: "inbound", body: "Message WhatsApp confidentiel." });
+    seedEmailConversation("conv-mail", "contact-1");
+    seedMessage("msg-mail", "conv-mail", { direction: "inbound", body: "Pouvez-vous me renvoyer la proposition ?" });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Bonjour Jean, une question rapide." }]);
+
+    const result = await generateEmailParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    const prompt = generateStructuredMock.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("Pouvez-vous me renvoyer la proposition ?");
+    expect(prompt).not.toContain("Message WhatsApp confidentiel.");
+  });
+
+  it("asks for an e-mail register and the email length budget, not WhatsApp's", async () => {
+    seedEmailCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedEmailConversation("conv-mail", "contact-1");
+    seedMessage("msg-mail", "conv-mail", { direction: "inbound", body: "Pouvez-vous me renvoyer la proposition ?" });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Bonjour Jean, une question rapide." }]);
+
+    await generateEmailParticipantPersonalization(context, "camp-1", "part-1");
+
+    const request = generateStructuredMock.mock.calls[0]![0] as { system: string; prompt: string };
+    expect(request.prompt).toContain("relance e-mail");
+    expect(request.prompt).toContain("1200 caractères maximum");
+    // No subject and no signature: the subject is campaign-level and
+    // user-authored, the signature belongs to the mailbox.
+    expect(request.system).toContain("ni objet ni signature");
+  });
+
+  it("applies the SAME evidence validation — an undeclared prospect-state assertion falls back", async () => {
+    seedEmailCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedEmailConversation("conv-mail", "contact-1");
+    seedMessage("msg-mail", "conv-mail", { direction: "inbound", body: "Merci pour votre message." });
+    // "budget" is a prospect-state assertion with no inbound evidence behind
+    // it, mislabelled generic.
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "Avez-vous validé le budget de votre côté ?" }]);
+
+    const result = await generateEmailParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = firstMessage(result.personalization);
+    expect(message.generationMode).toBe("deterministic_fallback");
+    expect(message.generatedText).not.toContain("budget");
+  });
+
+  it("rejects a generation longer than the email budget rather than truncating it", async () => {
+    seedEmailCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedEmailConversation("conv-mail", "contact-1");
+    seedMessage("msg-mail", "conv-mail", { direction: "inbound", body: "Merci pour votre message." });
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: "a".repeat(1201) }]);
+
+    const result = await generateEmailParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("accepts a grounded email longer than WhatsApp's 320-character limit", async () => {
+    seedEmailCampaign("camp-1");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1");
+    seedEmailConversation("conv-mail", "contact-1");
+    seedMessage("msg-mail", "conv-mail", { direction: "inbound", body: "Merci pour votre message." });
+    const longButValid = `Bonjour Jean, ${"une phrase de courtoisie tout à fait ordinaire. ".repeat(8)}`;
+    expect(longButValid.length).toBeGreaterThan(320);
+    mockSegmentedWhatsAppGeneration([{ kind: "generic", text: longButValid }]);
+
+    const result = await generateEmailParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generationMode).toBe("ai_grounded");
+  });
+});
+
+describe("generateEmailParticipantPersonalization — first touch (no thread yet)", () => {
+  it("never calls the model when there is no inbound evidence, and proposes the campaign's own template", async () => {
+    seedEmailCampaign("camp-1", { template: "Bonjour {first_name}, je me permets de vous écrire au sujet de {company}." });
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { company: "Acme" });
+    getAIProviderMock.mockReturnValue({ model: "test-model", generateStructured: generateStructuredMock });
+
+    const result = await generateEmailParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    // No conversation exists, so nothing can be grounded — spending a
+    // provider call would only produce a text validation is guaranteed to
+    // reject.
+    expect(generateStructuredMock).not.toHaveBeenCalled();
+    const message = firstMessage(result.personalization);
+    expect(message.generationMode).toBe("deterministic_fallback");
+    expect(message.generatedText).toBe("Bonjour Jean, je me permets de vous écrire au sujet de Acme.");
+    // Proposed, never executable — a human still has to approve it.
+    expect(message.status).toBe("generated");
+    expect(message.approvedText).toBeNull();
+  });
+
+  it("never invents a company for a Contact that has none", async () => {
+    seedEmailCampaign("camp-1", { template: "Bonjour {first_name}, au sujet de {company}." });
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedContact("contact-1", { company: null });
+
+    const result = await generateEmailParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).generatedText).toBe("Bonjour Jean, au sujet de votre entreprise.");
+  });
+
+  it("never overwrites an already-approved message", async () => {
+    seedEmailCampaign("camp-1");
+    seedContact("contact-1");
+    seedParticipant("camp-1", "part-1", "contact-1", {
+      evidence: { observedFacts: [], qualificationContext: null, strategyContext: null, uncertainties: [] },
+      outreachAngle: null,
+      invitation: { status: "not_generated", generatedText: null, editedText: null, approvedText: null, approvedAt: null },
+      messages: [{ stepId: "camp-1-msg1", status: "approved", generatedText: "Texte humain.", editedText: null, approvedText: "Texte humain.", approvedAt: "2026-02-01T00:00:00.000Z" }],
+      generatedAt: "2026-02-01T00:00:00.000Z", aiModel: null,
+    });
+
+    const result = await generateEmailParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(firstMessage(result.personalization).approvedText).toBe("Texte humain.");
+  });
+
+  it("refuses for a participant in another workspace", async () => {
+    seedEmailCampaign("camp-1", { forWorkspaceId: "ws-2" });
+    seedParticipant("camp-1", "part-1", "contact-1");
+
+    const result = await generateEmailParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result).toEqual({ ok: false, reason: "NOT_ELIGIBLE" });
   });
 });

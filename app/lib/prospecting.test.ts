@@ -102,11 +102,35 @@ function createFakeDatabase() {
       return { rows: [] };
     }
 
+    // `returning id` is what lets approveProspects tell a genuinely new
+    // participant from an ON CONFLICT no-op — only a fresh, ACTIVE one is
+    // ever initialized onto the first step.
     if (text.startsWith("insert into campaign_participants")) {
       const [campaignId, contactId, status] = params as string[];
-      if (!campaignParticipants.some((p) => p.campaign_id === campaignId && p.contact_id === contactId)) {
-        campaignParticipants.push({ id: nextId("part"), campaign_id: campaignId, contact_id: contactId, status: status ?? "waiting", current_step_id: null, invite_claimed_at: null, invite_sent_at: null, invite_accepted_at: null, created_at: new Date().toISOString() });
-      }
+      if (campaignParticipants.some((p) => p.campaign_id === campaignId && p.contact_id === contactId)) return { rows: [] };
+      const row = { id: nextId("part"), campaign_id: campaignId, contact_id: contactId, status: status ?? "waiting", current_step_id: null, invite_claimed_at: null, invite_sent_at: null, invite_accepted_at: null, step_claimed_at: null, last_action_at: null, created_at: new Date().toISOString() };
+      campaignParticipants.push(row);
+      return { rows: [{ id: row.id }] };
+    }
+
+    // step-progression.ts's initializeParticipantStep, reached from
+    // approveProspects for an active campaign — the same canonical
+    // initializer campaigns.ts's addParticipants uses, not a second one.
+    if (text.startsWith("select id,position,step_type,message_template from campaign_steps where campaign_id=$1 and position>$2")) {
+      const [campaignId, position] = params as [string, number];
+      const row = campaignSteps.filter((s) => s.campaign_id === campaignId && (s.position as number) > Number(position)).sort((a, b) => (a.position as number) - (b.position as number))[0];
+      return { rows: row ? [{ id: row.id, position: row.position, step_type: row.step_type, message_template: row.message_template ?? null }] : [] };
+    }
+    if (text.startsWith("update campaign_participants set current_step_id=$1,step_claimed_at=null")) {
+      const [stepId, participantId] = params as string[];
+      const row = campaignParticipants.find((p) => p.id === participantId);
+      if (row) { row.current_step_id = stepId; row.step_claimed_at = null; row.last_action_at = new Date().toISOString(); }
+      return { rows: [] };
+    }
+    if (text.startsWith("update campaign_participants set current_step_id=coalesce($1,current_step_id),status='completed'")) {
+      const [stepId, participantId] = params as [string | null, string];
+      const row = campaignParticipants.find((p) => p.id === participantId);
+      if (row) { row.current_step_id = stepId ?? row.current_step_id; row.status = "completed"; row.last_action_at = new Date().toISOString(); }
       return { rows: [] };
     }
 
@@ -417,7 +441,15 @@ describe("approveProspects", () => {
     expect(fakeDatabase.contacts).toHaveLength(1);
     expect(fakeDatabase.contacts[0]).toMatchObject({ status: "lead" });
     expect(fakeDatabase.campaignParticipants).toHaveLength(1);
-    expect(fakeDatabase.campaignParticipants[0]).toMatchObject({ campaign_id: "camp-1", status: "waiting", current_step_id: "camp-1-invite" });
+    // current_step_id stays NULL on purpose while the campaign is a draft.
+    // Stamping it here (as this used to) silently disqualified the
+    // participant from transitionCampaign's `status='waiting' and
+    // current_step_id is null` activation guard, so "save as draft ->
+    // approve prospects -> activate" left it stuck on 'waiting' forever —
+    // a status the engine never claims, with no error recorded anywhere.
+    // Activation is what places it on the first step, through the canonical
+    // initializer.
+    expect(fakeDatabase.campaignParticipants[0]).toMatchObject({ campaign_id: "camp-1", status: "waiting", current_step_id: null });
 
     fakeDatabase.campaigns[0]!.status = "active";
     await fakeDatabase.query(`update campaign_participants set status='active',started_at=coalesce(started_at,now()),updated_at=now() where campaign_id=$1 and status='waiting'`, ["camp-1"]);

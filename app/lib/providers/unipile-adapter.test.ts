@@ -3,11 +3,23 @@ import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { UnipileAccountStatusPayload, UnipileHostedAuthNotifyPayload, UnipileNewMessagePayload } from "./unipile";
 
+// These assertions guard real production CHECK constraints, so they must
+// resolve the migration wherever the suite was launched from. A single
+// cwd-relative path ("../db/migrations/...") silently turned them into "the
+// file does not exist" failures when vitest ran from the repository root —
+// the least useful outcome for a test whose whole point is that the schema
+// and the code agree. Both roots are tried, and a genuinely missing file
+// still fails loudly on the existsSync assertion below.
+function migrationPath(file: string): string {
+  const candidates = [resolve(process.cwd(), "db/migrations", file), resolve(process.cwd(), "../db/migrations", file)];
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!;
+}
+
 describe("connection_auth_attempts migration", () => {
   it("5. token_hash carries a real UNIQUE constraint, not just a plain index", () => {
-    const migrationPath = resolve(process.cwd(), "../db/migrations/020_connection_auth_attempts.sql");
-    expect(existsSync(migrationPath)).toBe(true);
-    const migration = readFileSync(migrationPath, "utf8");
+    const path = migrationPath("020_connection_auth_attempts.sql");
+    expect(existsSync(path)).toBe(true);
+    const migration = readFileSync(path, "utf8");
     expect(migration).toContain("unique(token_hash)");
     expect(migration).toContain("external_account_id");
   });
@@ -336,7 +348,7 @@ function createFakeDatabase() {
       if (!conversation) return { rows: [] };
       const connection = connections.find((c) => c.id === conversation.connection_id && c.provider === provider);
       if (!connection) return { rows: [] };
-      return { rows: [{ external_thread_id: conversation.external_thread_id, external_account_id: connection.external_account_id, status: connection.status }] };
+      return { rows: [{ external_thread_id: conversation.external_thread_id, external_account_id: connection.external_account_id, status: connection.status, channel_type: conversation.channel_type }] };
     }
 
     if (text.startsWith("update campaign_participants set invite_accepted_at=now()")) {
@@ -432,6 +444,17 @@ vi.mock("./unipile", async (importOriginal) => ({
 const runDueCampaignActionsMock = vi.hoisted(() => vi.fn(async () => ({ attempted: 0, sent: 0, skipped: 0, failed: 0 })));
 vi.mock("../campaign-execution/engine", () => ({ runDueCampaignActions: runDueCampaignActionsMock }));
 
+// sendMessage dispatches an email conversation to unipile-email.ts through a
+// dynamic import (the two modules import each other). Mocked so this file
+// keeps testing the adapter's own dispatch and persistence, not email sending.
+const sendEmailForConversationMock = vi.hoisted(() => vi.fn(async () => ({ providerMessageId: "provider-msg-outbound-1", subject: "Re: Objet" })));
+// persistImportedEmails is stubbed too: backfillConnectionHistory reaches it
+// through the same dynamic import, and leaving it off the mock would make the
+// email backfill test pass through its own error path instead of the success
+// path it is asserting. Persistence itself is covered in unipile-email.test.ts.
+const persistImportedEmailsMock = vi.hoisted(() => vi.fn(async () => ({ messagesInserted: 0, threadsTouched: 0 })));
+vi.mock("./unipile-email", () => ({ sendEmailForConversation: sendEmailForConversationMock, persistImportedEmails: persistImportedEmailsMock }));
+
 const { backfillConnectionHistory, createConnectionAuthAttempt, editMessage, ingestAccountStatus, ingestHostedAuthNotification, ingestMessage, requestConnectionSync, resolveConnectionAuthAttempt, runDueConnectionSyncs, sendMessage } = await import("./unipile-adapter");
 
 beforeEach(() => {
@@ -476,7 +499,7 @@ function messagePayload(overrides: Partial<UnipileNewMessagePayload> = {}): Unip
 // out of the migration files themselves — so they fail if the code ever
 // writes a channel value Postgres would reject in production.
 function allowedChannelTypes(migrationFile: string, table: string): string[] {
-  const migration = readFileSync(resolve(process.cwd(), `../db/migrations/${migrationFile}`), "utf8");
+  const migration = readFileSync(migrationPath(migrationFile), "utf8");
   const tableStart = migration.indexOf(table);
   expect(tableStart).toBeGreaterThan(-1);
   const match = /channel_type varchar\(24\) not null check \(channel_type in \(([^)]*)\)\)/.exec(migration.slice(tableStart));
@@ -859,6 +882,32 @@ describe("sendMessage", () => {
   it("refuses to send on a conversation with no real provider connection behind it", async () => {
     fakeDatabase.conversations.push({ id: "conv-manual", workspace_id: workspaceId, connection_id: null, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: null, last_message_at: null });
     await expect(sendMessage(workspaceId, "conv-manual", "Bonjour")).rejects.toThrow();
+    expect(sendChatMessageMock).not.toHaveBeenCalled();
+  });
+
+  // A first-touch email Conversation legitimately has external_thread_id =
+  // NULL until the mail_sent webhook reconciles it (see unipile-email.ts).
+  // The thread key is never an input to an email send — the recipient comes
+  // from the Contact's identity and threading from the parent mail's own
+  // provider id — so a blanket "no thread, no send" check blocked the very
+  // follow-up Talvia had just made possible.
+  it("sends on an email conversation whose thread is not reconciled yet", async () => {
+    await connectAccount();
+    fakeDatabase.connections[0]!.channel_type = "email";
+    fakeDatabase.conversations.push({ id: "conv-mail", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "email", external_thread_id: null, last_message_at: null });
+
+    const result = await sendMessage(workspaceId, "conv-mail", "Je reviens vers vous.", "part-1:step-1");
+
+    expect(sendEmailForConversationMock).toHaveBeenCalled();
+    expect(sendChatMessageMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ direction: "outbound", status: "sent" });
+  });
+
+  it("still refuses on a CHAT conversation with no thread id — there the thread key IS the chat id", async () => {
+    await connectAccount();
+    fakeDatabase.conversations.push({ id: "conv-chat", workspace_id: workspaceId, connection_id: fakeDatabase.connections[0]!.id, contact_id: "contact-1", channel_type: "linkedin", external_thread_id: null, last_message_at: null });
+
+    await expect(sendMessage(workspaceId, "conv-chat", "Bonjour")).rejects.toThrow();
     expect(sendChatMessageMock).not.toHaveBeenCalled();
   });
 

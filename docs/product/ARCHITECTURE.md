@@ -254,6 +254,31 @@ For controlled outbound sequences:
 
 ---
 
+# 6b. Outbound reconciliation
+
+A channel whose provider only assigns a thread identifier once a message
+exists (email today) must not invent one. The rule:
+
+1. call the provider first, outside any transaction;
+2. persist only what the provider confirmed, keyed on a real identifier it
+   returned, marked as provisional;
+3. reconcile onto the canonical thread when the provider's own event
+   supplies it, re-keying the existing row rather than inserting a second;
+4. if no identifier comes back at all, create nothing and report the send as
+   done — never as failed, which would re-send to a real person.
+
+The provisional state is represented by a NULL thread key, never by parking a
+message identifier in the thread column: a unique constraint on that column
+defines thread identity, and a value that merely looks like one collides with
+nothing when the real thread finally arrives. Reconciliation keys on an
+identifier every arrival path carries, so it does not matter which of them
+reaches Talvia first.
+
+A provider action that succeeded must never be reported as a failure, and a
+local mirror that is incomplete must never be reported as complete.
+
+---
+
 # 7. WhatsApp architecture philosophy
 
 WhatsApp campaigns should prioritize:

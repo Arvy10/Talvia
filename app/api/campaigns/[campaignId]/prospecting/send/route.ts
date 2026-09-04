@@ -7,9 +7,11 @@ function fail(error: unknown) { if (error instanceof UnauthorizedError) return N
 
 const BLOCKED_REASON_MESSAGES: Partial<Record<string, string>> = {
   NO_LINKEDIN_CONNECTION: "Aucun compte LinkedIn connecté.",
+  NO_WHATSAPP_CONNECTION: "Aucun compte WhatsApp connecté.",
+  NO_EMAIL_CONNECTION: "Aucune boîte e-mail connectée.",
   NOT_ELIGIBLE: "Campagne introuvable.",
   CAMPAIGN_PAUSED: "La campagne doit être activée avant d'envoyer des invitations.",
-  NO_STEP_CONFIGURED: "Cette campagne n'a pas d'étape d'invitation.",
+  NO_STEP_CONFIGURED: "Cette campagne n'a aucune étape exécutable.",
   DAILY_LIMIT_REACHED: "La limite quotidienne d'invitations est atteinte — réessayez demain.",
 };
 

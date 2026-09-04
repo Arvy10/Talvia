@@ -1059,7 +1059,16 @@ export async function sendMessage(workspaceId: string, conversationId: string, t
     [workspaceId, conversationId, PROVIDER],
   );
   const row = result.rows[0];
-  if (!row?.external_thread_id) throw new Error("Ce canal n'est pas encore relié à un fournisseur réel.");
+  if (!row) throw new Error("Ce canal n'est pas encore relié à un fournisseur réel.");
+  // external_thread_id IS the chat id for the /chats API, so a chat channel
+  // genuinely cannot send without it. Email is different: the recipient comes
+  // from the Contact's stored identity and threading comes from the parent
+  // mail's own provider id, so a thread key is never an input to the send.
+  // A first-touch Conversation legitimately has external_thread_id = NULL
+  // until the mail_sent webhook reconciles it (see unipile-email.ts) — a
+  // blanket check here would have blocked the follow-up on a conversation
+  // Talvia itself had just created.
+  if (row.channel_type !== "email" && !row.external_thread_id) throw new Error("Ce canal n'est pas encore relié à un fournisseur réel.");
   if (row.status !== "connected") throw new Error("Ce canal n'est pas connecté.");
 
   // Email is not the /chats API — sendChatMessage would address an email
@@ -1071,7 +1080,7 @@ export async function sendMessage(workspaceId: string, conversationId: string, t
   // circular, the same reason the engine trigger above uses one.
   const messageId = row.channel_type === "email"
     ? (await (await import("./unipile-email")).sendEmailForConversation(workspaceId, conversationId, text, row.external_account_id, idempotencyKey)).providerMessageId
-    : await sendChatMessage(config, row.external_thread_id, text);
+    : await sendChatMessage(config, row.external_thread_id!, text);
 
   // ON CONFLICT DO UPDATE (a no-op update, not DO NOTHING) so this always
   // returns a row even in the rare race where the webhook for this exact

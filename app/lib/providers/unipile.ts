@@ -414,7 +414,11 @@ export async function sendEmail(config: UnipileConfig, params: SendEmailParams):
     }),
     signal: AbortSignal.timeout(20_000),
   });
-  if (!response.ok) throw new Error(`Unipile send email failed (${response.status}).`);
+  // Marked so the caller can distinguish "the provider answered and refused"
+  // (nothing was sent) from a timeout or dropped connection, where whether
+  // the mail went out is genuinely unknown. Only the latter carries a
+  // double-send risk on retry.
+  if (!response.ok) throw Object.assign(new Error(`Unipile send email failed (${response.status}).`), { providerAnswered: true as const });
   const data = await response.json() as { object?: string; provider_id?: string | null; tracking_id?: string | null };
   return { providerId: data.provider_id ?? null, trackingId: data.tracking_id ?? null };
 }

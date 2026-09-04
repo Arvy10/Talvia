@@ -56,6 +56,141 @@ function createFakeDatabase() {
       return { rows: [] };
     }
 
+    // --- first touch (sendFirstTouchEmail) ---
+    // The cross-path "is this mail already mirrored?" guard. emailProviderId
+    // is the one identifier the send response, the webhook and the historical
+    // import all carry.
+    if (text.startsWith("select m.conversation_id from messages m join conversations v on v.id=m.conversation_id")) {
+      const [ws, connectionId, providerId] = params as string[];
+      const row = messages.find((m) => {
+        const conversation = conversations.find((c) => c.id === m.conversation_id);
+        return m.workspace_id === ws && conversation?.connection_id === connectionId && (m.metadata as Record<string, unknown>)?.emailProviderId === providerId;
+      });
+      return { rows: row ? [{ conversation_id: row.conversation_id }] : [] };
+    }
+    // The Contact's canonical email Conversation on this connection, if any —
+    // a first touch adopts it rather than opening a second one.
+    if (text.startsWith("select id from conversations where workspace_id=$1 and connection_id=$2 and contact_id=$3 and channel_type='email'")) {
+      const [ws, connectionId, contactId] = params as string[];
+      const row = conversations.find((c) => c.workspace_id === ws && c.connection_id === connectionId && c.contact_id === contactId && c.channel_type === "email");
+      return { rows: row ? [{ id: row.id }] : [] };
+    }
+    // The provisional Conversation: external_thread_id is genuinely NULL, not
+    // a stand-in value.
+    if (text.startsWith("insert into conversations(workspace_id,connection_id,contact_id,channel_type,external_thread_id,status) values($1,$2,$3,'email',null,'open')")) {
+      const [ws, connectionId, contactId] = params as string[];
+      const row = { id: nextId("conv"), workspace_id: ws, connection_id: connectionId, contact_id: contactId, channel_type: "email", external_thread_id: null as string | null, subject: null as string | null, last_message_at: null as string | null, status: "open" };
+      conversations.push(row);
+      return { rows: [{ id: row.id }] };
+    }
+    if (text.startsWith("select ci.identifier, ct.display_name from contact_identities ci")) {
+      const [ws, contactId] = params as string[];
+      const identity = contactIdentities.find((i) => i.workspace_id === ws && i.contact_id === contactId && i.channel_type === "email");
+      const contact = contacts.find((c) => c.id === contactId);
+      return { rows: identity ? [{ identifier: identity.identifier, display_name: contact?.display_name ?? null }] : [] };
+    }
+    if (text.startsWith("select id,external_account_id from connections where workspace_id=$1 and provider=$2 and channel_type='email' and status='connected'")) {
+      const [ws, provider] = params as string[];
+      const row = connections.find((c) => c.workspace_id === ws && c.provider === provider && c.channel_type === "email" && c.status === "connected");
+      return { rows: row ? [{ id: row.id, external_account_id: row.external_account_id }] : [] };
+    }
+    if (text.startsWith("insert into messages(workspace_id,conversation_id,direction,body,status,provider_message_id,sent_at,metadata)")) {
+      const [ws, conversationId, body, providerMessageId, metadataJson] = params as string[];
+      if (messages.some((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId)) return { rows: [] };
+      const row = { id: nextId("msg"), workspace_id: ws, conversation_id: conversationId, direction: "outbound", sender_contact_id: null, body, status: "sent", provider_message_id: providerMessageId, date: new Date().toISOString(), metadata: JSON.parse(metadataJson) };
+      messages.push(row);
+      return { rows: [] };
+    }
+    if (text.startsWith("update conversations set last_message_at=now(),updated_at=now() where id=$1")) {
+      const [id] = params as string[];
+      const row = conversations.find((c) => c.id === id);
+      if (row) row.last_message_at = new Date().toISOString();
+      return { rows: [] };
+    }
+
+    // --- threaded send (sendEmailForConversation) ---
+    if (text.startsWith("select v.subject, ct.display_name,")) {
+      const [ws, conversationId] = params as string[];
+      const conversation = conversations.find((c) => c.id === conversationId && c.workspace_id === ws);
+      if (!conversation) return { rows: [] };
+      const contact = contacts.find((c) => c.id === conversation.contact_id);
+      const identity = contactIdentities.find((i) => i.workspace_id === ws && i.contact_id === conversation.contact_id && i.channel_type === "email");
+      return { rows: [{ subject: conversation.subject ?? null, display_name: contact?.display_name ?? null, address: identity?.identifier ?? null }] };
+    }
+    if (text.startsWith("select metadata->>'emailProviderId' as provider_id from messages")) {
+      const [ws, conversationId] = params as string[];
+      const row = messages
+        .filter((m) => m.workspace_id === ws && m.conversation_id === conversationId && (m.metadata as Record<string, unknown>)?.emailProviderId)
+        .sort((a, b) => String(b.date ?? "").localeCompare(String(a.date ?? "")))[0];
+      return { rows: row ? [{ provider_id: (row.metadata as Record<string, string>).emailProviderId }] : [] };
+    }
+
+    // --- outbound reconciliation (reconcileOutboundSend) ---
+    if (text.startsWith("select m.id,m.conversation_id,v.external_thread_id from messages m join conversations v")) {
+      const [ws, connectionId, providerId] = params as string[];
+      const row = messages.find((m) => {
+        const conversation = conversations.find((c) => c.id === m.conversation_id);
+        const metadata = m.metadata as Record<string, unknown>;
+        return m.workspace_id === ws && conversation?.connection_id === connectionId
+          && metadata?.emailProviderId === providerId;
+      });
+      if (!row) return { rows: [] };
+      const conversation = conversations.find((c) => c.id === row.conversation_id)!;
+      return { rows: [{ id: row.id, conversation_id: row.conversation_id, external_thread_id: conversation.external_thread_id }] };
+    }
+    if (text.startsWith("select id from conversations where connection_id=$1 and external_thread_id=$2")) {
+      const [connectionId, threadId] = params as string[];
+      const row = conversations.find((c) => c.connection_id === connectionId && c.external_thread_id === threadId);
+      return { rows: row ? [{ id: row.id }] : [] };
+    }
+    if (text.startsWith("update conversations set external_thread_id=$2")) {
+      const [id, threadId] = params as string[];
+      const row = conversations.find((c) => c.id === id);
+      if (row) row.external_thread_id = threadId;
+      return { rows: [] };
+    }
+    if (text.startsWith("select id from messages where conversation_id=$1 and (provider_message_id=$2 or metadata->>'emailProviderId'=$3)")) {
+      const [conversationId, providerMessageId, providerId] = params as string[];
+      const row = messages.find((m) => m.conversation_id === conversationId && (m.provider_message_id === providerMessageId || (m.metadata as Record<string, unknown>)?.emailProviderId === providerId));
+      return { rows: row ? [{ id: row.id }] : [] };
+    }
+    if (text.startsWith("update messages set conversation_id=$2 where id=$1")) {
+      const [id, conversationId] = params as string[];
+      const row = messages.find((m) => m.id === id);
+      if (row) row.conversation_id = conversationId;
+      return { rows: [] };
+    }
+    if (text.startsWith("update conversations set status='archived'")) {
+      const [id] = params as string[];
+      const row = conversations.find((c) => c.id === id);
+      if (row && row.external_thread_id === null && !messages.some((m) => m.conversation_id === id)) row.status = "archived";
+      return { rows: [] };
+    }
+    // Historical import's cross-path guard.
+    if (text.startsWith("select m.metadata->>'emailProviderId' as pid from messages m join conversations v")) {
+      const [ws, connectionId, providerIds] = params as [string, string, string[]];
+      const rows = messages.filter((m) => {
+        const conversation = conversations.find((c) => c.id === m.conversation_id);
+        return m.workspace_id === ws && conversation?.connection_id === connectionId && m.direction === "outbound"
+          && providerIds.includes(String((m.metadata as Record<string, unknown>)?.emailProviderId ?? ""));
+      });
+      return { rows: rows.map((m) => ({ pid: (m.metadata as Record<string, string>).emailProviderId })) };
+    }
+    if (text.startsWith("select id from messages where conversation_id=$1 and provider_message_id=$2 and id<>$3")) {
+      const [conversationId, providerMessageId, excludeId] = params as string[];
+      const row = messages.find((m) => m.conversation_id === conversationId && m.provider_message_id === providerMessageId && m.id !== excludeId);
+      return { rows: row ? [{ id: row.id }] : [] };
+    }
+    if (text.startsWith("update messages set provider_message_id=case when $4")) {
+      const [id, emailId, patchJson, taken] = params as [string, string, string, boolean];
+      const row = messages.find((m) => m.id === id);
+      if (row) {
+        if (!taken) row.provider_message_id = emailId;
+        row.metadata = { ...(row.metadata as Record<string, unknown>), ...JSON.parse(patchJson) };
+      }
+      return { rows: [] };
+    }
+
     if (text.startsWith("select id,contact_id from conversations where connection_id=$1 and external_thread_id=$2")) {
       const [connectionId, threadId] = params as string[];
       const row = conversations.find((c) => c.connection_id === connectionId && c.external_thread_id === threadId);
@@ -158,10 +293,15 @@ vi.mock("../database", () => ({ get database() { return fakeDatabase; } }));
 // The provider lookup that resolves a webhook's thread — a real network call,
 // mocked so these tests exercise the ingestion logic, not Unipile.
 const getEmailByMessageIdMock = vi.hoisted(() => vi.fn(async () => null as { thread_id?: string } | null));
+// The only irreversible call in this module — a real person receives a real
+// mail — mocked so these tests exercise Talvia's own resolution, persistence
+// and reconciliation, never Unipile.
+const sendEmailMock = vi.hoisted(() => vi.fn(async (_config: unknown, _params: { accountId: string; to: Array<{ identifier: string }>; body: string; subject?: string; replyTo?: string; idempotencyKey?: string }) => ({ providerId: "provider-sent-1" as string | null, trackingId: null as string | null })));
 vi.mock("./unipile", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./unipile")>()),
   getUnipileConfig: () => ({ apiKey: "test-key", apiUrl: "https://api.test", webhookSecret: "test-secret", appBaseUrl: "https://app.test" }),
   getEmailByMessageId: getEmailByMessageIdMock,
+  sendEmail: sendEmailMock,
 }));
 
 const dispatchCommittedActivityMock = vi.hoisted(() => vi.fn(async () => undefined));
@@ -170,11 +310,12 @@ vi.mock("../activities", async (importOriginal) => ({
   dispatchCommittedActivity: dispatchCommittedActivityMock,
 }));
 
-const { ingestEmail, persistImportedEmails, toPlainTextBody } = await import("./unipile-email");
+const { ingestEmail, persistImportedEmails, sendEmailForConversation, sendFirstTouchEmail, toPlainTextBody } = await import("./unipile-email");
 
 beforeEach(() => {
   fakeDatabase = createFakeDatabase();
   getEmailByMessageIdMock.mockReset().mockResolvedValue({ thread_id: "thread-1" });
+  sendEmailMock.mockReset().mockResolvedValue({ providerId: "provider-sent-1", trackingId: null });
   dispatchCommittedActivityMock.mockClear();
 });
 
@@ -643,5 +784,434 @@ describe("persistImportedEmails — batching (transactional N+1 removed)", () =>
     expect(fakeDatabase.messages.every((m) => m.workspace_id === workspaceId)).toBe(true);
     expect(fakeDatabase.conversations.every((c) => c.workspace_id === workspaceId)).toBe(true);
     expect(fakeDatabase.contactIdentities.every((i) => i.workspace_id === workspaceId)).toBe(true);
+  });
+});
+
+// --- First touch: a real mail to a known address with no thread yet ---
+// The capability DECISIONS.md deferred, and the one structural hole that made
+// "Email is a real campaign channel" untrue: the shared executor required an
+// existing Conversation, so a Contact with a perfectly valid address but no
+// thread could only ever end as NOT_ELIGIBLE.
+
+function seedEmailContact(address = "prospect@example.com", contactId = "contact-ft") {
+  fakeDatabase.contacts.push({ id: contactId, workspace_id: workspaceId, display_name: "Marc Durand" });
+  fakeDatabase.contactIdentities.push({ workspace_id: workspaceId, contact_id: contactId, channel_type: "email", identifier: address, identifier_normalized: address.toLowerCase() });
+  return contactId;
+}
+function seedConnectedEmailConnection(externalAccountId = accountId) {
+  fakeDatabase.connections.push({ id: `conn-${externalAccountId}`, workspace_id: workspaceId, provider: "unipile", channel_type: "email", external_account_id: externalAccountId, status: "connected" });
+  return `conn-${externalAccountId}`;
+}
+
+describe("sendFirstTouchEmail — sending", () => {
+  it("sends to the address resolved from Talvia's own identity, with a real subject and no reply_to", async () => {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId, subject: "Suite à notre échange", body: "Bonjour Marc,", idempotencyKey: "part-1:step-1" });
+
+    expect(result.ok).toBe(true);
+    const call = sendEmailMock.mock.calls[0]![1];
+    expect(call.to).toEqual([{ identifier: "prospect@example.com", display_name: "Marc Durand" }]);
+    expect(call.subject).toBe("Suite à notre échange");
+    // A first touch has no parent mail — inventing a reply_to would be
+    // inventing a provider identifier.
+    expect(call.replyTo).toBeUndefined();
+    expect(call.idempotencyKey).toBe("part-1:step-1");
+  });
+
+  it("creates a Conversation with NO thread id yet — never the message id parked in the thread column", async () => {
+    const connectionId = seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId, subject: "Suite à notre échange", body: "Bonjour Marc," });
+
+    const conversation = fakeDatabase.conversations.find((c) => c.connection_id === connectionId)!;
+    // NULL means exactly "the provider has not told us the thread yet".
+    // Storing the send response's provider_id here instead would file a
+    // MESSAGE identifier in the column whose unique(connection_id,
+    // external_thread_id) constraint defines THREAD identity.
+    expect(conversation.external_thread_id).toBeNull();
+    expect(conversation.contact_id).toBe(contactId);
+    expect(conversation.subject).toBe("Suite à notre échange");
+    expect(result).toMatchObject({ ok: true, conversationId: conversation.id });
+
+    expect(fakeDatabase.messages).toHaveLength(1);
+    const message = fakeDatabase.messages[0]!;
+    expect(message.direction).toBe("outbound");
+    expect(message.provider_message_id).toBe("provider-sent-1");
+    // Marked provisional, never presented as a resolved thread.
+    expect((message.metadata as Record<string, unknown>).threadResolution).toBe("pending_first_touch");
+  });
+
+  it("records the same message.sent activity a threaded send records — an Automation must not behave differently per delivery path", async () => {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+
+    await sendFirstTouchEmail({ workspaceId, contactId, subject: "Objet", body: "Corps" });
+
+    expect(fakeDatabase.activities.some((a) => a.event_type === "message.sent")).toBe(true);
+    expect(dispatchCommittedActivityMock).toHaveBeenCalled();
+  });
+
+  it("never opens a transaction while the provider call is in flight", async () => {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    let depthDuringSend = -1;
+    sendEmailMock.mockImplementationOnce(async () => { depthDuringSend = fakeDatabase.transactionDepth(); return { providerId: "provider-sent-1", trackingId: null }; });
+
+    await sendFirstTouchEmail({ workspaceId, contactId, subject: "Objet", body: "Corps" });
+
+    expect(depthDuringSend).toBe(0);
+  });
+});
+
+describe("sendFirstTouchEmail — refusals (never a send, never a fabricated success)", () => {
+  it("refuses with EMAIL_IDENTITY_MISSING when the Contact has no email identity", async () => {
+    seedConnectedEmailConnection();
+    fakeDatabase.contacts.push({ id: "contact-none", workspace_id: workspaceId, display_name: "Sans adresse" });
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId: "contact-none", subject: "Objet", body: "Corps" });
+
+    expect(result).toEqual({ ok: false, reason: "EMAIL_IDENTITY_MISSING" });
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the identity exists in ANOTHER workspace — a contact id is never an authorization boundary", async () => {
+    seedConnectedEmailConnection();
+    fakeDatabase.contacts.push({ id: "contact-other", workspace_id: "ws-other", display_name: "Ailleurs" });
+    fakeDatabase.contactIdentities.push({ workspace_id: "ws-other", contact_id: "contact-other", channel_type: "email", identifier: "ailleurs@example.com", identifier_normalized: "ailleurs@example.com" });
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId: "contact-other", subject: "Objet", body: "Corps" });
+
+    expect(result).toEqual({ ok: false, reason: "EMAIL_IDENTITY_MISSING" });
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses with EMAIL_CONNECTION_UNAVAILABLE when no email account is connected", async () => {
+    fakeDatabase.connections.push({ id: "conn-x", workspace_id: workspaceId, provider: "unipile", channel_type: "email", external_account_id: accountId, status: "error" });
+    const contactId = seedEmailContact();
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId, subject: "Objet", body: "Corps" });
+
+    expect(result).toEqual({ ok: false, reason: "EMAIL_CONNECTION_UNAVAILABLE" });
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses with EMAIL_SUBJECT_MISSING rather than inventing a subject", async () => {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId, subject: "   ", body: "Corps" });
+
+    expect(result).toEqual({ ok: false, reason: "EMAIL_SUBJECT_MISSING" });
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+
+  it("reports EMAIL_FIRST_TOUCH_SEND_FAILED and writes nothing when the provider ANSWERS and refuses", async () => {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    // providerAnswered is what unipile.ts stamps on a real HTTP rejection:
+    // the provider spoke, and it did not send anything.
+    sendEmailMock.mockRejectedValueOnce(Object.assign(new Error("Unipile send email failed (500)."), { providerAnswered: true }));
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId, subject: "Objet", body: "Corps" });
+
+    expect(result).toEqual({ ok: false, reason: "EMAIL_FIRST_TOUCH_SEND_FAILED" });
+    expect(fakeDatabase.conversations).toHaveLength(0);
+    expect(fakeDatabase.messages).toHaveLength(0);
+  });
+
+  it("reports EMAIL_SEND_OUTCOME_UNKNOWN when the provider never answered — the one case that can double-send on retry", async () => {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    // A timeout / dropped connection carries no providerAnswered marker.
+    sendEmailMock.mockRejectedValueOnce(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId, subject: "Objet", body: "Corps" });
+
+    expect(result).toEqual({ ok: false, reason: "EMAIL_SEND_OUTCOME_UNKNOWN" });
+    expect(fakeDatabase.messages).toHaveLength(0);
+  });
+
+  it("reports the send as DONE (never retryable) but flags reconciliation when the provider returns no identifier", async () => {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    sendEmailMock.mockResolvedValueOnce({ providerId: null, trackingId: null });
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId, subject: "Objet", body: "Corps" });
+
+    // The mail is out. Reporting failure here would make the engine re-send
+    // to a real person; no Conversation is fabricated either.
+    expect(result).toEqual({ ok: true, conversationId: null, reason: "EMAIL_THREAD_RECONCILIATION_FAILED" });
+    expect(fakeDatabase.conversations).toHaveLength(0);
+  });
+});
+
+describe("first-touch reconciliation — send response + mail_sent webhook produce ONE message", () => {
+  async function firstTouchThenWebhook(overrides: Partial<UnipileNewEmailPayload> = {}) {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    await sendFirstTouchEmail({ workspaceId, contactId, subject: "Suite à notre échange", body: "Bonjour Marc," });
+    return ingestEmail(emailPayload({
+      event: "mail_sent",
+      provider_id: "provider-sent-1",
+      email_id: "unipile-email-ft",
+      message_id: "<rfc-ft@mail.example>",
+      subject: "Suite à notre échange",
+      from_attendee: { identifier: "moi@talvia.app" },
+      to_attendees: [{ identifier: "prospect@example.com" }],
+      ...overrides,
+    }));
+  }
+
+  it("re-keys the provisional Conversation onto the real thread and never inserts a second message", async () => {
+    getEmailByMessageIdMock.mockResolvedValue({ thread_id: "real-thread-1" });
+
+    const result = await firstTouchThenWebhook();
+
+    expect(result).toEqual({ status: "duplicate" });
+    expect(fakeDatabase.messages).toHaveLength(1);
+    expect(fakeDatabase.conversations).toHaveLength(1);
+    expect(fakeDatabase.conversations[0]!.external_thread_id).toBe("real-thread-1");
+    const metadata = fakeDatabase.messages[0]!.metadata as Record<string, unknown>;
+    expect(metadata.threadResolution).toBe("provider_thread_id");
+    // Re-keyed onto the canonical Unipile id, which is what a redelivery and
+    // a later historical import both carry.
+    expect(fakeDatabase.messages[0]!.provider_message_id).toBe("unipile-email-ft");
+  });
+
+  it("is idempotent across a webhook redelivery", async () => {
+    getEmailByMessageIdMock.mockResolvedValue({ thread_id: "real-thread-1" });
+    await firstTouchThenWebhook();
+
+    const again = await ingestEmail(emailPayload({
+      event: "mail_sent", provider_id: "provider-sent-1", email_id: "unipile-email-ft",
+      message_id: "<rfc-ft@mail.example>", from_attendee: { identifier: "moi@talvia.app" }, to_attendees: [{ identifier: "prospect@example.com" }],
+    }));
+
+    expect(again).toEqual({ status: "duplicate" });
+    expect(fakeDatabase.messages).toHaveLength(1);
+    expect(fakeDatabase.conversations).toHaveLength(1);
+  });
+
+  it("converges onto the Conversation that owns the canonical thread instead of leaving two", async () => {
+    // A resync paged this thread in before the webhook landed, for a DIFFERENT
+    // contact than the first touch, so the first touch could not adopt it.
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    fakeDatabase.contacts.push({ id: "contact-other", workspace_id: workspaceId, display_name: "Autre" });
+    fakeDatabase.conversations.push({ id: "conv-existing", workspace_id: workspaceId, connection_id: `conn-${accountId}`, contact_id: "contact-other", channel_type: "email", external_thread_id: "real-thread-1", subject: null, last_message_at: null, status: "open" });
+    getEmailByMessageIdMock.mockResolvedValue({ thread_id: "real-thread-1" });
+    await sendFirstTouchEmail({ workspaceId, contactId, subject: "Objet", body: "Corps" });
+
+    await ingestEmail(emailPayload({
+      event: "mail_sent", provider_id: "provider-sent-1", email_id: "unipile-email-ft",
+      message_id: "<rfc-ft@mail.example>", from_attendee: { identifier: "moi@talvia.app" }, to_attendees: [{ identifier: "prospect@example.com" }],
+    }));
+
+    // The message moved into the real thread's Conversation; the emptied
+    // provisional one is archived, not left as a second live thread and not
+    // deleted.
+    expect(fakeDatabase.messages).toHaveLength(1);
+    expect(fakeDatabase.messages[0]!.conversation_id).toBe("conv-existing");
+    const provisional = fakeDatabase.conversations.find((c) => c.id !== "conv-existing")!;
+    expect(provisional.external_thread_id).toBeNull();
+    expect(provisional.status).toBe("archived");
+  });
+
+  it("does not swallow a genuinely unrelated outbound mail sent from outside Talvia", async () => {
+    seedConnectedEmailConnection();
+    seedEmailContact();
+    getEmailByMessageIdMock.mockResolvedValue({ thread_id: "other-thread" });
+
+    const result = await ingestEmail(emailPayload({
+      event: "mail_sent", provider_id: "provider-unrelated", email_id: "unipile-email-other",
+      from_attendee: { identifier: "moi@talvia.app" }, to_attendees: [{ identifier: "someone@example.com" }],
+    }));
+
+    expect(result).toEqual({ status: "ingested" });
+    expect(fakeDatabase.messages).toHaveLength(1);
+  });
+});
+
+// --- Threaded send (the other half of the pair) ---
+// A reply must land in the SAME provider thread and keep the thread's own
+// subject. The recipient comes from Talvia's stored identity, never from
+// anything a caller passed in.
+
+describe("sendEmailForConversation — real email semantics", () => {
+  function seedThread(opts: { subject?: string | null; parentProviderId?: string | null } = {}) {
+    const connectionId = seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: connectionId, contact_id: contactId, channel_type: "email", external_thread_id: "thread-1", subject: opts.subject === undefined ? "Votre devis" : opts.subject, last_message_at: null });
+    if (opts.parentProviderId !== null) {
+      fakeDatabase.messages.push({ id: "msg-parent", workspace_id: workspaceId, conversation_id: "conv-1", direction: "inbound", body: "Bonjour", status: "received", provider_message_id: "unipile-1", date: "2026-02-01T00:00:00.000Z", metadata: { emailProviderId: opts.parentProviderId ?? "parent-provider-1" } });
+    }
+    return contactId;
+  }
+
+  it("threads the reply onto the parent mail and prefixes the subject once", async () => {
+    seedThread();
+
+    await sendEmailForConversation(workspaceId, "conv-1", "Bien reçu.", accountId, "part-1:step-1");
+
+    const call = sendEmailMock.mock.calls[0]![1];
+    expect(call.replyTo).toBe("parent-provider-1");
+    expect(call.subject).toBe("Re: Votre devis");
+    expect(call.to).toEqual([{ identifier: "prospect@example.com", display_name: "Marc Durand" }]);
+    expect(call.idempotencyKey).toBe("part-1:step-1");
+  });
+
+  it("does not stack a second Re: on a subject that already has one", async () => {
+    seedThread({ subject: "Re: Votre devis" });
+
+    await sendEmailForConversation(workspaceId, "conv-1", "Bien reçu.", accountId);
+
+    expect(sendEmailMock.mock.calls[0]![1].subject).toBe("Re: Votre devis");
+  });
+
+  it("sends without a reply_to when the thread has no parent carrying a provider id", async () => {
+    seedThread({ parentProviderId: null });
+
+    await sendEmailForConversation(workspaceId, "conv-1", "Bonjour.", accountId);
+
+    const call = sendEmailMock.mock.calls[0]![1];
+    expect(call.replyTo).toBeUndefined();
+    // No reply_to means no reply — the original subject stands as it is.
+    expect(call.subject).toBe("Votre devis");
+  });
+
+  it("refuses rather than guessing when the Contact has no known address", async () => {
+    const connectionId = seedConnectedEmailConnection();
+    fakeDatabase.contacts.push({ id: "contact-noaddr", workspace_id: workspaceId, display_name: "Sans adresse" });
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: connectionId, contact_id: "contact-noaddr", channel_type: "email", external_thread_id: "thread-1", subject: "Sujet", last_message_at: null });
+
+    await expect(sendEmailForConversation(workspaceId, "conv-1", "Texte", accountId)).rejects.toThrow(/adresse e-mail/i);
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+
+  it("never resolves a conversation belonging to another workspace", async () => {
+    seedThread();
+
+    await expect(sendEmailForConversation("ws-other", "conv-1", "Texte", accountId)).rejects.toThrow();
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+});
+
+// --- Arrival-order safety ---
+// One real outbound email must produce ONE Conversation and ONE message row
+// whatever the order of (send response, mail_sent webhook, historical import).
+// The send response and the webhook carry DIFFERENT ids for the same mail
+// (provider_id vs email_id), so the unique (conversation_id,
+// provider_message_id) index cannot relate them on its own — the cross-path
+// key is metadata.emailProviderId, which all three paths write.
+
+describe("outbound arrival order — one mail, one Conversation, one message", () => {
+  const sentWebhook = (overrides: Partial<UnipileNewEmailPayload> = {}) => emailPayload({
+    event: "mail_sent", provider_id: "provider-sent-1", email_id: "unipile-email-ft",
+    message_id: "<rfc-ft@mail.example>", subject: "Suite à notre échange",
+    from_attendee: { identifier: "moi@talvia.app" }, to_attendees: [{ identifier: "prospect@example.com" }],
+    ...overrides,
+  });
+
+  it("webhook FIRST, then the send response is persisted — the first touch adopts what is there", async () => {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    getEmailByMessageIdMock.mockResolvedValue({ thread_id: "real-thread-1" });
+
+    // The provider fired mail_sent before sendFirstTouchEmail's own
+    // transaction ran — a separate inbound HTTP request racing it.
+    await ingestEmail(sentWebhook());
+    const result = await sendFirstTouchEmail({ workspaceId, contactId, subject: "Suite à notre échange", body: "Bonjour Marc," });
+
+    expect(result.ok).toBe(true);
+    expect(fakeDatabase.conversations).toHaveLength(1);
+    expect(fakeDatabase.messages).toHaveLength(1);
+    expect(fakeDatabase.conversations[0]!.external_thread_id).toBe("real-thread-1");
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.conversationId).toBe(fakeDatabase.conversations[0]!.id);
+  });
+
+  it("send response FIRST, then the webhook — the provisional Conversation gets the real thread", async () => {
+    seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    getEmailByMessageIdMock.mockResolvedValue({ thread_id: "real-thread-1" });
+
+    await sendFirstTouchEmail({ workspaceId, contactId, subject: "Suite à notre échange", body: "Bonjour Marc," });
+    await ingestEmail(sentWebhook());
+
+    expect(fakeDatabase.conversations).toHaveLength(1);
+    expect(fakeDatabase.messages).toHaveLength(1);
+    expect(fakeDatabase.conversations[0]!.external_thread_id).toBe("real-thread-1");
+  });
+
+  it("a first touch adopts the Contact's existing email Conversation rather than opening a second", async () => {
+    const connectionId = seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    // An inbound mail arrived between audience selection and execution.
+    fakeDatabase.conversations.push({ id: "conv-inbound", workspace_id: workspaceId, connection_id: connectionId, contact_id: contactId, channel_type: "email", external_thread_id: "thread-inbound", subject: "Bonjour", last_message_at: null, status: "open" });
+
+    const result = await sendFirstTouchEmail({ workspaceId, contactId, subject: "Objet", body: "Corps" });
+
+    expect(result).toMatchObject({ ok: true, conversationId: "conv-inbound" });
+    expect(fakeDatabase.conversations).toHaveLength(1);
+  });
+
+  it("a THREADED send is reconciled too — this is where a duplicate used to appear", async () => {
+    const connectionId = seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    // Exactly what unipile-adapter.ts's sendMessage leaves behind for an
+    // email reply: a real thread, and a message keyed on the send response's
+    // provider_id — NOT the email_id the webhook will carry.
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: connectionId, contact_id: contactId, channel_type: "email", external_thread_id: "real-thread-1", subject: "Votre devis", last_message_at: null, status: "open" });
+    fakeDatabase.messages.push({ id: "msg-sent", workspace_id: workspaceId, conversation_id: "conv-1", direction: "outbound", body: "Bien reçu.", status: "sent", provider_message_id: "provider-sent-1", date: "2026-03-01T10:00:00.000Z", metadata: { emailProviderId: "provider-sent-1" } });
+    getEmailByMessageIdMock.mockResolvedValue({ thread_id: "real-thread-1" });
+    dispatchCommittedActivityMock.mockClear();
+
+    const result = await ingestEmail(sentWebhook());
+
+    expect(result).toEqual({ status: "duplicate" });
+    expect(fakeDatabase.messages).toHaveLength(1);
+    // Re-keyed onto the canonical id, so a redelivery and a later re-import
+    // both collapse onto this row.
+    expect(fakeDatabase.messages[0]!.provider_message_id).toBe("unipile-email-ft");
+    // And crucially: no second message.sent activity for one real email.
+    expect(fakeDatabase.activities.filter((a) => a.event_type === "message.sent")).toHaveLength(0);
+  });
+});
+
+describe("historical import vs a Talvia send", () => {
+  it("skips a mail Talvia already mirrored under the send response's own id", async () => {
+    const connectionId = seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: connectionId, contact_id: contactId, channel_type: "email", external_thread_id: null, subject: "Objet", last_message_at: null, status: "open" });
+    fakeDatabase.messages.push({ id: "msg-sent", workspace_id: workspaceId, conversation_id: "conv-1", direction: "outbound", body: "Corps", status: "sent", provider_message_id: "provider-sent-1", date: "2026-03-01T10:00:00.000Z", metadata: { emailProviderId: "provider-sent-1", threadResolution: "pending_first_touch" } });
+
+    const result = await persistImportedEmails(workspaceId, connectionId, [{
+      id: "unipile-email-ft", provider_id: "provider-sent-1", thread_id: "real-thread-1",
+      role: "sent", date: "2026-03-01T10:00:00.000Z", subject: "Objet",
+      from_attendee: { identifier: "moi@talvia.app" }, to_attendees: [{ identifier: "prospect@example.com" }],
+      body_plain: "Corps",
+    } as UnipileEmail]);
+
+    // Without this guard the page inserted a SECOND row for one real email:
+    // the import keys on email.id, the send mirrored on provider_id.
+    expect(result.messagesInserted).toBe(0);
+    expect(fakeDatabase.messages).toHaveLength(1);
+  });
+
+  it("still imports a genuinely unrelated sent mail on the same page", async () => {
+    const connectionId = seedConnectedEmailConnection();
+    const contactId = seedEmailContact();
+    fakeDatabase.conversations.push({ id: "conv-1", workspace_id: workspaceId, connection_id: connectionId, contact_id: contactId, channel_type: "email", external_thread_id: null, subject: "Objet", last_message_at: null, status: "open" });
+    fakeDatabase.messages.push({ id: "msg-sent", workspace_id: workspaceId, conversation_id: "conv-1", direction: "outbound", body: "Corps", status: "sent", provider_message_id: "provider-sent-1", date: "2026-03-01T10:00:00.000Z", metadata: { emailProviderId: "provider-sent-1" } });
+
+    const result = await persistImportedEmails(workspaceId, connectionId, [
+      { id: "unipile-email-ft", provider_id: "provider-sent-1", thread_id: "real-thread-1", role: "sent", date: "2026-03-01T10:00:00.000Z", from_attendee: { identifier: "moi@talvia.app" }, to_attendees: [{ identifier: "prospect@example.com" }], body_plain: "Corps" },
+      { id: "unipile-email-other", provider_id: "provider-other", thread_id: "thread-other", role: "sent", date: "2026-03-02T10:00:00.000Z", from_attendee: { identifier: "moi@talvia.app" }, to_attendees: [{ identifier: "autre@example.com" }], body_plain: "Autre" },
+    ] as UnipileEmail[]);
+
+    expect(result.messagesInserted).toBe(1);
   });
 });

@@ -22,15 +22,28 @@ export type CampaignStepType = "invite" | "message" | "wait" | "follow_up" | "en
 export type ParticipantStatus = "waiting" | "active" | "replied" | "completed" | "stopped";
 
 export type CampaignStepInput = { id?: string; position: number; stepType: CampaignStepType; channelType?: CampaignChannel; delayValue?: number; delayUnit?: "minutes" | "hours" | "days"; messageTemplate?: string };
-export type CampaignInput = { name: string; objective: CampaignObjective; channelType: CampaignChannel; description?: string; participantIds?: string[]; steps?: CampaignStepInput[]; stopOnReply?: boolean };
-export type CampaignRecord = { id: string; name: string; objective: CampaignObjective; channelType: CampaignChannel; status: CampaignStatus; description?: string; stopOnReply: boolean; strategy?: CampaignStrategy; startedAt?: string; pausedAt?: string; completedAt?: string; archivedAt?: string; createdAt: string; updatedAt: string; participantCount: number; steps: CampaignStepInput[]; participants: CampaignParticipantRecord[] };
+// emailSubject is the real, user-authored subject line of an email campaign's
+// first touch (a threaded reply keeps its own thread's subject instead). It
+// lives in campaigns.settings — the same jsonb column description/stopOnReply
+// already use — because it is one small 1:1 extra on a campaign, not a new
+// table and not a new column. Nothing invents it: without it, a first touch
+// is blocked with EMAIL_SUBJECT_MISSING rather than sent under a made-up
+// subject.
+export type CampaignInput = { name: string; objective: CampaignObjective; channelType: CampaignChannel; description?: string; participantIds?: string[]; steps?: CampaignStepInput[]; stopOnReply?: boolean; emailSubject?: string };
+export type CampaignRecord = { id: string; name: string; objective: CampaignObjective; channelType: CampaignChannel; status: CampaignStatus; description?: string; stopOnReply: boolean; emailSubject?: string; strategy?: CampaignStrategy; startedAt?: string; pausedAt?: string; completedAt?: string; archivedAt?: string; createdAt: string; updatedAt: string; participantCount: number; steps: CampaignStepInput[]; participants: CampaignParticipantRecord[] };
 export type CampaignParticipantRecord = { id: string; contactId: string; name: string; company?: string; status: ParticipantStatus; currentStepId?: string; startedAt?: string; repliedAt?: string; stoppedAt?: string; stopReason?: string };
 
-type CampaignRow = { id:string; name:string; objective:CampaignObjective; channel_type:CampaignChannel; status:CampaignStatus; settings:{description?:string;stopOnReply?:boolean;strategy?:CampaignStrategy}; started_at:string|null; paused_at:string|null; completed_at:string|null; archived_at:string|null; created_at:string; updated_at:string; participant_count:string };
+type CampaignRow = { id:string; name:string; objective:CampaignObjective; channel_type:CampaignChannel; status:CampaignStatus; settings:{description?:string;stopOnReply?:boolean;strategy?:CampaignStrategy;emailSubject?:string}; started_at:string|null; paused_at:string|null; completed_at:string|null; archived_at:string|null; created_at:string; updated_at:string; participant_count:string };
 type StepRow = { id:string; position:number; step_type:CampaignStepType; channel_type:CampaignChannel|null; delay_value:number; delay_unit:"minutes"|"hours"|"days"; message_template:string|null };
 type ParticipantRow = { id:string; contact_id:string; display_name:string; company:string|null; status:ParticipantStatus; current_step_id:string|null; started_at:string|null; replied_at:string|null; stopped_at:string|null; stop_reason:string|null };
 
 export type WhatsAppRelation = { id:string; name:string; company?:string; conversationId:string; lastMessageAt?:string; lastMessagePreview?:string; lastMessageDirection?:"inbound"|"outbound" };
+// An email-eligible Contact. `hasConversation` is what tells the two real
+// delivery paths apart in the UI: an existing thread means the campaign will
+// reply into it; no thread means the first mail of the relationship (a first
+// touch), which is legitimate on email — unlike WhatsApp, where an existing
+// Conversation is a hard eligibility requirement.
+export type EmailAudienceContact = { id:string; name:string; company?:string; address:string; hasConversation:boolean; lastMessageAt?:string };
 
 function invalid(message:string): never { throw new Error(message); }
 function validateInput(input:CampaignInput) { if (!input.name?.trim()) invalid("Le nom de la campagne est requis."); if (!input.objective || !input.channelType) invalid("L’objectif et le canal sont requis."); }
@@ -64,6 +77,67 @@ async function eligibleWhatsAppContactIds(client:PoolClient, workspaceId:string,
     [workspaceId, contactIds],
   );
   return new Set(result.rows.map((row) => row.id));
+}
+
+// Email eligibility, bulk, same anti-N+1 shape as the WhatsApp one above
+// and for the same reason (createCampaign/addParticipants receive dozens of
+// ids at once). The rule is deliberately DIFFERENT from WhatsApp's: email
+// requires a real, usable address, NOT an existing Conversation — first
+// touch to a known address is a legitimate email capability (see
+// campaign-execution/email-executor.ts). `identifier_normalized<>''` is what
+// keeps a stored-but-unusable identifier out: contacts.ts's normalizeEmail
+// returns an empty string for anything that is not a real address.
+async function eligibleEmailContactIds(client:PoolClient, workspaceId:string, contactIds:string[]): Promise<Set<string>> {
+  if (!contactIds.length) return new Set();
+  const result = await client.query<{id:string}>(
+    `select distinct c.id from contacts c
+     join contact_identities ci on ci.contact_id=c.id and ci.workspace_id=c.workspace_id
+     where c.workspace_id=$1 and c.id = any($2::uuid[]) and c.archived_at is null
+       and ci.channel_type='email' and coalesce(ci.identifier_normalized,'')<>''`,
+    [workspaceId, contactIds],
+  );
+  return new Set(result.rows.map((row) => row.id));
+}
+
+// The email campaign audience. One row per Contact with a genuinely usable
+// email address, whether or not a thread already exists — the server, never
+// the client, decides who is eligible, and the same rule is re-applied at
+// send time (email-executor.ts / unipile-email.ts's resolveFirstTouchTarget)
+// so a Contact that loses its identity between setup and execution is caught
+// there too. Single query with two LATERALs, no N+1: one for the canonical
+// address, one for the canonical email Conversation if any.
+export async function listEligibleEmailContacts(context:WorkspaceContext): Promise<EmailAudienceContact[]> {
+  const result = await database.query<{ contact_id:string; display_name:string; company:string|null; address:string; conversation_id:string|null; last_message_at:string|null }>(
+    `select c.id contact_id, c.display_name, co.name company, ident.identifier address, v.id conversation_id, v.last_message_at
+     from contacts c
+     left join companies co on co.id=c.company_id and co.workspace_id=c.workspace_id
+     join lateral (
+       select ci.identifier
+       from contact_identities ci
+       where ci.workspace_id=c.workspace_id and ci.contact_id=c.id and ci.channel_type='email'
+         and coalesce(ci.identifier_normalized,'')<>''
+       order by ci.created_at asc
+       limit 1
+     ) ident on true
+     left join lateral (
+       select conv.id, conv.last_message_at
+       from conversations conv
+       where conv.workspace_id=c.workspace_id and conv.contact_id=c.id and conv.channel_type='email'
+       order by coalesce(conv.last_message_at,conv.created_at) desc, conv.created_at desc, conv.id desc
+       limit 1
+     ) v on true
+     where c.workspace_id=$1 and c.archived_at is null
+     order by v.last_message_at desc nulls last, c.display_name asc`,
+    [context.workspaceId],
+  );
+  return result.rows.map((row) => ({
+    id: row.contact_id,
+    name: row.display_name,
+    ...(row.company ? { company: row.company } : {}),
+    address: row.address,
+    hasConversation: row.conversation_id !== null,
+    ...(row.last_message_at ? { lastMessageAt: row.last_message_at } : {}),
+  }));
 }
 
 function truncatePreview(body: string | null | undefined, max = 140): string | undefined {
@@ -120,12 +194,12 @@ export async function listEligibleWhatsAppRelations(context:WorkspaceContext): P
 async function getCampaignRow(client:PoolClient, workspaceId:string, campaignId:string) { const r=await client.query<CampaignRow>(`select c.id,c.name,c.objective,c.channel_type,c.status,c.settings,c.started_at,c.paused_at,c.completed_at,c.archived_at,c.created_at,c.updated_at,count(p.id) participant_count from campaigns c left join campaign_participants p on p.campaign_id=c.id where c.workspace_id=$1 and c.id=$2 group by c.id`,[workspaceId,campaignId]); return r.rows[0]??null; }
 async function stepsFor(client:PoolClient,campaignId:string) { const r=await client.query<StepRow>(`select id,position,step_type,channel_type,delay_value,delay_unit,message_template from campaign_steps where campaign_id=$1 order by position asc`,[campaignId]); return r.rows.map(stepFromRow); }
 async function participantsFor(client:PoolClient,workspaceId:string,campaignId:string) { const r=await client.query<ParticipantRow>(`select p.id,p.contact_id,c.display_name,co.name company,p.status,p.current_step_id,p.started_at,p.replied_at,p.stopped_at,p.stop_reason from campaign_participants p join contacts c on c.id=p.contact_id and c.workspace_id=$1 left join companies co on co.id=c.company_id and co.workspace_id=c.workspace_id where p.campaign_id=$2 order by c.display_name`,[workspaceId,campaignId]); return r.rows.map(participantFromRow); }
-async function record(client:PoolClient,workspaceId:string,row:CampaignRow):Promise<CampaignRecord> { return {id:row.id,name:row.name,objective:row.objective,channelType:row.channel_type,status:row.status,description:row.settings?.description,stopOnReply:row.settings?.stopOnReply??true,...(row.settings?.strategy?{strategy:row.settings.strategy}:{}),startedAt:row.started_at??undefined,pausedAt:row.paused_at??undefined,completedAt:row.completed_at??undefined,archivedAt:row.archived_at??undefined,createdAt:row.created_at,updatedAt:row.updated_at,participantCount:Number(row.participant_count),steps:await stepsFor(client,row.id),participants:await participantsFor(client,workspaceId,row.id)}; }
+async function record(client:PoolClient,workspaceId:string,row:CampaignRow):Promise<CampaignRecord> { return {id:row.id,name:row.name,objective:row.objective,channelType:row.channel_type,status:row.status,description:row.settings?.description,stopOnReply:row.settings?.stopOnReply??true,...(row.settings?.emailSubject?{emailSubject:row.settings.emailSubject}:{}),...(row.settings?.strategy?{strategy:row.settings.strategy}:{}),startedAt:row.started_at??undefined,pausedAt:row.paused_at??undefined,completedAt:row.completed_at??undefined,archivedAt:row.archived_at??undefined,createdAt:row.created_at,updatedAt:row.updated_at,participantCount:Number(row.participant_count),steps:await stepsFor(client,row.id),participants:await participantsFor(client,workspaceId,row.id)}; }
 
 export async function listCampaigns(context:WorkspaceContext) { const client=await database.connect(); try { const r=await client.query<CampaignRow>(`select c.id,c.name,c.objective,c.channel_type,c.status,c.settings,c.started_at,c.paused_at,c.completed_at,c.archived_at,c.created_at,c.updated_at,count(p.id) participant_count from campaigns c left join campaign_participants p on p.campaign_id=c.id where c.workspace_id=$1 and c.status<>'archived' group by c.id order by c.updated_at desc`,[context.workspaceId]); return Promise.all(r.rows.map(row=>record(client,context.workspaceId,row))); } finally { client.release(); } }
 export async function getCampaign(context:WorkspaceContext,campaignId:string) { const client=await database.connect(); try { const row=await getCampaignRow(client,context.workspaceId,campaignId); return row?record(client,context.workspaceId,row):null; } finally { client.release(); } }
-export async function createCampaign(context:WorkspaceContext,input:CampaignInput) { validateInput(input); const steps=input.steps??[]; validateSteps(steps); const participantIds=[...new Set(input.participantIds??[])]; const client=await database.connect(); try { await client.query("begin"); const eligibleWhatsAppIds = input.channelType==='whatsapp' ? await eligibleWhatsAppContactIds(client,context.workspaceId,participantIds) : null; for(const contactId of participantIds) { if(eligibleWhatsAppIds){ if(!eligibleWhatsAppIds.has(contactId)) invalid("Ce contact n’a pas encore de conversation WhatsApp éligible dans Talvia."); } else if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,input.channelType)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal."); } const created=await client.query<{id:string}>(`insert into campaigns(workspace_id,name,objective,channel_type,status,created_by_user_id,settings) values($1,$2,$3,$4,'draft',$5,$6) returning id`,[context.workspaceId,input.name.trim(),input.objective,input.channelType,context.userId,{description:input.description?.trim()||undefined,stopOnReply:input.stopOnReply??true}]); const id=created.rows[0]!.id; for(const step of steps) await client.query(`insert into campaign_steps(campaign_id,position,step_type,channel_type,delay_value,delay_unit,message_template) values($1,$2,$3,$4,$5,$6,$7)`,[id,step.position,step.stepType,step.channelType??input.channelType,step.delayValue??0,step.delayUnit??"days",step.messageTemplate?.trim()||null]); for(const contactId of participantIds) await client.query(`insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,'waiting')`,[id,contactId]); const event=await activity(client,context,id,"campaign.created"); const row=await getCampaignRow(client,context.workspaceId,id); const value=await record(client,context.workspaceId,row!); await client.query("commit"); await dispatchCommittedActivity(event); return value; } catch(error) { await client.query("rollback"); throw error; } finally { client.release(); } }
-export async function updateCampaign(context:WorkspaceContext,id:string,input:Partial<CampaignInput>) { const client=await database.connect(); try { const existing=await getCampaignRow(client,context.workspaceId,id); if(!existing)return null; if(existing.status!=="draft" && (input.participantIds||input.steps)) invalid("La séquence et l’audience ne peuvent plus être modifiées après activation."); const name=input.name?.trim()||existing.name; const objective=input.objective??existing.objective; const channel=input.channelType??existing.channel_type; await client.query(`update campaigns set name=$1,objective=$2,channel_type=$3,settings=$4,updated_at=now() where workspace_id=$5 and id=$6`,[name,objective,channel,{...existing.settings,description:input.description?.trim()||existing.settings?.description,stopOnReply:input.stopOnReply??existing.settings?.stopOnReply??true},context.workspaceId,id]); await activity(client,context,id,"campaign.updated"); return record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,id))!); } finally { client.release(); } }
+export async function createCampaign(context:WorkspaceContext,input:CampaignInput) { validateInput(input); const steps=input.steps??[]; validateSteps(steps); const participantIds=[...new Set(input.participantIds??[])]; const client=await database.connect(); try { await client.query("begin"); const bulkEligible = input.channelType==='whatsapp' ? await eligibleWhatsAppContactIds(client,context.workspaceId,participantIds) : input.channelType==='email' ? await eligibleEmailContactIds(client,context.workspaceId,participantIds) : null; for(const contactId of participantIds) { if(bulkEligible){ if(!bulkEligible.has(contactId)) invalid(input.channelType==='whatsapp'?"Ce contact n’a pas encore de conversation WhatsApp éligible dans Talvia.":"Ce contact n’a pas d’adresse e-mail exploitable dans Talvia."); } else if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,input.channelType)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal."); } const created=await client.query<{id:string}>(`insert into campaigns(workspace_id,name,objective,channel_type,status,created_by_user_id,settings) values($1,$2,$3,$4,'draft',$5,$6) returning id`,[context.workspaceId,input.name.trim(),input.objective,input.channelType,context.userId,{description:input.description?.trim()||undefined,stopOnReply:input.stopOnReply??true,...(input.emailSubject?.trim()?{emailSubject:input.emailSubject.trim()}:{})}]); const id=created.rows[0]!.id; for(const step of steps) await client.query(`insert into campaign_steps(campaign_id,position,step_type,channel_type,delay_value,delay_unit,message_template) values($1,$2,$3,$4,$5,$6,$7)`,[id,step.position,step.stepType,step.channelType??input.channelType,step.delayValue??0,step.delayUnit??"days",step.messageTemplate?.trim()||null]); for(const contactId of participantIds) await client.query(`insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,'waiting')`,[id,contactId]); const event=await activity(client,context,id,"campaign.created"); const row=await getCampaignRow(client,context.workspaceId,id); const value=await record(client,context.workspaceId,row!); await client.query("commit"); await dispatchCommittedActivity(event); return value; } catch(error) { await client.query("rollback"); throw error; } finally { client.release(); } }
+export async function updateCampaign(context:WorkspaceContext,id:string,input:Partial<CampaignInput>) { const client=await database.connect(); try { const existing=await getCampaignRow(client,context.workspaceId,id); if(!existing)return null; if(existing.status!=="draft" && (input.participantIds||input.steps)) invalid("La séquence et l’audience ne peuvent plus être modifiées après activation."); const name=input.name?.trim()||existing.name; const objective=input.objective??existing.objective; const channel=input.channelType??existing.channel_type; await client.query(`update campaigns set name=$1,objective=$2,channel_type=$3,settings=$4,updated_at=now() where workspace_id=$5 and id=$6`,[name,objective,channel,{...existing.settings,description:input.description?.trim()||existing.settings?.description,stopOnReply:input.stopOnReply??existing.settings?.stopOnReply??true,...(input.emailSubject?.trim()?{emailSubject:input.emailSubject.trim()}:{})},context.workspaceId,id]); await activity(client,context,id,"campaign.updated"); return record(client,context.workspaceId,(await getCampaignRow(client,context.workspaceId,id))!); } finally { client.release(); } }
 // Wrapped in an explicit transaction (this function previously had none —
 // each client.query call auto-committed on its own) precisely because
 // activation must never be observable as "participants already active" while
@@ -154,7 +228,18 @@ export async function transitionCampaign(context:WorkspaceContext,id:string,acti
       // elsewhere — a participant genuinely mid-sequence (e.g. re-activated
       // after a pause, current_step_id already pointing somewhere real) is
       // structurally excluded here, not just by convention.
-      const activated=await client.query<{id:string}>(`update campaign_participants set status='active',started_at=coalesce(started_at,now()),updated_at=now() where campaign_id=$1 and status='waiting' and current_step_id is null returning id`,[id]);
+      // Two disjoint cases, both meaning "this participant has not started
+      // the sequence yet": current_step_id still NULL (the normal case), or
+      // current_step_id pointing at the campaign's very FIRST step, which is
+      // what a participant approved while the campaign was still a draft
+      // looks like on rows written before prospecting.ts stopped stamping it
+      // (those rows would otherwise stay 'waiting' forever, unclaimable and
+      // silent). A participant genuinely mid-sequence sits on a later step
+      // and is still structurally excluded. Re-initializing a first-step
+      // participant is a no-op in effect — initializeParticipantStep
+      // resolves the first step again — and additionally stamps
+      // last_action_at, which a WAIT-first sequence needs to ever become due.
+      const activated=await client.query<{id:string}>(`update campaign_participants set status='active',started_at=coalesce(started_at,now()),updated_at=now() where campaign_id=$1 and status='waiting' and (current_step_id is null or current_step_id=(select id from campaign_steps where campaign_id=$1 order by position limit 1)) returning id`,[id]);
       for(const row of activated.rows) await initializeParticipantStep(context.workspaceId,id,row.id,client);
     }
     await activity(client,context,id,`campaign.${action==='activate'?'started':action==='resume'?'resumed':action==='pause'?'paused':action==='complete'?'completed':'archived'}`);
@@ -180,9 +265,9 @@ export async function addParticipants(context:WorkspaceContext,campaignId:string
     const campaign=await getCampaignRow(client,context.workspaceId,campaignId);
     if(!campaign){await client.query("rollback");return null;}
     const uniqueContactIds=[...new Set(contactIds)];
-    const eligibleWhatsAppIds = campaign.channel_type==='whatsapp' ? await eligibleWhatsAppContactIds(client,context.workspaceId,uniqueContactIds) : null;
+    const bulkEligible = campaign.channel_type==='whatsapp' ? await eligibleWhatsAppContactIds(client,context.workspaceId,uniqueContactIds) : campaign.channel_type==='email' ? await eligibleEmailContactIds(client,context.workspaceId,uniqueContactIds) : null;
     for(const contactId of uniqueContactIds) {
-      if(eligibleWhatsAppIds){ if(!eligibleWhatsAppIds.has(contactId)) invalid("Ce contact n’a pas encore de conversation WhatsApp éligible dans Talvia."); } else if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,campaign.channel_type)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal.");
+      if(bulkEligible){ if(!bulkEligible.has(contactId)) invalid(campaign.channel_type==='whatsapp'?"Ce contact n’a pas encore de conversation WhatsApp éligible dans Talvia.":"Ce contact n’a pas d’adresse e-mail exploitable dans Talvia."); } else if(!await hasCompatibleIdentity(client,context.workspaceId,contactId,campaign.channel_type)) invalid("Un contact est introuvable, archivé ou incompatible avec ce canal.");
       const inserted=await client.query<{id:string}>(`insert into campaign_participants(campaign_id,contact_id,status) values($1,$2,$3) on conflict(campaign_id,contact_id) do nothing returning id`,[campaignId,contactId,campaign.status==='active'?'active':'waiting']);
       if(inserted.rows[0] && campaign.status==='active') await initializeParticipantStep(context.workspaceId,campaignId,inserted.rows[0].id,client);
     }

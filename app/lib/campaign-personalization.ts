@@ -1,12 +1,12 @@
 import { database } from "./database";
 import { getAIProvider } from "./ai";
-import { getCampaignStrategy, type CampaignObjective } from "./campaigns";
+import { getCampaignStrategy, type CampaignChannel, type CampaignObjective } from "./campaigns";
 import type { CampaignStrategy } from "./campaign-strategy";
 import { getActiveBusinessContext, type BusinessContextRecord } from "./business-context/business-context-service";
 import type { CandidateQualification } from "./prospecting";
 import type { ReasonCode } from "./campaign-execution/reason-codes";
 import type { WorkspaceContext } from "./workspace-context";
-import { buildWhatsAppConversationContext } from "./campaign-execution/conversation-context";
+import { buildChannelConversationContext } from "./campaign-execution/conversation-context";
 
 // Phase 3: Qualified Candidate -> Evidence -> Outreach Angle -> Generated
 // text -> Human review -> Approved text -> Executor sends EXACTLY that.
@@ -420,10 +420,13 @@ async function generatePersonalization(
   strategy: CampaignStrategy | null,
   candidate: CandidateFacts,
   guidance?: string,
-): Promise<{ evidence: PersonalizationEvidence; outreachAngle: OutreachAngle; invitationNote: string; message: string; aiModel: string | null }> {
+): Promise<{ evidence: PersonalizationEvidence; outreachAngle: OutreachAngle; invitationNote: string; message: string; invitationMode: GenerationMode; messageMode: GenerationMode; aiModel: string | null }> {
   const evidence = buildPersonalizationEvidence(candidate, strategy);
   const provider = getAIProvider();
-  if (!provider) return { evidence, ...deterministicFallback(candidate, businessContext, strategy, evidence), aiModel: null };
+  // No provider configured is not a hidden condition: the texts below are
+  // the deterministic ones, and they are labelled as such all the way to the
+  // UI (generationMode) instead of being passed off as AI output.
+  if (!provider) return { evidence, ...deterministicFallback(candidate, businessContext, strategy, evidence), invitationMode: "deterministic_fallback", messageMode: "deterministic_fallback", aiModel: null };
 
   try {
     const result = await provider.generateStructured<{ outreachAngle: OutreachAngle; invitation: { text: string; usedFactTypes: string[] }; message: { text: string; usedFactTypes: string[] } }>({
@@ -445,10 +448,16 @@ async function generatePersonalization(
       outreachAngle: result.data.outreachAngle,
       invitationNote: (invitationGrounded ? result.data.invitation.text : fallback.invitationNote).slice(0, 300),
       message: messageGrounded ? result.data.message.text : fallback.message,
-      aiModel: result.model,
+      invitationMode: invitationGrounded ? "ai_grounded" : "deterministic_fallback",
+      messageMode: messageGrounded ? "ai_grounded" : "deterministic_fallback",
+      // Reported only when at least one text the caller actually receives
+      // came from the model. A generation that was produced and then
+      // REJECTED by grounding validation must not leave a model name behind
+      // as if it had authored the deterministic text that replaced it.
+      aiModel: invitationGrounded || messageGrounded ? result.model : null,
     };
   } catch {
-    return { evidence, ...deterministicFallback(candidate, businessContext, strategy, evidence), aiModel: null };
+    return { evidence, ...deterministicFallback(candidate, businessContext, strategy, evidence), invitationMode: "deterministic_fallback", messageMode: "deterministic_fallback", aiModel: null };
   }
 }
 
@@ -531,7 +540,7 @@ export async function generateParticipantPersonalization(context: WorkspaceConte
   const now = new Date().toISOString();
 
   let messages = existing.messages;
-  if (firstStep) messages = mergeMessageArtifact(messages, firstStep.id, generated.message);
+  if (firstStep) messages = mergeMessageArtifact(messages, firstStep.id, generated.message, generated.messageMode);
   const bestText = (stepId: string): string | null => {
     const artifact = messages.find((entry) => entry.stepId === stepId);
     return artifact?.approvedText ?? artifact?.editedText ?? artifact?.generatedText ?? null;
@@ -548,7 +557,7 @@ export async function generateParticipantPersonalization(context: WorkspaceConte
     const current = messages.find((entry) => entry.stepId === step.id);
     if (current?.status !== "approved") {
       const followUp = await generateFollowUpArtifact(businessContext, candidate, generated.evidence, generated.outreachAngle, previousStepText, step.message_template ?? undefined);
-      messages = mergeMessageArtifact(messages, step.id, followUp.text);
+      messages = mergeMessageArtifact(messages, step.id, followUp.text, followUp.aiModel ? "ai_grounded" : "deterministic_fallback");
     }
     previousStepText = bestText(step.id) ?? previousStepText;
   }
@@ -633,6 +642,37 @@ type WhatsAppSegment = { kind: WhatsAppSegmentKind; text: string; supportedByEvi
 type WhatsAppGenerationOutput = { segments: WhatsAppSegment[]; uncertain: boolean };
 
 const MAX_WHATSAPP_TEXT_LENGTH = 320;
+// An email is correspondence, not a chat bubble: the same grounding rules
+// apply verbatim, only the room to say it differs. Still a hard reject, never
+// a truncation.
+const MAX_EMAIL_TEXT_LENGTH = 1200;
+
+// What differs between two channels that both ground on a real message
+// history — and nothing else. Every validation rule, the segment schema, the
+// evidence construction and the fallback are shared: a second copy of them
+// per channel is exactly the duplication that lets two channels' safety
+// rules drift apart.
+type ConversationChannelPolicy = {
+  channel: CampaignChannel;
+  // Used in the prompt only, so the model writes in the right register.
+  label: string;
+  maxTextLength: number;
+  system: string;
+};
+
+const WHATSAPP_POLICY: ConversationChannelPolicy = {
+  channel: "whatsapp",
+  label: "WhatsApp",
+  maxTextLength: MAX_WHATSAPP_TEXT_LENGTH,
+  system: "Tu écris des relances WhatsApp humaines et courtes, découpées en segments \"generic\" ou \"factual\", fondées STRICTEMENT sur les messages réellement échangés (CONVERSATION EVIDENCE) pour tout segment factual. Le Contact et le Business Context ne sont que des informations d'identité, jamais des preuves sur l'état ou l'intention du prospect. Réponds en français.",
+};
+
+const EMAIL_POLICY: ConversationChannelPolicy = {
+  channel: "email",
+  label: "e-mail",
+  maxTextLength: MAX_EMAIL_TEXT_LENGTH,
+  system: "Tu écris des e-mails commerciaux de suivi, humains et concis, découpés en segments \"generic\" ou \"factual\", fondés STRICTEMENT sur les messages réellement échangés (CONVERSATION EVIDENCE) pour tout segment factual. Le Contact et le Business Context ne sont que des informations d'identité, jamais des preuves sur l'état ou l'intention du prospect. N'écris ni objet ni signature — uniquement le corps du message. Réponds en français.",
+};
 
 const WHATSAPP_SEGMENT_SCHEMA = {
   type: "object",
@@ -767,14 +807,14 @@ function isAcceptableSegment(segment: WhatsAppSegment, evidence: WhatsAppEvidenc
 // checked first and unconditionally: true always forces fallback regardless
 // of what follows, and false never skips the checks below — the model is
 // never its own final judge either way.
-function isAcceptableWhatsAppGeneration(output: WhatsAppGenerationOutput, evidence: WhatsAppEvidence[]): { ok: true; text: string } | { ok: false } {
+function isAcceptableWhatsAppGeneration(output: WhatsAppGenerationOutput, evidence: WhatsAppEvidence[], maxTextLength: number = MAX_WHATSAPP_TEXT_LENGTH): { ok: true; text: string } | { ok: false } {
   if (output.uncertain) return { ok: false };
   if (!output.segments.length) return { ok: false };
   const evidenceById = new Map(evidence.map((item) => [item.evidenceId, item]));
   if (!output.segments.every((segment) => isAcceptableSegment(segment, evidence, evidenceById))) return { ok: false };
   const text = output.segments.map((segment) => segment.text.trim()).filter(Boolean).join(" ");
   if (!text) return { ok: false };
-  if (text.length > MAX_WHATSAPP_TEXT_LENGTH) return { ok: false }; // rejected outright — never truncated (docs C2 correction §2)
+  if (text.length > maxTextLength) return { ok: false }; // rejected outright — never truncated (docs C2 correction §2)
   return { ok: true, text };
 }
 
@@ -794,14 +834,14 @@ function buildWhatsAppObjectivePolicy(objective: CampaignObjective, daysSinceLas
   return `Suivi (follow_up) : continuité directe de la conversation. N'affirme JAMAIS qu'une action précise (devis, rendez-vous, décision, engagement) est en attente ou promise, sauf si un message du prospect (CONVERSATION EVIDENCE, direction "reçu du prospect") le prouve explicitement.`;
 }
 
-function buildWhatsAppPrompt(evidence: WhatsAppEvidence[], contact: WhatsAppContactFacts, businessContext: BusinessContextRecord | null, objective: CampaignObjective, daysSinceLastMessage: number | null, guidance?: string): string {
+function buildWhatsAppPrompt(evidence: WhatsAppEvidence[], contact: WhatsAppContactFacts, businessContext: BusinessContextRecord | null, objective: CampaignObjective, daysSinceLastMessage: number | null, guidance?: string, policy: ConversationChannelPolicy = WHATSAPP_POLICY): string {
   return [
     `=== CONVERSATION EVIDENCE (seule source de vérité sur ce que le prospect a dit ou fait — chaque ligne porte son identifiant [eN]) ===\n${buildWhatsAppEvidenceBlock(evidence)}`,
     `=== CONTACT FACTS (identité connue — permet une salutation ou une référence à l'entreprise, ne prouve AUCUNE intention ni situation commerciale) ===\nPrénom : ${contact.firstName || contact.name}${contact.company ? `\nEntreprise : ${contact.company}` : ""}`,
     `=== BUSINESS FACTS (décrit VOTRE entreprise, l'expéditeur — ne prouve RIEN sur le prospect) ===\n${businessContext?.companyName ?? "inconnue"}${businessContext?.businessDescription ? ` — ${businessContext.businessDescription}` : ""}`,
     `=== CAMPAIGN OBJECTIVE / TONE POLICY (politique de ton uniquement — n'est JAMAIS une preuve) ===\n${buildWhatsAppObjectivePolicy(objective, daysSinceLastMessage)}`,
     guidance ? `Consigne du fondateur pour ce message : ${guidance}` : null,
-    `INSTRUCTIONS :\nRédige une relance WhatsApp courte et humaine, découpée en une liste ORDONNÉE de \`segments\` qui, mis bout à bout dans l'ordre, forment le message final — n'écris aucun texte en dehors de ces segments.\n\nChaque segment est soit :\n- "generic" : formulation relationnelle qui n'affirme RIEN de spécifique sur ce prospect ou cette conversation — salutation ("Bonjour Marc"), politesse ("j'espère que vous allez bien"), relance conversationnelle ("je me permets de revenir vers vous"), question ouverte générique ("est-ce toujours d'actualité ?"). Un segment "generic" ne cite AUCUN identifiant dans \`supportedByEvidenceIds\` (tableau vide) — s'il en cite un, ce n'est pas générique.\n- "factual" : affirmation NOUVELLE portant sur le prospect ou la conversation (intérêt, besoin, situation, engagement, objection, action attendue). \`supportedByEvidenceIds\` DOIT alors citer UNIQUEMENT les identifiants [eN] de CONVERSATION EVIDENCE qui la justifient réellement — jamais un identifiant inventé.\n\nUne information tirée de CONTACT FACTS ou BUSINESS FACTS (prénom, entreprise, ce que vous proposez) reste "generic" : ce n'est pas une preuve sur le prospect, juste une identité déjà connue.\n\nNe classe JAMAIS un segment "generic" s'il affirme réellement quelque chose de spécifique sur ce prospect — un tel segment sera rejeté, et le rejet d'un seul segment invalide tout le message. S'il n'y a aucune affirmation à faire, un seul segment "generic" (question ouverte ou relance conversationnelle) est le cas normal et attendu.\n\nLe message final (tous les segments concaténés) doit faire ${MAX_WHATSAPP_TEXT_LENGTH} caractères maximum — sois concis dès la rédaction, un message trop long sera rejeté entièrement, jamais coupé.\n\nIndique \`uncertain: true\` si le contexte disponible est trop pauvre pour une relance vraiment pertinente — dans ce cas garde un contenu simple plutôt que de forcer une personnalisation qui dépasserait ce que tu sais réellement. Réponds en français.`,
+    `INSTRUCTIONS :\nRédige une relance ${policy.label} courte et humaine, découpée en une liste ORDONNÉE de \`segments\` qui, mis bout à bout dans l'ordre, forment le message final — n'écris aucun texte en dehors de ces segments.\n\nChaque segment est soit :\n- "generic" : formulation relationnelle qui n'affirme RIEN de spécifique sur ce prospect ou cette conversation — salutation ("Bonjour Marc"), politesse ("j'espère que vous allez bien"), relance conversationnelle ("je me permets de revenir vers vous"), question ouverte générique ("est-ce toujours d'actualité ?"). Un segment "generic" ne cite AUCUN identifiant dans \`supportedByEvidenceIds\` (tableau vide) — s'il en cite un, ce n'est pas générique.\n- "factual" : affirmation NOUVELLE portant sur le prospect ou la conversation (intérêt, besoin, situation, engagement, objection, action attendue). \`supportedByEvidenceIds\` DOIT alors citer UNIQUEMENT les identifiants [eN] de CONVERSATION EVIDENCE qui la justifient réellement — jamais un identifiant inventé.\n\nUne information tirée de CONTACT FACTS ou BUSINESS FACTS (prénom, entreprise, ce que vous proposez) reste "generic" : ce n'est pas une preuve sur le prospect, juste une identité déjà connue.\n\nNe classe JAMAIS un segment "generic" s'il affirme réellement quelque chose de spécifique sur ce prospect — un tel segment sera rejeté, et le rejet d'un seul segment invalide tout le message. S'il n'y a aucune affirmation à faire, un seul segment "generic" (question ouverte ou relance conversationnelle) est le cas normal et attendu.\n\nLe message final (tous les segments concaténés) doit faire ${policy.maxTextLength} caractères maximum — sois concis dès la rédaction, un message trop long sera rejeté entièrement, jamais coupé.\n\nIndique \`uncertain: true\` si le contexte disponible est trop pauvre pour une relance vraiment pertinente — dans ce cas garde un contenu simple plutôt que de forcer une personnalisation qui dépasserait ce que tu sais réellement. Réponds en français.`,
   ].filter(Boolean).join("\n\n");
 }
 
@@ -819,19 +859,20 @@ async function generateGroundedWhatsAppMessage(
   daysSinceLastMessage: number | null,
   fallbackText: string,
   guidance?: string,
+  policy: ConversationChannelPolicy = WHATSAPP_POLICY,
 ): Promise<{ text: string; generationMode: GenerationMode; aiModel: string | null }> {
   const provider = getAIProvider();
   if (!provider) return { text: fallbackText, generationMode: "deterministic_fallback", aiModel: null };
 
   try {
     const result = await provider.generateStructured<WhatsAppGenerationOutput>({
-      system: "Tu écris des relances WhatsApp humaines et courtes, découpées en segments \"generic\" ou \"factual\", fondées STRICTEMENT sur les messages réellement échangés (CONVERSATION EVIDENCE) pour tout segment factual. Le Contact et le Business Context ne sont que des informations d'identité, jamais des preuves sur l'état ou l'intention du prospect. Réponds en français.",
-      prompt: buildWhatsAppPrompt(evidence, contact, businessContext, objective, daysSinceLastMessage, guidance),
-      schemaName: "WhatsAppPersonalization",
+      system: policy.system,
+      prompt: buildWhatsAppPrompt(evidence, contact, businessContext, objective, daysSinceLastMessage, guidance, policy),
+      schemaName: "ConversationPersonalization",
       schema: WHATSAPP_ARTIFACT_SCHEMA,
-      maxTokens: 400,
+      maxTokens: policy.maxTextLength > MAX_WHATSAPP_TEXT_LENGTH ? 1200 : 400,
     });
-    const verdict = isAcceptableWhatsAppGeneration(result.data, evidence);
+    const verdict = isAcceptableWhatsAppGeneration(result.data, evidence, policy.maxTextLength);
     if (!verdict.ok) return { text: fallbackText, generationMode: "deterministic_fallback", aiModel: null };
     return { text: verdict.text, generationMode: "ai_grounded", aiModel: result.model };
   } catch {
@@ -839,7 +880,7 @@ async function generateGroundedWhatsAppMessage(
   }
 }
 
-export async function generateWhatsAppParticipantPersonalization(context: WorkspaceContext, campaignId: string, participantId: string): Promise<GenerateOutcome> {
+export async function generateConversationParticipantPersonalization(context: WorkspaceContext, campaignId: string, participantId: string, policy: ConversationChannelPolicy): Promise<GenerateOutcome> {
   const participantRow = await database.query<{ contact_id: string }>(
     `select p.contact_id from campaign_participants p join campaigns c on c.id=p.campaign_id where c.workspace_id=$1 and c.id=$2 and p.id=$3`,
     [context.workspaceId, campaignId, participantId],
@@ -876,7 +917,7 @@ export async function generateWhatsAppParticipantPersonalization(context: Worksp
   // and canonical Conversation resolution already guaranteed there. Null
   // (no eligible Conversation) degrades to an empty evidence set below,
   // never an error.
-  const conversationContext = await buildWhatsAppConversationContext(context.workspaceId, participant.contact_id);
+  const conversationContext = await buildChannelConversationContext(context.workspaceId, participant.contact_id, policy.channel);
   const evidence = conversationContext ? buildWhatsAppEvidence(conversationContext.recentMessages) : [];
   const daysSinceLastMessage = conversationContext?.daysSinceLastMessage ?? null;
   // No AI call at all when there's no inbound message to ground on (docs C2
@@ -889,7 +930,7 @@ export async function generateWhatsAppParticipantPersonalization(context: Worksp
 
   const observedFacts: ObservedFact[] = [{ type: "name", value: contact.name, source: "contact" }];
   if (contact.company) observedFacts.push({ type: "company", value: contact.company, source: "contact" });
-  for (const item of evidence) observedFacts.push({ type: item.direction === "inbound" ? "conversation_inbound" : "conversation_outbound", value: item.text, source: "whatsapp_conversation" });
+  for (const item of evidence) observedFacts.push({ type: item.direction === "inbound" ? "conversation_inbound" : "conversation_outbound", value: item.text, source: `${policy.channel}_conversation` });
 
   const existing = (await getParticipantPersonalization(context, campaignId, participantId)) ?? emptyPersonalization();
   let messages = existing.messages;
@@ -901,7 +942,7 @@ export async function generateWhatsAppParticipantPersonalization(context: Worksp
       ? substituteContactPlaceholders(step.message_template, contact).slice(0, 1000)
       : deterministicWhatsAppMessage(contact);
     const generated = hasInboundEvidence
-      ? await generateGroundedWhatsAppMessage(evidence, contact, businessContext, objective, daysSinceLastMessage, fallbackText, step.message_template ?? undefined)
+      ? await generateGroundedWhatsAppMessage(evidence, contact, businessContext, objective, daysSinceLastMessage, fallbackText, step.message_template ?? undefined, policy)
       : { text: fallbackText, generationMode: "deterministic_fallback" as const, aiModel: null };
     if (generated.generationMode === "ai_grounded") lastAiModel = generated.aiModel;
     messages = mergeMessageArtifact(messages, step.id, generated.text, generated.generationMode);
@@ -920,6 +961,24 @@ export async function generateWhatsAppParticipantPersonalization(context: Worksp
   return { ok: true, personalization: next };
 }
 
+// The two channels whose evidence is a real message history. Identical
+// pipeline, identical validation, identical fallback discipline — only the
+// register and the length budget differ (see ConversationChannelPolicy).
+export async function generateWhatsAppParticipantPersonalization(context: WorkspaceContext, campaignId: string, participantId: string): Promise<GenerateOutcome> {
+  return generateConversationParticipantPersonalization(context, campaignId, participantId, WHATSAPP_POLICY);
+}
+
+// Email participants are existing Contacts with a known address, exactly
+// like WhatsApp participants — never rows in campaign_prospect_candidates
+// (LinkedIn-search-specific). A first-touch participant simply has no
+// conversation yet, so evidence is empty and the deterministic fallback (the
+// step's own template, with the Contact's real fields substituted) is what
+// gets proposed for human approval — never an AI claim about someone Talvia
+// has never exchanged a word with.
+export async function generateEmailParticipantPersonalization(context: WorkspaceContext, campaignId: string, participantId: string): Promise<GenerateOutcome> {
+  return generateConversationParticipantPersonalization(context, campaignId, participantId, EMAIL_POLICY);
+}
+
 const GENERATION_CONCURRENCY = 3;
 
 // Controlled concurrency, not a sequential cascade, not a distributed job
@@ -927,11 +986,31 @@ const GENERATION_CONCURRENCY = 3;
 // participants still need a first proposal (or an explicit re-generation
 // list).
 export async function generatePersonalizationForCampaign(context: WorkspaceContext, campaignId: string, participantIds?: string[]): Promise<{ generated: number; failed: number }> {
+  // Dispatched by the campaign's OWN channel, exactly like the per-participant
+  // route — this used to call the LinkedIn generator unconditionally, which
+  // meant batch generation could only ever succeed for LinkedIn.
+  const campaignRow = await database.query<{ channel_type: CampaignChannel }>(
+    `select channel_type from campaigns where workspace_id=$1 and id=$2`,
+    [context.workspaceId, campaignId],
+  );
+  const channelType = campaignRow.rows[0]?.channel_type;
+  const generateOne = channelType === "whatsapp"
+    ? generateWhatsAppParticipantPersonalization
+    : channelType === "email"
+      ? generateEmailParticipantPersonalization
+      : generateParticipantPersonalization;
+
   const targets = participantIds?.length
     ? participantIds
     : (await database.query<{ id: string }>(
-        `select p.id from campaign_participants p join campaigns c on c.id=p.campaign_id
-         where c.workspace_id=$1 and c.id=$2 and (p.personalization is null or p.personalization->'invitation'->>'status'='not_generated')`,
+        // "still needs a first proposal" differs by channel: LinkedIn has an
+        // invitation artifact, the conversation channels do not — for them a
+        // participant is pending exactly while `personalization` is null.
+        channelType === "linkedin"
+          ? `select p.id from campaign_participants p join campaigns c on c.id=p.campaign_id
+             where c.workspace_id=$1 and c.id=$2 and (p.personalization is null or p.personalization->'invitation'->>'status'='not_generated')`
+          : `select p.id from campaign_participants p join campaigns c on c.id=p.campaign_id
+             where c.workspace_id=$1 and c.id=$2 and p.personalization is null`,
         [context.workspaceId, campaignId],
       )).rows.map((row) => row.id);
 
@@ -939,7 +1018,7 @@ export async function generatePersonalizationForCampaign(context: WorkspaceConte
   let failed = 0;
   for (let index = 0; index < targets.length; index += GENERATION_CONCURRENCY) {
     const chunk = targets.slice(index, index + GENERATION_CONCURRENCY);
-    const results = await Promise.all(chunk.map((participantId) => generateParticipantPersonalization(context, campaignId, participantId)));
+    const results = await Promise.all(chunk.map((participantId) => generateOne(context, campaignId, participantId)));
     for (const result of results) { if (result.ok) generated += 1; else failed += 1; }
   }
   return { generated, failed };
