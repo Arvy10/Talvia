@@ -183,3 +183,121 @@ describe("InboxClient — media and links", () => {
     expect(within(link.parentElement!).getByText(/à bientôt/)).toBeInTheDocument();
   });
 });
+
+// UX pass: profile on demand, a real way out of a conversation, per-Inbox
+// appearance, and mark-as-read wired to the persisted read model.
+describe("InboxClient — conversation and profile controls", () => {
+  it("does not open the contact panel by default", () => {
+    render(<InboxClient initialData={baseInitialData()} />);
+
+    const layout = document.querySelector(".talvia-inbox-layout")!;
+    expect(layout).toHaveAttribute("data-context", "closed");
+  });
+
+  it("opens the contact panel from the header and closes it again", () => {
+    render(<InboxClient initialData={baseInitialData()} />);
+    const layout = document.querySelector(".talvia-inbox-layout")!;
+
+    fireEvent.click(screen.getByTitle("Informations du contact"));
+    expect(layout).toHaveAttribute("data-context", "open");
+
+    fireEvent.click(screen.getByTitle("Fermer"));
+    expect(layout).toHaveAttribute("data-context", "closed");
+  });
+
+  it("opens the contact panel by clicking the contact identity in the header", () => {
+    render(<InboxClient initialData={baseInitialData()} />);
+
+    fireEvent.click(screen.getByTitle("Voir le contact"));
+
+    expect(document.querySelector(".talvia-inbox-layout")).toHaveAttribute("data-context", "open");
+  });
+
+  it("closes the conversation entirely — no previous thread stays rendered", () => {
+    render(<InboxClient initialData={baseInitialData()} />);
+    expect(screen.getByText("Bonjour")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle("Fermer la conversation"));
+
+    // The message body is gone (the thread list preview keeps its own copy).
+    expect(screen.queryByText("Bonjour")).not.toBeInTheDocument();
+    expect(screen.getByText("Sélectionnez une conversation")).toBeInTheDocument();
+  });
+
+  it("re-opens a conversation after closing it", () => {
+    render(<InboxClient initialData={baseInitialData()} />);
+    fireEvent.click(screen.getByTitle("Fermer la conversation"));
+    expect(screen.getByText("Sélectionnez une conversation")).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByText("Jane Doe")[0]!);
+
+    expect(screen.getByText("Bonjour")).toBeInTheDocument();
+  });
+
+  it("toggles the Inbox appearance without touching anything outside the Inbox", () => {
+    render(<InboxClient initialData={baseInitialData()} />);
+    const layout = document.querySelector(".talvia-inbox-layout")!;
+    expect(layout).toHaveAttribute("data-inbox-theme", "dark");
+
+    fireEvent.click(screen.getByTitle("Apparence claire"));
+
+    expect(layout).toHaveAttribute("data-inbox-theme", "light");
+    // Scoped: the preference lives on the Inbox root only.
+    expect(document.documentElement).not.toHaveAttribute("data-inbox-theme");
+    expect(window.localStorage.getItem("talvia.inbox.theme")).toBe("light");
+  });
+});
+
+describe("InboxClient — mark as read (persisted model)", () => {
+  it("marks one conversation as read through the real read endpoint", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ conversation: {} }), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    const data = baseInitialData();
+    data.conversations[0]!.unread = true;
+    render(<InboxClient initialData={data} />);
+
+    fireEvent.click(screen.getByTitle("Marquer comme lu"));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/inbox/conversations/conv-1/read",
+        expect.objectContaining({ method: "PATCH" }),
+      );
+    });
+  });
+
+  it("offers 'tout marquer comme lu' only when something is unread", () => {
+    render(<InboxClient initialData={baseInitialData()} />);
+    expect(screen.queryByText("Tout marquer comme lu")).not.toBeInTheDocument();
+
+    cleanup();
+    const data = baseInitialData();
+    data.conversations[0]!.unread = true;
+    render(<InboxClient initialData={data} />);
+    expect(screen.getByText("Tout marquer comme lu")).toBeInTheDocument();
+  });
+});
+
+describe("InboxClient — channel presentation", () => {
+  it("shows the subject in the header for an email conversation and uses the editorial message style", () => {
+    const data = baseInitialData();
+    data.conversations[0]!.channel = "email";
+    data.conversations[0]!.subject = "Votre devis";
+    data.connections = [{ channel_type: "email", status: "connected" }];
+    render(<InboxClient initialData={data} />);
+
+    expect(screen.getByText("Votre devis")).toBeInTheDocument();
+    expect(document.querySelectorAll(".inbox-message--email").length).toBeGreaterThan(0);
+  });
+
+  it("keeps WhatsApp and LinkedIn conversational — no email modifier", () => {
+    const data = baseInitialData();
+    data.conversations[0]!.channel = "whatsapp";
+    data.connections = [{ channel_type: "whatsapp", status: "connected" }];
+    render(<InboxClient initialData={data} />);
+
+    expect(document.querySelectorAll(".inbox-message--email")).toHaveLength(0);
+    expect(document.querySelectorAll(".inbox-message").length).toBeGreaterThan(0);
+  });
+});
