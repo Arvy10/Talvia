@@ -209,11 +209,47 @@ function createFakeDatabase() {
     // can initialize each one's current_step_id in the same transaction. A
     // participant already mid-sequence is structurally excluded by this
     // WHERE clause itself, not by an unstated convention elsewhere.
-    if (text.startsWith("update campaign_participants set status='active',started_at=coalesce(started_at,now()),updated_at=now() where campaign_id=$1 and status='waiting' and current_step_id is null returning id")) {
+    // Mirrors the real activation guard: not-yet-started means
+    // current_step_id NULL, or already parked on the campaign's FIRST step
+    // (what a prospect approved while the campaign was a draft looks like on
+    // rows written before prospecting.ts stopped stamping it).
+    if (text.startsWith("update campaign_participants set status='active',started_at=coalesce(started_at,now()),updated_at=now() where campaign_id=$1 and status='waiting' and (current_step_id is null or current_step_id=(select id from campaign_steps where campaign_id=$1 order by position limit 1)) returning id")) {
       const [campaignId] = params as [string];
-      const matches = campaignParticipants.filter((p) => p.campaign_id === campaignId && p.status === "waiting" && !p.current_step_id);
+      const firstStepId = campaignSteps.filter((step) => step.campaign_id === campaignId).sort((a, b) => (a.position as number) - (b.position as number))[0]?.id;
+      const matches = campaignParticipants.filter((p) => p.campaign_id === campaignId && p.status === "waiting" && (!p.current_step_id || p.current_step_id === firstStepId));
       for (const p of matches) { p.status = "active"; p.started_at = p.started_at ?? new Date().toISOString(); }
       return { rows: matches.map((p) => ({ id: p.id })) };
+    }
+
+    // eligibleEmailContactIds — the email bulk guard. Deliberately a
+    // DIFFERENT rule from WhatsApp's: a usable address, never a Conversation.
+    if (text.startsWith("select distinct c.id from contacts c join contact_identities ci on ci.contact_id=c.id and ci.workspace_id=c.workspace_id where c.workspace_id=$1 and c.id = any($2::uuid[])")) {
+      bulkEligibilityCalls += 1;
+      const [workspaceId, contactIds] = params as [string, string[]];
+      const eligible = contacts.filter((c) =>
+        c.workspace_id === workspaceId
+        && contactIds.includes(c.id as string)
+        && !c.archived_at
+        && contactIdentities.some((ci) => ci.workspace_id === workspaceId && ci.contact_id === c.id && ci.channel_type === "email" && ci.identifier_normalized));
+      return { rows: eligible.map((c) => ({ id: c.id })) };
+    }
+
+    // listEligibleEmailContacts
+    if (text.startsWith("select c.id contact_id, c.display_name, co.name company, ident.identifier address")) {
+      const [workspaceId] = params as [string];
+      const rows = contacts
+        .filter((c) => c.workspace_id === workspaceId && !c.archived_at)
+        .map((c) => {
+          const identity = contactIdentities
+            .filter((ci) => ci.workspace_id === workspaceId && ci.contact_id === c.id && ci.channel_type === "email" && ci.identifier_normalized)
+            .sort((a, b) => String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")))[0];
+          if (!identity) return null;
+          const conversation = pickCanonicalConversation(conversations.filter((v) => v.workspace_id === workspaceId && v.contact_id === c.id && v.channel_type === "email"));
+          const company = companies.find((co) => co.id === c.company_id && co.workspace_id === workspaceId);
+          return { contact_id: c.id, display_name: c.display_name, company: company?.name ?? null, address: identity.identifier, conversation_id: conversation?.id ?? null, last_message_at: conversation?.last_message_at ?? null };
+        })
+        .filter((row): row is NonNullable<typeof row> => row !== null);
+      return { rows };
     }
 
     if (text.startsWith("insert into activities")) {
@@ -270,7 +306,7 @@ let fakeDatabase = createFakeDatabase();
 // it against this same fake.
 vi.mock("./database", () => ({ get database() { return fakeDatabase; } }));
 
-const { addParticipants, createCampaign, listEligibleWhatsAppRelations, transitionCampaign } = await import("./campaigns");
+const { addParticipants, createCampaign, listEligibleEmailContacts, listEligibleWhatsAppRelations, transitionCampaign } = await import("./campaigns");
 const { advanceParticipantToNextStep } = await import("./campaign-execution/step-progression");
 const { findConversationId } = await import("./campaign-execution/conversation-resolution");
 
@@ -413,12 +449,67 @@ describe("current_step_id initialization — never re-initializes an already-adv
     await transitionCampaign(context, campaign.id, "resume");
 
     // current_step_id, last_action_at, and started_at are byte-for-byte
-    // unchanged — pause/resume never re-enters initializeParticipantStep
-    // for a participant whose current_step_id is already non-null (the
-    // `and current_step_id is null` guard on the activation query).
+    // unchanged — pause/resume never re-enters initializeParticipantStep for
+    // a participant genuinely mid-sequence: the activation query matches only
+    // `status='waiting'` rows, and among those only ones with no
+    // current_step_id or one still pointing at the campaign's first step.
     expect(participant.current_step_id).toBe(waitStep.id);
     expect(participant.last_action_at).toBe(lastActionAtAfterAdvance);
     expect(participant.started_at).toBe(startedAtAfterAdvance);
+    expect(participant.status).toBe("active");
+  });
+});
+
+describe("current_step_id initialization — states activation must never touch", () => {
+  // The activation guard was widened (it now also matches a waiting
+  // participant parked on the campaign's FIRST step, to recover rows written
+  // before prospecting.ts stopped stamping current_step_id). These two tests
+  // pin the boundaries of that widening, since a guard that is too generous
+  // would silently restart a real sequence.
+  it("never reinitializes a STOPPED participant, even one sitting on the first step", async () => {
+    seedWhatsAppRelation("contact-1");
+    const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
+    const participant = fakeDatabase.campaignParticipants[0]!;
+    const firstStep = fakeDatabase.campaignSteps.filter((s) => s.campaign_id === campaign.id).sort((a, b) => (a.position as number) - (b.position as number))[0]!;
+    participant.status = "stopped";
+    participant.current_step_id = firstStep.id;
+    participant.last_action_at = null;
+
+    await transitionCampaign(context, campaign.id, "activate");
+
+    expect(participant.status).toBe("stopped");
+    expect(participant.last_action_at).toBeNull(); // never re-stamped
+  });
+
+  it("never reinitializes a participant that already REPLIED", async () => {
+    seedWhatsAppRelation("contact-1");
+    const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
+    const participant = fakeDatabase.campaignParticipants[0]!;
+    participant.status = "replied";
+    participant.current_step_id = null;
+
+    await transitionCampaign(context, campaign.id, "activate");
+
+    expect(participant.status).toBe("replied");
+    expect(participant.current_step_id).toBeNull();
+  });
+
+  it("resume never restarts the WAIT timer of an active participant parked on the first step", async () => {
+    // The widened guard matches on current_step_id = first step. This proves
+    // the `status='waiting'` half of the guard is what keeps a live,
+    // mid-WAIT participant out of it — otherwise resuming a paused campaign
+    // would silently reset every pending relance's countdown.
+    seedWhatsAppRelation("contact-1");
+    const campaign = await createWhatsAppCampaign("follow_up", ["contact-1"]);
+    await transitionCampaign(context, campaign.id, "activate");
+    const participant = fakeDatabase.campaignParticipants[0]!;
+    const stampedAt = "2026-01-01T00:00:00.000Z";
+    participant.last_action_at = stampedAt;
+
+    await transitionCampaign(context, campaign.id, "pause");
+    await transitionCampaign(context, campaign.id, "resume");
+
+    expect(participant.last_action_at).toBe(stampedAt);
     expect(participant.status).toBe("active");
   });
 });
@@ -737,5 +828,155 @@ describe("listing <-> executor consistency (cross-check)", () => {
     const executorResolved = await findConversationId(workspaceId, "contact-1", "whatsapp");
 
     expect(relations[0]!.conversationId).toBe(executorResolved);
+  });
+});
+
+// --- Email audience ---
+// Email's eligibility rule is deliberately NOT WhatsApp's. WhatsApp requires a
+// real existing Conversation (it is a relation-continuation channel);
+// email requires a real usable ADDRESS, because a first mail to a known
+// address is a legitimate email capability. These tests exist so the two
+// rules can never quietly converge.
+
+function seedEmailContact(id: string, opts: { address?: string; normalized?: string | null; archived?: boolean; workspaceId?: string; createdAt?: string } = {}) {
+  const ws = opts.workspaceId ?? workspaceId;
+  const address = opts.address ?? `${id}@example.com`;
+  fakeDatabase.contacts.push({ id, workspace_id: ws, display_name: `Contact ${id}`, company_id: null, archived_at: opts.archived ? "2026-01-01T00:00:00.000Z" : null });
+  fakeDatabase.contactIdentities.push({
+    workspace_id: ws, contact_id: id, channel_type: "email", identifier: address,
+    identifier_normalized: opts.normalized === undefined ? address.toLowerCase() : opts.normalized,
+    created_at: opts.createdAt ?? "2026-01-01T00:00:00.000Z",
+  });
+}
+
+describe("listEligibleEmailContacts", () => {
+  it("includes a Contact with a usable address and NO conversation — the first-touch case", async () => {
+    seedEmailContact("contact-1");
+
+    const rows = await listEligibleEmailContacts(context);
+
+    expect(rows).toEqual([{ id: "contact-1", name: "Contact contact-1", address: "contact-1@example.com", hasConversation: false }]);
+  });
+
+  it("marks a Contact that already has an email conversation so the UI can say 'the relance follows the thread'", async () => {
+    seedEmailContact("contact-1");
+    seedConversation("conv-1", "contact-1", { channelType: "email" as never, lastMessageAt: "2026-02-01T00:00:00.000Z" });
+
+    const rows = await listEligibleEmailContacts(context);
+
+    expect(rows[0]).toMatchObject({ id: "contact-1", hasConversation: true, lastMessageAt: "2026-02-01T00:00:00.000Z" });
+  });
+
+  it("excludes a Contact whose stored address never normalized to anything usable", async () => {
+    seedEmailContact("contact-bad", { address: "pas-une-adresse", normalized: "" });
+
+    expect(await listEligibleEmailContacts(context)).toEqual([]);
+  });
+
+  it("excludes an archived Contact", async () => {
+    seedEmailContact("contact-archived", { archived: true });
+
+    expect(await listEligibleEmailContacts(context)).toEqual([]);
+  });
+
+  it("excludes a Contact with only a WhatsApp or LinkedIn identity", async () => {
+    seedContact("contact-wa", "whatsapp");
+    seedContact("contact-li", "linkedin");
+
+    expect(await listEligibleEmailContacts(context)).toEqual([]);
+  });
+
+  it("never returns another workspace's Contact", async () => {
+    seedEmailContact("contact-other", { workspaceId: "ws-2" });
+
+    expect(await listEligibleEmailContacts(context)).toEqual([]);
+  });
+});
+
+describe("email backend guard — createCampaign / addParticipants", () => {
+  it("accepts a Contact with an email address but no conversation (first touch is legitimate)", async () => {
+    seedEmailContact("contact-1");
+
+    const campaign = await createCampaign(context, { name: "Relance", objective: "follow_up", channelType: "email", participantIds: ["contact-1"] });
+
+    expect(campaign.participantCount).toBe(1);
+  });
+
+  it("rejects a Contact with no usable email address, with an email-specific message", async () => {
+    seedContact("contact-wa", "whatsapp");
+
+    await expect(createCampaign(context, { name: "Relance", objective: "follow_up", channelType: "email", participantIds: ["contact-wa"] }))
+      .rejects.toThrow(/adresse e-mail exploitable/);
+  });
+
+  it("re-checks eligibility server-side when a contact is added to an existing email campaign", async () => {
+    seedEmailContact("contact-1");
+    seedContact("contact-wa", "whatsapp");
+    const campaign = await createCampaign(context, { name: "Relance", objective: "follow_up", channelType: "email", participantIds: ["contact-1"] });
+
+    await expect(addParticipants(context, campaign.id, ["contact-wa"])).rejects.toThrow(/adresse e-mail exploitable/);
+  });
+
+  it("checks a whole batch in ONE bulk query — never one round trip per contact", async () => {
+    seedEmailContact("contact-1");
+    seedEmailContact("contact-2");
+    seedEmailContact("contact-3");
+    const bulkBefore = fakeDatabase.bulkEligibilityCalls;
+    const identityBefore = fakeDatabase.identityCheckCalls;
+
+    await createCampaign(context, { name: "Relance", objective: "follow_up", channelType: "email", participantIds: ["contact-1", "contact-2", "contact-3"] });
+
+    expect(fakeDatabase.bulkEligibilityCalls - bulkBefore).toBe(1);
+    expect(fakeDatabase.identityCheckCalls - identityBefore).toBe(0);
+  });
+
+  it("persists the campaign's email subject in settings — never invented at send time", async () => {
+    seedEmailContact("contact-1");
+
+    const campaign = await createCampaign(context, { name: "Relance", objective: "follow_up", channelType: "email", participantIds: ["contact-1"], emailSubject: "  Suite à notre échange  " });
+
+    expect(campaign.emailSubject).toBe("Suite à notre échange");
+  });
+});
+
+describe("activation recovers a participant parked on the first step", () => {
+  // The bug: prospecting.ts used to stamp current_step_id on EVERY newly
+  // approved participant, including those approved while the campaign was
+  // still a draft. transitionCampaign's guard excluded them
+  // (`current_step_id is null`), so they stayed 'waiting' forever — a status
+  // the engine never claims, with no error recorded anywhere.
+  it("activates a waiting participant already sitting on the campaign's first step", async () => {
+    seedWhatsAppRelation("contact-1");
+    const campaign = await createCampaign(context, {
+      name: "Relance", objective: "follow_up", channelType: "whatsapp", participantIds: ["contact-1"],
+      steps: [{ position: 0, stepType: "message" }, { position: 1, stepType: "end" }],
+    });
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.campaign_id === campaign.id)!;
+    const firstStep = fakeDatabase.campaignSteps.filter((s) => s.campaign_id === campaign.id).sort((a, b) => (a.position as number) - (b.position as number))[0]!;
+    // Exactly the legacy shape.
+    participant.current_step_id = firstStep.id;
+
+    await transitionCampaign(context, campaign.id, "activate");
+
+    expect(participant.status).toBe("active");
+    expect(participant.current_step_id).toBe(firstStep.id);
+    // last_action_at is what a later WAIT step computes its due date from.
+    expect(participant.last_action_at).not.toBeNull();
+  });
+
+  it("still refuses to re-initialize a participant genuinely mid-sequence", async () => {
+    seedWhatsAppRelation("contact-1");
+    const campaign = await createCampaign(context, {
+      name: "Relance", objective: "follow_up", channelType: "whatsapp", participantIds: ["contact-1"],
+      steps: [{ position: 0, stepType: "message" }, { position: 1, stepType: "message" }, { position: 2, stepType: "end" }],
+    });
+    const participant = fakeDatabase.campaignParticipants.find((p) => p.campaign_id === campaign.id)!;
+    const steps = fakeDatabase.campaignSteps.filter((s) => s.campaign_id === campaign.id).sort((a, b) => (a.position as number) - (b.position as number));
+    participant.current_step_id = steps[1]!.id;
+
+    await transitionCampaign(context, campaign.id, "activate");
+
+    expect(participant.status).toBe("waiting");
+    expect(participant.current_step_id).toBe(steps[1]!.id);
   });
 });

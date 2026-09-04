@@ -68,8 +68,23 @@ Potential priorities:
 
 - Gmail integration — **moved into active work (2026-09)**: connection, ingestion,
   historical import, Inbox conversations and campaign execution are built on the
-  shared domain entities and the single Campaign Engine. First-touch outbound
-  (no existing thread) remains deferred — see DECISIONS.md.
+  shared domain entities and the single Campaign Engine. Connection and historical
+  import have been exercised against a real mailbox. First-touch outbound (no
+  existing thread) and campaign sending are implemented and covered by tests, but
+  **their real end-to-end run against a live mailbox is still outstanding** — see
+  DECISIONS.md, "Email first touch to a known address".
+
+**Maturity vocabulary.** These three are not the same claim, and this roadmap
+keeps them apart deliberately:
+
+- *implemented* — the code path exists and is reachable in the product;
+- *tested* — covered by the automated suite, which runs against fakes, never
+  against a provider;
+- *E2E verified* — actually observed working against the real provider.
+
+"Not E2E verified" means nobody has recorded observing it here. It is never a
+claim that it was tried and failed, nor that it was never exercised before this
+repository's history began.
 - WhatsApp integration
 - stronger Inbox context panel
 - conversation summarization

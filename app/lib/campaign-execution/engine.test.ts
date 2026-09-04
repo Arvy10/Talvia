@@ -110,6 +110,11 @@ function createFakeDatabase() {
       const [workspaceId] = params as string[];
       return { rows: [{ connected: connections.some((c) => c.workspace_id === workspaceId && c.channel_type === "email" && c.status === "connected") }] };
     }
+    if (text.startsWith("select settings->>'emailSubject' as subject from campaigns where workspace_id=$1 and id=$2")) {
+      const [workspaceId, campaignId] = params as string[];
+      const row = campaigns.find((c) => c.id === campaignId && c.workspace_id === workspaceId);
+      return { rows: row ? [{ subject: (row.settings as { emailSubject?: string } | undefined)?.emailSubject ?? null }] : [] };
+    }
     if (text.startsWith("select step_type from campaign_steps where campaign_id=$1 and step_type='message'")) {
       const [campaignId] = params as string[];
       return { rows: campaignSteps.filter((s) => s.campaign_id === campaignId && s.step_type === "message").map((s) => ({ step_type: s.step_type })) };
@@ -230,6 +235,12 @@ vi.mock("../providers/unipile", async (importOriginal) => ({
 // below can read call[3] instead of casting.
 const sendMessageMock = vi.hoisted(() => vi.fn(async (_workspaceId: string, _conversationId: string, _text: string, _idempotencyKey?: string) => ({ id: "msg-1", body: "", direction: "outbound" as const, status: "sent" as const, createdAt: new Date().toISOString() })));
 vi.mock("../providers/unipile-adapter", () => ({ sendMessage: sendMessageMock }));
+// The email first-touch sender, reached through the executor's dynamic
+// import. Mocked here so these tests prove WHEN the engine chooses the
+// first-touch path and with WHAT key — unipile-email.test.ts owns the
+// sending/persistence/reconciliation behaviour itself.
+const sendFirstTouchEmailMock = vi.hoisted(() => vi.fn(async (_args: { workspaceId: string; contactId: string; subject: string; body: string; idempotencyKey?: string }) => ({ ok: true as const, conversationId: "conv-first-touch", reason: undefined as undefined | string })));
+vi.mock("../providers/unipile-email", () => ({ sendFirstTouchEmail: sendFirstTouchEmailMock }));
 vi.mock("../ai", () => ({ getAIProvider: () => null }));
 vi.mock("../business-context/business-context-service", () => ({ getActiveBusinessContext: async () => null }));
 
@@ -239,6 +250,7 @@ beforeEach(() => {
   fakeDatabase = createFakeDatabase();
   sendLinkedInInvitationMock.mockClear();
   sendMessageMock.mockClear();
+  sendFirstTouchEmailMock.mockClear().mockResolvedValue({ ok: true, conversationId: "conv-first-touch", reason: undefined });
 });
 
 const workspaceId = "ws-1";
@@ -497,5 +509,213 @@ describe("email send idempotency key (provider-side double-send protection)", ()
 
     const keys = sendMessageMock.mock.calls.map((call) => call[3]);
     expect(new Set(keys).size).toBe(1);
+  });
+});
+
+// --- Email first touch through the shared engine ---
+// The gap this closes: executeMessageStep required an existing Conversation,
+// so a Contact with a real, known address but no thread yet always ended as
+// NOT_ELIGIBLE. First touch is NOT a second send path — it is the same claim,
+// the same re-checks, the same idempotency key and the same participant state
+// machine, with a different delivery for the one case where there is nothing
+// to reply into.
+
+// Same seed as seedEmailParticipantOnDueWait, minus the Conversation: a
+// participant Talvia can address but has never written to.
+function seedEmailParticipantWithoutConversation(campaignId: string, participantId: string, approvedText: string | null = "Premier e-mail approuvé.") {
+  fakeDatabase.campaignParticipants.push({
+    id: participantId, campaign_id: campaignId, contact_id: `contact-${participantId}`, status: "active", current_step_id: `${campaignId}-wait`,
+    invite_sent_at: null, invite_accepted_at: null, message_sent_at: null, step_claimed_at: null, last_action_at: ago(3 * DAY + 60_000),
+    personalization: {
+      evidence: { observedFacts: [], qualificationContext: null, strategyContext: null, uncertainties: [] },
+      outreachAngle: null,
+      invitation: EMPTY_TEXT,
+      messages: [approvedText
+        ? { stepId: `${campaignId}-msg2`, ...EMPTY_TEXT, status: "approved", generatedText: approvedText, approvedText, approvedAt: new Date().toISOString() }
+        : { stepId: `${campaignId}-msg2`, ...EMPTY_TEXT, status: "generated", generatedText: "Proposition non approuvée." }],
+      generatedAt: new Date().toISOString(), aiModel: null,
+    },
+  });
+  return fakeDatabase.campaignParticipants[fakeDatabase.campaignParticipants.length - 1]!;
+}
+
+function withSubject(campaignId: string, subject = "Suite à notre échange") {
+  const campaign = fakeDatabase.campaigns.find((c) => c.id === campaignId)!;
+  campaign.settings = { emailSubject: subject };
+}
+
+describe("email first touch — known address, no conversation yet", () => {
+  it("sends the approved text as a first touch and advances the participant exactly like a threaded send", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    withSubject("camp-email");
+    const participant = seedEmailParticipantWithoutConversation("camp-email", "part-ft");
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(sendFirstTouchEmailMock).toHaveBeenCalledWith({
+      workspaceId, contactId: "contact-part-ft", subject: "Suite à notre échange",
+      body: "Premier e-mail approuvé.", idempotencyKey: "part-ft:camp-email-msg2",
+    });
+    expect(summary.sent).toBe(1);
+    expect(participant.message_sent_at).not.toBeNull();
+    expect(participant.current_step_id).toBe("camp-email-end");
+    expect(participant.status).toBe("completed");
+  });
+
+  it("uses the SAME idempotency key the threaded path would have used for that (participant, step)", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    withSubject("camp-email");
+    seedEmailParticipantWithoutConversation("camp-email", "part-x");
+    seedEmailParticipantOnDueWait("camp-email", "part-y");
+
+    await runDueCampaignActions(context, "camp-email");
+
+    expect(sendFirstTouchEmailMock.mock.calls[0]![0].idempotencyKey).toBe("part-x:camp-email-msg2");
+    expect(sendMessageMock.mock.calls[0]![3]).toBe("part-y:camp-email-msg2");
+  });
+
+  it("prefers the existing thread whenever one exists — a first touch is only ever the fallback", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    withSubject("camp-email");
+    seedEmailParticipantOnDueWait("camp-email", "part-threaded");
+
+    await runDueCampaignActions(context, "camp-email");
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendFirstTouchEmailMock).not.toHaveBeenCalled();
+  });
+
+  it("never sends without an approvedText, first touch included", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    withSubject("camp-email");
+    const participant = seedEmailParticipantWithoutConversation("camp-email", "part-ft", null);
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(sendFirstTouchEmailMock).not.toHaveBeenCalled();
+    expect(summary.failed).toBe(1);
+    expect(participant.last_error_code).toBe("MESSAGE_NOT_APPROVED");
+  });
+
+  it("does NOT require a campaign subject for a threaded relance — that thread already has its own", async () => {
+    // The guard lives inside the first-touch handler, which executeMessageStep
+    // only reaches when there is no conversation to reply into. Putting it a
+    // level higher would have blocked every follow-up on an existing thread
+    // for a campaign created before the subject field existed.
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email"); // deliberately no emailSubject
+    const participant = seedEmailParticipantOnDueWait("camp-email", "part-threaded");
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(summary.sent).toBe(1);
+    expect(sendMessageMock).toHaveBeenCalled();
+    expect(participant.last_error_code).toBeFalsy();
+  });
+
+  it("blocks with EMAIL_SUBJECT_MISSING rather than inventing a subject", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    const participant = seedEmailParticipantWithoutConversation("camp-email", "part-ft");
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(sendFirstTouchEmailMock).not.toHaveBeenCalled();
+    expect(summary.sent).toBe(0);
+    expect(participant.last_error_code).toBe("EMAIL_SUBJECT_MISSING");
+    expect(participant.message_sent_at).toBeNull();
+  });
+
+  it("keeps the claim when the provider outcome is UNKNOWN, so no retry fires on the very next run", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    withSubject("camp-email");
+    const participant = seedEmailParticipantWithoutConversation("camp-email", "part-ft");
+    sendFirstTouchEmailMock.mockResolvedValueOnce({ ok: false, reason: "EMAIL_SEND_OUTCOME_UNKNOWN" } as never);
+
+    await runDueCampaignActions(context, "camp-email");
+
+    expect(participant.last_error_code).toBe("EMAIL_SEND_OUTCOME_UNKNOWN");
+    // Claim retained: re-sending a mail a real person may already have
+    // received is worse than waiting out CLAIM_STALE_AFTER.
+    expect(participant.step_claimed_at).not.toBeNull();
+
+    sendFirstTouchEmailMock.mockClear();
+    await runDueCampaignActions(context, "camp-email");
+    expect(sendFirstTouchEmailMock).not.toHaveBeenCalled();
+  });
+
+  it("records the provider's refusal on the participant and leaves it retry-eligible", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    withSubject("camp-email");
+    const participant = seedEmailParticipantWithoutConversation("camp-email", "part-ft");
+    sendFirstTouchEmailMock.mockResolvedValueOnce({ ok: false, reason: "EMAIL_FIRST_TOUCH_SEND_FAILED" } as never);
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(summary.failed).toBe(1);
+    expect(participant.last_error_code).toBe("EMAIL_FIRST_TOUCH_SEND_FAILED");
+    expect(participant.message_sent_at).toBeNull();
+    expect(participant.step_claimed_at).toBeNull();
+  });
+
+  it("counts a send whose thread could not be reconciled as SENT — never retried — but records why", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    withSubject("camp-email");
+    const participant = seedEmailParticipantWithoutConversation("camp-email", "part-ft");
+    sendFirstTouchEmailMock.mockResolvedValueOnce({ ok: true, conversationId: null, reason: "EMAIL_THREAD_RECONCILIATION_FAILED" } as never);
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(summary.sent).toBe(1);
+    expect(participant.message_sent_at).not.toBeNull();
+    expect(participant.last_error_code).toBe("EMAIL_THREAD_RECONCILIATION_FAILED");
+  });
+
+  it("does not first-touch a participant that replied between the claim and the send", async () => {
+    seedConnectedEmailAccount();
+    seedEmailSequence("camp-email");
+    withSubject("camp-email");
+    const participant = seedEmailParticipantWithoutConversation("camp-email", "part-ft");
+    // The reply lands while personalization is being read — exactly the
+    // window checkParticipantStillActive exists for.
+    fakeDatabase.campaigns.find((c) => c.id === "camp-email")!.settings = { emailSubject: "Suite à notre échange" };
+    const originalQuery = fakeDatabase.query;
+    fakeDatabase.query = async (sql: string, params: unknown[] = []) => {
+      if (sql.replace(/\s+/g, " ").trim().startsWith("select p.personalization from campaign_participants p join campaigns c")) {
+        participant.status = "replied";
+      }
+      return originalQuery(sql, params);
+    };
+
+    const summary = await runDueCampaignActions(context, "camp-email");
+
+    expect(sendFirstTouchEmailMock).not.toHaveBeenCalled();
+    expect(summary.sent).toBe(0);
+    expect(participant.last_error_code).toBe("PARTICIPANT_REPLIED");
+  });
+});
+
+describe("first touch is EMAIL-only — the other channels are unchanged", () => {
+  it("a LinkedIn participant with no conversation is still NOT_ELIGIBLE, never first-touched", async () => {
+    seedConnectedAccount();
+    seedSequence("camp-li");
+    const participant = seedParticipantOnDueWait("camp-li", "part-li");
+    // Remove the conversation the seed created, keeping everything else.
+    fakeDatabase.conversations.length = 0;
+
+    const summary = await runDueCampaignActions(context, "camp-li");
+
+    expect(sendFirstTouchEmailMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(summary.sent).toBe(0);
+    expect(participant.last_error_code).toBe("NOT_ELIGIBLE");
   });
 });

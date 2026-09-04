@@ -26,6 +26,26 @@ export type ReasonCode =
   | "DAILY_LIMIT_REACHED"
   // Phase 3 — personalization pipeline (docs spec §22). MESSAGE_ALREADY_SENT
   // is deliberately not its own code: ALREADY_SENT above already covers it.
+  // Email first-touch (controlled outbound to a known address with no
+  // existing thread). Each names the exact precondition that was missing, so
+  // "nothing was sent" is never an unexplained silence — and each is
+  // distinct from NOT_ELIGIBLE, which would say nothing about which of the
+  // four preconditions actually failed.
+  | "EMAIL_IDENTITY_MISSING"
+  | "EMAIL_CONNECTION_UNAVAILABLE"
+  | "EMAIL_SUBJECT_MISSING"
+  | "EMAIL_FIRST_TOUCH_SEND_FAILED"
+  // The provider never answered (timeout / connection dropped), so whether it
+  // accepted the mail is genuinely UNKNOWN. Distinct from
+  // EMAIL_FIRST_TOUCH_SEND_FAILED, which means the provider answered and
+  // refused — nothing was sent. Never treated as a success, never treated as
+  // a clean failure either.
+  | "EMAIL_SEND_OUTCOME_UNKNOWN"
+  // The mail genuinely went out but Talvia could not key a real Conversation
+  // to it (the provider returned no usable identifier). Never a failure of
+  // the send itself — recorded on the participant so the deferred
+  // webhook-driven reconciliation is visible rather than silent.
+  | "EMAIL_THREAD_RECONCILIATION_FAILED"
   | "NO_PERSONALIZATION_DATA"
   | "AI_GENERATION_FAILED"
   | "MESSAGE_NOT_GENERATED"

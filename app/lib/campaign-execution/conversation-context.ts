@@ -1,26 +1,35 @@
 import { database } from "../database";
+import type { CampaignChannel } from "../campaigns";
 import { findConversationId } from "./conversation-resolution";
 
-// C1 scope only (see Phase C audit): this builder exposes OBSERVED DATA from
-// a real WhatsApp Conversation, nothing inferred or generated. No LLM call
-// happens here — that is C2's concern. Deliberately WhatsApp-scoped for now
-// rather than a generic cross-channel abstraction: LinkedIn's evidence
-// source (a structured prospect profile) has nothing structurally in common
-// with a free-form message history, so a shared shape today would be a
-// premature abstraction over two things that don't actually look alike yet.
+// This builder exposes OBSERVED DATA from a real Conversation, nothing
+// inferred or generated. No LLM call happens here — grounded generation is
+// campaign-personalization.ts's concern.
+//
+// Originally WhatsApp-only (C1). Now channel-parameterized, because email
+// turned out to have exactly the same evidence shape — a free-form message
+// history on an existing thread — and duplicating this file for it would
+// have meant two definitions of "what was actually said", which is precisely
+// the divergence conversation-resolution.ts exists to prevent. LinkedIn
+// stays out: its evidence source is a structured prospect profile, which has
+// nothing structurally in common with a message history.
 
-export type WhatsAppConversationContextMessage = {
+export type ConversationContextMessage = {
   direction: "inbound" | "outbound";
   body: string;
   at: string;
 };
 
-export type WhatsAppConversationContext = {
+export type ConversationContext = {
   conversationId: string;
-  recentMessages: WhatsAppConversationContextMessage[];
+  recentMessages: ConversationContextMessage[];
   lastMessageAt: string | null;
   daysSinceLastMessage: number | null;
 };
+
+// Pre-existing names, kept so no WhatsApp caller or test has to change.
+export type WhatsAppConversationContextMessage = ConversationContextMessage;
+export type WhatsAppConversationContext = ConversationContext;
 
 // Batch-execution limits (DEFAULT_BATCH_LIMIT/MAX_BATCH_LIMIT in the
 // executors) size how many PARTICIPANTS get processed per engine run — an
@@ -51,12 +60,13 @@ function daysBetween(from: Date, to: Date): number {
 // Conversation in this workspace) — a genuinely empty Conversation still
 // returns a context, just with an empty recentMessages/null timestamps,
 // since "no messages" is itself a real observed fact for C2 to fall back on.
-export async function buildWhatsAppConversationContext(
+export async function buildChannelConversationContext(
   workspaceId: string,
   contactId: string,
+  channel: CampaignChannel,
   opts?: { limit?: number; now?: Date },
-): Promise<WhatsAppConversationContext | null> {
-  const conversationId = await findConversationId(workspaceId, contactId, "whatsapp");
+): Promise<ConversationContext | null> {
+  const conversationId = await findConversationId(workspaceId, contactId, channel);
   if (!conversationId) return null;
 
   const limit = Math.min(Math.max(Math.trunc(opts?.limit ?? DEFAULT_CONTEXT_MESSAGES), 1), MAX_CONTEXT_MESSAGES);
@@ -92,4 +102,17 @@ export async function buildWhatsAppConversationContext(
   const daysSinceLastMessage = lastMessageAt ? daysBetween(new Date(lastMessageAt), now) : null;
 
   return { conversationId, recentMessages, lastMessageAt, daysSinceLastMessage };
+}
+
+// The WhatsApp entry point, unchanged for every existing caller: exactly the
+// builder above with the channel pinned. Kept as its own named function
+// rather than making callers pass a literal, so the WhatsApp personalization
+// path keeps reading as "the WhatsApp conversation context" and cannot
+// accidentally be pointed at another channel by a typo.
+export async function buildWhatsAppConversationContext(
+  workspaceId: string,
+  contactId: string,
+  opts?: { limit?: number; now?: Date },
+): Promise<WhatsAppConversationContext | null> {
+  return buildChannelConversationContext(workspaceId, contactId, "whatsapp", opts);
 }

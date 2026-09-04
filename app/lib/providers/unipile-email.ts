@@ -8,6 +8,7 @@ import {
   type IngestResult,
 } from "./unipile-adapter";
 import { normalizeEmail } from "../../app/contacts/contact-utils";
+import type { ReasonCode } from "../campaign-execution/reason-codes";
 import { getEmailByMessageId, getUnipileConfig, sendEmail, type UnipileEmail, type UnipileEmailAttendee, type UnipileNewEmailPayload } from "./unipile";
 
 // Email ingestion. Deliberately a separate module from unipile-adapter.ts's
@@ -79,7 +80,12 @@ export type EmailMessageMetadata = {
   cc?: string[];
   attachments?: Array<{ id: string; name?: string; mime?: string; size?: number }>;
   imported?: true;
-  threadResolution?: "provider_thread_id" | "fallback_message_id";
+  // "pending_first_touch" is the ONLY provisional value: a mail Talvia just
+  // sent to an address that had no thread yet, keyed on the provider id the
+  // send actually returned (never an invented thread id). It is replaced by
+  // the real resolution the moment the mail_sent webhook lets us look the
+  // canonical thread up — see reconcileOutboundSend below.
+  threadResolution?: "provider_thread_id" | "fallback_message_id" | "pending_first_touch" | "reconciliation_conflict";
 };
 
 function buildMetadata(payload: UnipileNewEmailPayload, threadResolution: EmailMessageMetadata["threadResolution"]): EmailMessageMetadata {
@@ -116,6 +122,113 @@ async function resolveThreadKey(payload: UnipileNewEmailPayload): Promise<{ thre
   return fallback ? { threadKey: fallback, resolution: "fallback_message_id" } : null;
 }
 
+// --- Outbound reconciliation ---
+// EVERY mail Talvia sends is mirrored locally the moment the provider accepts
+// it, keyed on the `provider_id` the send response returned — the only real
+// identifier available at that instant. Minutes later the provider's own
+// mail_sent webhook describes the SAME mail, carrying that provider_id, the
+// canonical Unipile email_id, and enough to resolve the real thread. Without
+// this function the two never meet: the ids differ, so the unique
+// (conversation_id, provider_message_id) index cannot relate them, and one
+// real email becomes two message rows and two `message.sent` activities.
+//
+// It applies to BOTH send paths, deliberately:
+//   - a first touch, whose Conversation still has external_thread_id = NULL
+//     and gets the canonical thread filled in here;
+//   - a threaded reply, whose Conversation already has the right thread and
+//     only needs its message re-keyed.
+// Restricting it to first touches (as an earlier revision did) left the
+// threaded path duplicating every campaign reply and every Inbox reply.
+//
+// Re-keying the message onto the canonical email_id is what makes every LATER
+// arrival collapse onto it: a webhook redelivery and a historical re-import
+// both carry that same email_id.
+//
+// Returns true when it handled this payload — the caller then stops, exactly
+// as it does for any other already-known message.
+async function reconcileOutboundSend(
+  client: import("pg").PoolClient,
+  workspaceId: string,
+  connectionId: string,
+  payload: UnipileNewEmailPayload,
+  thread: { threadKey: string; resolution: EmailMessageMetadata["threadResolution"] },
+): Promise<boolean> {
+  if (!payload.provider_id) return false;
+  const mirrored = await client.query<{ id: string; conversation_id: string; external_thread_id: string | null }>(
+    `select m.id,m.conversation_id,v.external_thread_id
+     from messages m join conversations v on v.id=m.conversation_id
+     where m.workspace_id=$1 and v.connection_id=$2 and m.metadata->>'emailProviderId'=$3
+     limit 1`,
+    [workspaceId, connectionId, payload.provider_id],
+  );
+  const row = mirrored.rows[0];
+  if (!row) return false;
+
+  let resolution: EmailMessageMetadata["threadResolution"] = thread.resolution;
+  let conversationId = row.conversation_id;
+
+  if (row.external_thread_id !== thread.threadKey) {
+    // Does another Conversation on this connection already own the canonical
+    // thread? (A resync that paged this thread in before the webhook landed
+    // is the realistic way this happens.)
+    const owner = await client.query<{ id: string }>(
+      `select id from conversations where connection_id=$1 and external_thread_id=$2`,
+      [connectionId, thread.threadKey],
+    );
+    const ownerId = owner.rows[0]?.id;
+
+    if (!ownerId) {
+      // Nobody owns it: this Conversation becomes the real one. Covers the
+      // normal first touch (NULL -> canonical thread).
+      await client.query(`update conversations set external_thread_id=$2,updated_at=now() where id=$1`, [row.conversation_id, thread.threadKey]);
+    } else if (ownerId !== row.conversation_id) {
+      // Two Conversations now describe one thread. Converge on the one that
+      // genuinely owns the canonical thread by MOVING this message into it —
+      // never by merging thread keys, and never by leaving both alive.
+      const ownerAlreadyHasIt = await client.query<{ id: string }>(
+        `select id from messages where conversation_id=$1 and (provider_message_id=$2 or metadata->>'emailProviderId'=$3)`,
+        [ownerId, payload.email_id, payload.provider_id],
+      );
+      if (ownerAlreadyHasIt.rows[0]) {
+        // The owning Conversation already holds this exact mail. Ours is a
+        // strict duplicate of a better-keyed row; say so rather than silently
+        // leaving two copies of one email in the Inbox.
+        resolution = "reconciliation_conflict";
+        console.error(`[unipile-email] outbound reconciliation: duplicate mirror for conversation ${row.conversation_id}`);
+      } else {
+        await client.query(`update messages set conversation_id=$2 where id=$1`, [row.id, ownerId]);
+        conversationId = ownerId;
+        // Archive the emptied provisional Conversation instead of deleting
+        // it — a modelled state, reversible, and it never had a thread of its
+        // own to lose.
+        await client.query(
+          `update conversations set status='archived',updated_at=now()
+           where id=$1 and external_thread_id is null and not exists (select 1 from messages m where m.conversation_id=$1)`,
+          [row.conversation_id],
+        );
+      }
+    }
+  }
+
+  // Only re-key onto the canonical id when it is genuinely free on the target
+  // conversation — otherwise the webhook's own row already exists there and
+  // the unique index would reject the update.
+  const canonicalIdTaken = await client.query<{ id: string }>(
+    `select id from messages where conversation_id=$1 and provider_message_id=$2 and id<>$3`,
+    [conversationId, payload.email_id, row.id],
+  );
+  const patch: Record<string, unknown> = { threadResolution: resolution };
+  if (payload.message_id) patch.emailMessageId = payload.message_id;
+  await client.query(
+    `update messages set provider_message_id=case when $4 then provider_message_id else $2 end, metadata=metadata||$3::jsonb where id=$1`,
+    [row.id, payload.email_id, JSON.stringify(patch), Boolean(canonicalIdTaken.rows[0])],
+  );
+  if (payload.subject) {
+    await client.query(`update conversations set subject=$2 where id=$1 and (subject is null or subject='')`, [conversationId, payload.subject]);
+  }
+  return true;
+}
+
 export async function ingestEmail(payload: UnipileNewEmailPayload): Promise<IngestResult> {
   const direction = directionForEvent(payload.event);
   if (!direction) return { status: "ignored" };
@@ -146,6 +259,15 @@ export async function ingestEmail(payload: UnipileNewEmailPayload): Promise<Inge
       return { status: "unknown_account" };
     }
     const { id: connectionId, workspace_id: workspaceId } = connectionRow;
+
+    // Before anything is created: is this the webhook for a mail Talvia
+    // itself sent (first touch OR threaded reply)? If so it is already
+    // stored, and the only work left is joining it to its real thread and
+    // canonical id — never a second row, never a second activity.
+    if (direction === "outbound" && await reconcileOutboundSend(client, workspaceId, connectionId, payload, thread)) {
+      await client.query("commit");
+      return { status: "duplicate" };
+    }
 
     const contactId = await findOrCreateContact(client, workspaceId, "email", address, undefined, counterparty?.display_name ?? "");
     const conversationId = await findOrCreateConversation(client, workspaceId, connectionId, "email", thread.threadKey, contactId);
@@ -276,6 +398,221 @@ export async function sendEmailForConversation(
   return { providerMessageId: result.providerId, subject: subject ?? null };
 }
 
+// --- First touch (controlled outbound to a known address, no thread yet) ---
+
+export type FirstTouchResult =
+  | { ok: true; conversationId: string | null; reason?: ReasonCode }
+  | { ok: false; reason: ReasonCode };
+
+// Everything a first touch needs, resolved from Talvia's own state — never
+// from anything a client sent. Read as one query so a Contact that lost its
+// email identity (or a workspace whose email account was disconnected)
+// between campaign setup and execution is caught HERE, at send time, and not
+// merely at audience-selection time (docs brief §13: never trust the
+// frontend, re-check before every send).
+type FirstTouchTarget = { address: string; displayName: string | null; connectionId: string; externalAccountId: string };
+
+async function resolveFirstTouchTarget(workspaceId: string, contactId: string): Promise<{ target: FirstTouchTarget } | { reason: ReasonCode }> {
+  const identity = await database.query<{ identifier: string; display_name: string | null }>(
+    `select ci.identifier, ct.display_name
+     from contact_identities ci
+     join contacts ct on ct.id=ci.contact_id and ct.workspace_id=ci.workspace_id
+     where ci.workspace_id=$1 and ci.contact_id=$2 and ci.channel_type='email' and ct.archived_at is null
+     order by ci.created_at asc
+     limit 1`,
+    [workspaceId, contactId],
+  );
+  const identityRow = identity.rows[0];
+  // normalizeEmail returns '' for anything that is not a real address — a
+  // stored-but-unusable identifier must never reach the provider.
+  if (!identityRow || !normalizeEmail(identityRow.identifier)) return { reason: "EMAIL_IDENTITY_MISSING" };
+
+  const connection = await database.query<{ id: string; external_account_id: string }>(
+    `select id,external_account_id from connections
+     where workspace_id=$1 and provider=$2 and channel_type='email' and status='connected'
+     order by created_at asc limit 1`,
+    [workspaceId, PROVIDER],
+  );
+  const connectionRow = connection.rows[0];
+  if (!connectionRow?.external_account_id) return { reason: "EMAIL_CONNECTION_UNAVAILABLE" };
+
+  return { target: { address: identityRow.identifier, displayName: identityRow.display_name, connectionId: connectionRow.id, externalAccountId: connectionRow.external_account_id } };
+}
+
+// The Conversation a first touch writes into. Two rules, in order:
+//
+// 1. If this Contact already HAS an email Conversation on this connection,
+//    use it. A first touch only means "no thread was known when the audience
+//    was built" — an inbound mail (or a resync) may have created one since,
+//    and a second Conversation for the same person is exactly the split this
+//    whole design exists to prevent.
+//
+// 2. Otherwise create one with external_thread_id = NULL.
+//
+// NULL is the whole point, and it is not a placeholder: the column has been
+// nullable since 005_inbox_persistence.sql, and NULL means precisely "the
+// provider has not told us the thread yet". Putting the send response's
+// `provider_id` there instead would file a MESSAGE identifier in a column
+// whose unique(connection_id, external_thread_id) constraint defines THREAD
+// identity — a value that then looks like a thread to every later reader and
+// collides with nothing when the real thread arrives. Postgres treats NULLs
+// as distinct under a unique constraint, so several provisional rows can
+// coexist safely; reconcileOutboundSend above fills the real value in.
+async function findOrCreateProvisionalEmailConversation(
+  client: import("pg").PoolClient,
+  workspaceId: string,
+  connectionId: string,
+  contactId: string,
+): Promise<string> {
+  const existing = await client.query<{ id: string }>(
+    `select id from conversations
+     where workspace_id=$1 and connection_id=$2 and contact_id=$3 and channel_type='email'
+     order by coalesce(last_message_at,created_at) desc, created_at desc, id desc
+     limit 1`,
+    [workspaceId, connectionId, contactId],
+  );
+  if (existing.rows[0]) return existing.rows[0].id;
+
+  const created = await client.query<{ id: string }>(
+    `insert into conversations(workspace_id,connection_id,contact_id,channel_type,external_thread_id,status)
+     values($1,$2,$3,'email',null,'open') returning id`,
+    [workspaceId, connectionId, contactId],
+  );
+  const conversationId = created.rows[0]!.id;
+  await client.query(
+    `insert into conversation_participants(conversation_id,contact_id,external_participant_id,role) values($1,$2,$3,'sender')
+     on conflict(conversation_id,external_participant_id) do nothing`,
+    [conversationId, contactId, contactId],
+  );
+  return conversationId;
+}
+
+// The first mail of a relationship: a real subject, a real recipient, a real
+// body, and NO reply_to — there is no parent to thread onto yet, and
+// inventing one would be inventing a provider identifier.
+//
+// Ordering is deliberate and not negotiable: the provider call happens
+// BEFORE any transaction is opened (docs/product/ARCHITECTURE.md §31 — never
+// hold a transaction across network I/O), and Talvia only writes what the
+// provider actually confirmed. The Conversation carries NO thread id yet
+// (external_thread_id stays NULL — see the helper above for why that is the
+// honest representation rather than parking the message id there), and the
+// message records threadResolution='pending_first_touch' plus the real
+// `provider_id` the send returned. reconcileOutboundSend above fills in the
+// canonical thread the moment the mail_sent webhook supplies it.
+//
+// When the provider returns no identifier at all, nothing is fabricated: the
+// mail DID go out (so it must never be re-sent), no Conversation is created,
+// and the caller is told so via EMAIL_THREAD_RECONCILIATION_FAILED on an
+// otherwise successful result. The webhook then creates the Conversation
+// normally, since there is no provisional row for it to reconcile against.
+export async function sendFirstTouchEmail(args: {
+  workspaceId: string;
+  contactId: string;
+  subject: string;
+  body: string;
+  idempotencyKey?: string;
+}): Promise<FirstTouchResult> {
+  const config = getUnipileConfig();
+  if (!config) return { ok: false, reason: "EMAIL_CONNECTION_UNAVAILABLE" };
+
+  const subject = args.subject.trim();
+  if (!subject) return { ok: false, reason: "EMAIL_SUBJECT_MISSING" };
+
+  const resolved = await resolveFirstTouchTarget(args.workspaceId, args.contactId);
+  if ("reason" in resolved) return { ok: false, reason: resolved.reason };
+  const { target } = resolved;
+
+  let sent: Awaited<ReturnType<typeof sendEmail>>;
+  try {
+    sent = await sendEmail(config, {
+      accountId: target.externalAccountId,
+      to: [{ identifier: target.address, ...(target.displayName ? { display_name: target.displayName } : {}) }],
+      subject,
+      body: args.body,
+      ...(args.idempotencyKey ? { idempotencyKey: args.idempotencyKey } : {}),
+    });
+  } catch (error) {
+    // Two genuinely different outcomes, never conflated:
+    //  - the provider ANSWERED and refused: nothing was sent, retrying is
+    //    free, and the participant is immediately retry-eligible;
+    //  - the provider never answered (timeout, dropped connection): whether a
+    //    real person received this mail is UNKNOWN. Retrying it is the one
+    //    path that can produce a second real email, and its only protection
+    //    is the provider honouring the Idempotency-Key header. The caller is
+    //    told which case this is so it does not retry an unknown outcome in
+    //    the same minute.
+    const providerAnswered = typeof error === "object" && error !== null && "providerAnswered" in error;
+    console.error(`[unipile-email] first-touch send ${providerAnswered ? "refused" : "outcome unknown"} for contact ${args.contactId}`, error);
+    return { ok: false, reason: providerAnswered ? "EMAIL_FIRST_TOUCH_SEND_FAILED" : "EMAIL_SEND_OUTCOME_UNKNOWN" };
+  }
+
+  if (!sent.providerId) return { ok: true, conversationId: null, reason: "EMAIL_THREAD_RECONCILIATION_FAILED" };
+
+  const client = await database.connect();
+  try {
+    await client.query("begin");
+
+    // The webhook (or a historical resync) can legitimately reach us BEFORE
+    // this transaction runs — the provider fires mail_sent as soon as it
+    // accepts, and that is a separate inbound HTTP request racing this one.
+    // If the mail is already mirrored, this is not a second mail; adopt what
+    // is there rather than writing a second Conversation and a second
+    // message for one real email.
+    const already = await client.query<{ conversation_id: string }>(
+      `select m.conversation_id from messages m join conversations v on v.id=m.conversation_id
+       where m.workspace_id=$1 and v.connection_id=$2 and m.metadata->>'emailProviderId'=$3
+       limit 1`,
+      [args.workspaceId, target.connectionId, sent.providerId],
+    );
+    if (already.rows[0]) {
+      await client.query("commit");
+      return { ok: true, conversationId: already.rows[0].conversation_id };
+    }
+
+    const conversationId = await findOrCreateProvisionalEmailConversation(client, args.workspaceId, target.connectionId, args.contactId);
+    await client.query(`update conversations set subject=$2 where id=$1 and (subject is null or subject='')`, [conversationId, subject]);
+    await client.query(
+      `insert into messages(workspace_id,conversation_id,direction,body,status,provider_message_id,sent_at,metadata)
+       values($1,$2,'outbound',$3,'sent',$4,now(),$5::jsonb)
+       on conflict(conversation_id,provider_message_id) where provider_message_id is not null do nothing`,
+      [
+        args.workspaceId,
+        conversationId,
+        args.body,
+        sent.providerId,
+        JSON.stringify({ subject, emailProviderId: sent.providerId, to: [target.address], threadResolution: "pending_first_touch" } satisfies EmailMessageMetadata),
+      ],
+    );
+    await client.query(`update conversations set last_message_at=now(),updated_at=now() where id=$1`, [conversationId]);
+    // Same conversation-level activity a threaded send records (see
+    // unipile-adapter.ts's sendMessage). Without it, an Automation triggered
+    // on 'message.sent' would fire for a relance and stay silent for a first
+    // touch — the same business event behaving differently depending on
+    // which delivery path happened to be used. Recorded inside the
+    // transaction, dispatched only after it commits.
+    const activity = await recordSystemActivity(args.workspaceId, {
+      eventType: "message.sent",
+      entityType: "conversation",
+      entityId: conversationId,
+      metadata: { conversationId, connectionId: target.connectionId },
+    }, client);
+    await client.query("commit");
+    await dispatchCommittedActivity(activity);
+    return { ok: true, conversationId };
+  } catch (error) {
+    await client.query("rollback");
+    // The mail is already out. Reporting this as a send failure would make
+    // the engine retry a message a real person has received, so it is
+    // reported as what it is: sent, mirror not written, reconcilable by the
+    // webhook.
+    console.error(`[unipile-email] first-touch persistence failed for contact ${args.contactId}`, error);
+    return { ok: true, conversationId: null, reason: "EMAIL_THREAD_RECONCILIATION_FAILED" };
+  } finally {
+    client.release();
+  }
+}
+
 // --- Historical import ---
 // Shares the chat backfill's discipline (provider fetch outside the
 // transaction, short write transactions, idempotent upsert, imported=true,
@@ -372,6 +709,28 @@ export async function persistImportedEmails(workspaceId: string, connectionId: s
   try {
     await client.query("begin");
 
+    // A mail Talvia itself sent is already mirrored locally, keyed on the
+    // send response's provider_id — a DIFFERENT key from the email_id this
+    // import uses, so ON CONFLICT cannot see it and the page would insert a
+    // second row for one real email. Only OUTBOUND mails can have been
+    // mirrored that way, so the lookup is restricted to those and skipped
+    // entirely when a page has none (the overwhelmingly common case, and
+    // always the case on a first backfill).
+    const outboundProviderIds = items
+      .filter((item) => item.direction === "outbound" && item.email.provider_id)
+      .map((item) => item.email.provider_id!);
+    let alreadyMirrored = new Set<string>();
+    if (outboundProviderIds.length) {
+      const mirrored = await client.query<{ pid: string }>(
+        `select m.metadata->>'emailProviderId' as pid
+         from messages m join conversations v on v.id=m.conversation_id
+         where m.workspace_id=$1 and v.connection_id=$2 and m.direction='outbound'
+           and m.metadata->>'emailProviderId' = any($3::text[])`,
+        [workspaceId, connectionId, outboundProviderIds],
+      );
+      alreadyMirrored = new Set(mirrored.rows.map((row) => row.pid));
+    }
+
     // Within one page the same address and the same thread recur constantly
     // (a thread is several emails). Resolving each once collapses the bulk of
     // the remaining per-email round trips, and makes a thread's Contact
@@ -381,6 +740,7 @@ export async function persistImportedEmails(workspaceId: string, connectionId: s
     const rows: ImportedMessageRow[] = [];
 
     for (const item of items) {
+      if (item.email.provider_id && alreadyMirrored.has(item.email.provider_id)) continue;
       let contactId = contactByAddress.get(item.normalizedAddress);
       if (!contactId) {
         contactId = await findOrCreateContact(client, workspaceId, "email", item.address, undefined, item.displayName);
@@ -408,6 +768,14 @@ export async function persistImportedEmails(workspaceId: string, connectionId: s
         timestamp: item.email.date,
         metadataJson: importedMetadata(item),
       });
+    }
+
+    // A page can now legitimately end up with nothing to write (every mail on
+    // it was already mirrored by a Talvia send). buildImportedEmailInsert on
+    // an empty list would emit `values ` with no tuples — a syntax error.
+    if (!rows.length) {
+      await client.query("commit");
+      return { messagesInserted: 0, threadsTouched: conversationByThread.size };
     }
 
     const insert = buildImportedEmailInsert(rows);
