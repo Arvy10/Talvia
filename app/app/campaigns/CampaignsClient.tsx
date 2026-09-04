@@ -12,7 +12,6 @@ const channels: Array<{ id: ChannelId; label: string; note: string }> = [
   { id: "linkedin", label: "LinkedIn", note: "Prospection professionnelle et suivi de relations." },
   { id: "whatsapp", label: "WhatsApp", note: "Relances et réactivation de contacts existants." },
   { id: "gmail", label: "E-mail", note: "Suivi, relances et propositions vers des adresses déjà connues." },
-  { id: "gmail", label: "Email", note: "Campagnes ciblées vers vos contacts connus." },
 ];
 const objectives = [
   ["Prospecter", "Trouver ou contacter de nouvelles opportunités commerciales."],
