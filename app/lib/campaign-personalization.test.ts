@@ -1552,3 +1552,375 @@ describe("generateEmailParticipantPersonalization — first touch (no thread yet
     expect(result).toEqual({ ok: false, reason: "NOT_ELIGIBLE" });
   });
 });
+
+// --- Business Context + Campaign Intent + Prospect Evidence -> Sales Angle -> Message ---
+// Before this architecture, the prospecting generator received two Business
+// Context fields (companyName, businessDescription), never read
+// campaigns.objective, and could only legally assert something if it ended in
+// a question mark — so its one reliable output was a generic open question.
+
+const scored = <T,>(value: T) => ({ value, provenance: "fact" as const, confidence: 0.9 });
+
+function richBusinessContext(): BusinessContextRecord {
+  return {
+    companyName: "Talvia",
+    businessDescription: "Un systeme de vente conversationnel pour equipes commerciales.",
+    valueProposition: scored("Centraliser LinkedIn, WhatsApp et e-mail dans un seul suivi commercial"),
+    services: ["Accompagnement au demarrage"],
+    products: ["Inbox unifiee", "Campagnes multicanal"],
+    painPoints: scored(["Prospects perdus entre les canaux", "Relances oubliees"]),
+    salesAngles: scored(["Montrer le cout des relances manquees"]),
+  } as BusinessContextRecord;
+}
+
+function seedCampaignWithObjective(campaignId: string, objective: string, template: string | null = null) {
+  fakeDatabase.campaigns.push({ id: campaignId, workspace_id: workspaceId, objective });
+  fakeDatabase.campaignSteps.push({ id: `${campaignId}-message`, campaign_id: campaignId, position: 1, step_type: "message", message_template: template });
+}
+
+// seedCampaignWithObjective uses the LinkedIn step-id convention
+// ("<campaign>-message"), not the WhatsApp one firstMessage() assumes.
+function linkedInMessage(personalization: { messages: MessageArtifact[] }, campaignId = "camp-1") {
+  return personalization.messages.find((m) => m.stepId === `${campaignId}-message`)!;
+}
+
+function promptOf(callIndex = 0): string {
+  return generateStructuredMock.mock.calls[callIndex]![0].prompt as string;
+}
+function withProvider() {
+  getAIProviderMock.mockReturnValue({ model: "test-model", generateStructured: generateStructuredMock });
+}
+function mockArtifacts(invitation: Record<string, unknown>, message: Record<string, unknown>) {
+  generateStructuredMock.mockResolvedValueOnce({
+    data: { invitation, message },
+    model: "test-model",
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+}
+
+describe("OFFERING — the commercial substance actually reaches the generator", () => {
+  it("1. a prospecting campaign receives the full commercial Business Context, not just name + description", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1", { headline: "Directrice marketing", company: "Acme" });
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+    withProvider();
+    mockArtifacts(
+      { text: "Bonjour Awa, chez Talvia nous centralisons le suivi commercial.", usedFactTypes: ["name"], usedOfferingFields: ["companyName", "valueProposition"] },
+      { text: "Nous traitons surtout les relances oubliees. Cela vous parle ?", usedFactTypes: [], usedOfferingFields: ["painPoints"] },
+    );
+
+    await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    const prompt = promptOf();
+    expect(prompt).toContain("=== OFFERING");
+    // The five fields that were previously loaded and then dropped.
+    expect(prompt).toContain("Centraliser LinkedIn, WhatsApp et e-mail");
+    expect(prompt).toContain("Inbox unifiee");
+    expect(prompt).toContain("Accompagnement au demarrage");
+    expect(prompt).toContain("Relances oubliees");
+    expect(prompt).toContain("Montrer le cout des relances manquees");
+  });
+
+  it("2. a known value proposition / product may be ASSERTED, not only questioned", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1", { company: "Acme" });
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+    withProvider();
+    // An assertive sentence citing ZERO prospect facts. Under the old single
+    // grounding rule this was rejected for not ending in "?".
+    mockArtifacts(
+      { text: "Bonjour, nous centralisons LinkedIn, WhatsApp et e-mail dans un seul suivi.", usedFactTypes: [], usedOfferingFields: ["valueProposition"] },
+      { text: "Talvia propose une Inbox unifiee et des campagnes multicanal.", usedFactTypes: [], usedOfferingFields: ["products"] },
+    );
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = linkedInMessage(result.personalization);
+    expect(message.generatedText).toBe("Talvia propose une Inbox unifiee et des campagnes multicanal.");
+    expect(message.generationMode).toBe("ai_grounded");
+  });
+
+  it("3. citing an OFFERING field the workspace does not actually have is rejected", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1");
+    // Minimal context: no products, no value proposition.
+    getActiveBusinessContextMock.mockResolvedValue({ companyName: "Talvia", businessDescription: "Un outil commercial." } as BusinessContextRecord);
+    withProvider();
+    mockArtifacts(
+      { text: "Bonjour.", usedFactTypes: ["name"], usedOfferingFields: ["companyName"] },
+      { text: "Notre produit phare repond exactement a ce besoin.", usedFactTypes: [], usedOfferingFields: ["products"] },
+    );
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(linkedInMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+});
+
+describe("grounding — two regimes, never merged", () => {
+  it("4. a claim about the PROSPECT with no evidence is still forbidden", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1"); // name only
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+    withProvider();
+    mockArtifacts(
+      { text: "Bonjour.", usedFactTypes: ["name"], usedOfferingFields: [] },
+      // Asserts the prospect's situation while citing only an OFFERING field.
+      { text: "Vous perdez des prospects entre vos canaux.", usedFactTypes: ["pain_observed"], usedOfferingFields: ["painPoints"] },
+    );
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    // "pain_observed" is not an observed fact type -> rejected.
+    expect(linkedInMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+  });
+
+  it("5. OFFERING never becomes evidence ABOUT the prospect", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1", { company: "Acme" });
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+    withProvider();
+    mockArtifacts({ text: "Bonjour.", usedFactTypes: [], usedOfferingFields: ["companyName"] }, { text: "Bonjour.", usedFactTypes: [], usedOfferingFields: ["companyName"] });
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    // The persisted evidence describes the prospect only — no offering value
+    // ever lands in observedFacts, and the prompt keeps them in separate blocks.
+    const observedValues = result.personalization.evidence.observedFacts.map((fact) => fact.value);
+    expect(observedValues).not.toContain("Inbox unifiee");
+    expect(observedValues.some((value) => value.includes("Centraliser LinkedIn"))).toBe(false);
+    const prompt = promptOf();
+    const evidenceSection = prompt.split("=== OFFERING")[0]!;
+    expect(evidenceSection).toContain("=== PROSPECT EVIDENCE");
+    expect(evidenceSection).not.toContain("Inbox unifiee");
+  });
+
+  it("6. an invented price / free trial / discount / guarantee is rejected even when the model claims it is grounded", async () => {
+    const invented = [
+      "Notre offre est a 49 euros par mois.",
+      "Profitez d'un essai gratuit de 14 jours.",
+      "Nous offrons 30% de remise ce mois-ci.",
+      "Satisfait ou rembourse, garantie incluse.",
+      "Plus de 500 clients nous font confiance.",
+    ];
+    for (const text of invented) {
+      fakeDatabase = createFakeDatabase();
+      generateStructuredMock.mockReset();
+      getAIProviderMock.mockReset();
+      seedCampaignWithObjective("camp-1", "prospecting");
+      seedParticipant("camp-1", "part-1", "contact-1");
+      seedCandidate("camp-1", "contact-1");
+      getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+      withProvider();
+      mockArtifacts({ text: "Bonjour.", usedFactTypes: ["name"], usedOfferingFields: [] }, { text, usedFactTypes: [], usedOfferingFields: ["valueProposition"] });
+
+      const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("unreachable");
+      const message = linkedInMessage(result.personalization);
+      expect(message.generatedText, `invented claim leaked: ${text}`).not.toBe(text);
+      expect(message.generationMode).toBe("deterministic_fallback");
+    }
+  });
+
+  it("7. the SAME commercial wording is allowed when the workspace's own offering really says it", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1");
+    getActiveBusinessContextMock.mockResolvedValue({
+      companyName: "Talvia",
+      businessDescription: "Un systeme de vente conversationnel.",
+      valueProposition: scored("Demarrage accompagne avec un essai de 14 jours"),
+    } as BusinessContextRecord);
+    withProvider();
+    mockArtifacts(
+      { text: "Bonjour.", usedFactTypes: ["name"], usedOfferingFields: [] },
+      { text: "Nous proposons un essai de 14 jours pour demarrer.", usedFactTypes: [], usedOfferingFields: ["valueProposition"] },
+    );
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    // The claim is not invented — it is in the Business Context — so it stands.
+    expect(linkedInMessage(result.personalization).generationMode).toBe("ai_grounded");
+  });
+});
+
+describe("CAMPAIGN INTENT — the objective really reaches the generator", () => {
+  const promptFor = async (objective: string) => {
+    fakeDatabase = createFakeDatabase();
+    generateStructuredMock.mockReset();
+    getAIProviderMock.mockReset();
+    seedCampaignWithObjective("camp-1", objective);
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1", { company: "Acme" });
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+    withProvider();
+    mockArtifacts({ text: "Bonjour.", usedFactTypes: ["name"], usedOfferingFields: [] }, { text: "Bonjour.", usedFactTypes: ["name"], usedOfferingFields: [] });
+    await generateParticipantPersonalization(context, "camp-1", "part-1");
+    return promptOf();
+  };
+
+  it("8. campaigns.objective is loaded and named in the prompt", async () => {
+    const prompt = await promptFor("prospecting");
+    expect(prompt).toContain("=== CAMPAIGN INTENT");
+    expect(prompt).toContain("prospecting");
+  });
+
+  it("9. prospecting, follow_up and reactivation are no longer semantically identical", async () => {
+    const prospecting = await promptFor("prospecting");
+    const followUp = await promptFor("follow_up");
+    const reactivation = await promptFor("reactivation");
+
+    const intentOf = (prompt: string) => prompt.split("=== CAMPAIGN INTENT")[1]!.split("=== SALES ANGLE")[0]!;
+    expect(intentOf(prospecting)).not.toBe(intentOf(followUp));
+    expect(intentOf(followUp)).not.toBe(intentOf(reactivation));
+    expect(intentOf(prospecting)).not.toBe(intentOf(reactivation));
+
+    // And each says something specific to its own commercial situation.
+    expect(intentOf(prospecting)).toContain("ne connaît pas l'expéditeur");
+    expect(intentOf(followUp)).toContain("relation existe déjà");
+    expect(intentOf(reactivation)).toContain("sans reproche");
+  });
+
+  it("10. prospecting instructs against asking the prospect to introduce themselves", async () => {
+    const prompt = await promptFor("prospecting");
+    expect(prompt).toContain("pouvez-vous me parler de votre entreprise");
+    expect(prompt).toContain("N'utilise PAS");
+  });
+});
+
+describe("deterministic fallback — honest, limited, and no longer discarding the founder's text", () => {
+  it("11. without a provider, the founder's own message_template is used instead of being thrown away", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting", "Bonjour {first_name}, je vous ecris au sujet de {company}.");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1", { company: "Acme" });
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+    // getAIProviderMock stays null by default -> no LLM at all.
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = linkedInMessage(result.personalization);
+    expect(message.generatedText).toBe("Bonjour Awa, je vous ecris au sujet de Acme.");
+    expect(generateStructuredMock).not.toHaveBeenCalled();
+  });
+
+  it("12. the fallback stays labelled deterministic_fallback with no model name", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting", "Bonjour {first_name}.");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1");
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(linkedInMessage(result.personalization).generationMode).toBe("deterministic_fallback");
+    expect(result.personalization.aiModel).toBeNull();
+  });
+
+  it("13. with no guidance, the fallback presents the known offer instead of asking the prospect to explain theirs", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1", { company: "Acme" });
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const text = linkedInMessage(result.personalization).generatedText!;
+    expect(text).toBe("Bonjour Awa, je travaille chez Talvia — centraliser LinkedIn, WhatsApp et e-mail dans un seul suivi commercial. Est-ce un sujet sur lequel vous travaillez chez Acme ?");
+    expect(text.toLowerCase()).not.toContain("parler de votre entreprise");
+  });
+
+  it("14. with NOTHING known, the fallback stays short and honest rather than inventing", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1");
+    getActiveBusinessContextMock.mockResolvedValue(null);
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const text = linkedInMessage(result.personalization).generatedText!;
+    expect(text.toLowerCase()).not.toContain("parler de votre entreprise");
+    // Nothing commercial is claimed, because nothing commercial is known.
+    expect(text).not.toContain("Talvia");
+    expect(text.length).toBeLessThan(200);
+  });
+});
+
+describe("SALES ANGLE — derived, not templated", () => {
+  it("15. the angle changes with the offering and reports the basis it actually rests on", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1", { role: "Directrice marketing", company: "Acme" });
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const angle = result.personalization.outreachAngle!;
+    // relevantOffer is SELECTED from real data (valueProposition first).
+    expect(angle.relevantOffer).toBe("Centraliser LinkedIn, WhatsApp et e-mail dans un seul suivi commercial");
+    // whyContactThisPerson comes from observed facts, never from targeting.
+    expect(angle.whyContactThisPerson).toContain("Directrice marketing");
+    // Both sides of the basis are reported.
+    expect(angle.evidenceUsed).toContain("role");
+    expect(angle.evidenceUsed).toContain("offering:valueProposition");
+  });
+
+  it("16. with no offering at all, the angle says so instead of inventing a reason", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1");
+    getActiveBusinessContextMock.mockResolvedValue(null);
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const angle = result.personalization.outreachAngle!;
+    expect(angle.relevantOffer).toBe("");
+    expect(angle.conversationGoal).toContain("Aucune matière commerciale connue");
+  });
+});
+
+describe("approvedText remains the only sendable source", () => {
+  it("17. generation never produces an approved text, whichever path ran", async () => {
+    seedCampaignWithObjective("camp-1", "prospecting", "Bonjour {first_name}.");
+    seedParticipant("camp-1", "part-1", "contact-1");
+    seedCandidate("camp-1", "contact-1", { company: "Acme" });
+    getActiveBusinessContextMock.mockResolvedValue(richBusinessContext());
+
+    const result = await generateParticipantPersonalization(context, "camp-1", "part-1");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    const message = linkedInMessage(result.personalization);
+    expect(message.status).toBe("generated");
+    expect(message.approvedText).toBeNull();
+    expect(result.personalization.invitation.status).toBe("generated");
+    expect(result.personalization.invitation.approvedText).toBeNull();
+  });
+});

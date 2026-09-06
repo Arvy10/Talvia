@@ -45,6 +45,106 @@ export type PersonalizationEvidence = {
   uncertainties: string[];
 };
 
+// --- OFFERING ---
+// What the SENDER may legitimately assert about itself. A projection of the
+// Business Context record that already exists — not a copy of it, not a new
+// table, no migration: every field below is read straight from
+// business_contexts, which has carried them since 008_business_context.sql.
+// They were loaded and then dropped before reaching the generator, which is
+// exactly why a prospecting message had nothing commercial to say.
+//
+// ScoredField values are unwrapped to their `.value` here: provenance and
+// confidence govern whether a human trusts the Business Context screen, not
+// whether a sentence may state what the company sells.
+export type Offering = {
+  companyName: string | null;
+  businessDescription: string | null;
+  valueProposition: string | null;
+  services: string[];
+  products: string[];
+  painPoints: string[];
+  salesAngles: string[];
+};
+
+// The named fields a generated sentence may cite as "this claim is about our
+// own offer". Anything outside this list is, by construction, something
+// Talvia does not know — see isSupportedOfferingUse.
+export type OfferingField = keyof Offering;
+
+const EMPTY_OFFERING: Offering = {
+  companyName: null, businessDescription: null, valueProposition: null,
+  services: [], products: [], painPoints: [], salesAngles: [],
+};
+
+export function buildOffering(businessContext: BusinessContextRecord | null): Offering {
+  if (!businessContext) return { ...EMPTY_OFFERING };
+  return {
+    companyName: businessContext.companyName,
+    businessDescription: businessContext.businessDescription,
+    valueProposition: businessContext.valueProposition?.value ?? null,
+    services: businessContext.services ?? [],
+    products: businessContext.products ?? [],
+    painPoints: businessContext.painPoints?.value ?? [],
+    salesAngles: businessContext.salesAngles?.value ?? [],
+  };
+}
+
+// Which offering fields actually carry something. A model citing a field
+// that is empty is citing something Talvia never knew.
+export function populatedOfferingFields(offering: Offering): Set<OfferingField> {
+  const filled = new Set<OfferingField>();
+  if (offering.companyName?.trim()) filled.add("companyName");
+  if (offering.businessDescription?.trim()) filled.add("businessDescription");
+  if (offering.valueProposition?.trim()) filled.add("valueProposition");
+  if (offering.services.length) filled.add("services");
+  if (offering.products.length) filled.add("products");
+  if (offering.painPoints.length) filled.add("painPoints");
+  if (offering.salesAngles.length) filled.add("salesAngles");
+  return filled;
+}
+
+export function hasSellableOffering(offering: Offering): boolean {
+  const filled = populatedOfferingFields(offering);
+  return filled.has("valueProposition") || filled.has("products") || filled.has("services") || filled.has("businessDescription");
+}
+
+// --- CAMPAIGN INTENT ---
+// campaigns.objective is an existing enum column that this path never read —
+// so a prospecting campaign, a follow-up and a reactivation all produced the
+// same text. It is not a tone setting: it decides what the message is FOR,
+// and therefore what next step it may legitimately propose.
+//
+// `goal`/`stance`/`nextStep` are inputs to a generator, never sentences to
+// paste into a message (rule 7: the model chooses its own wording).
+export type CampaignIntent = {
+  objective: CampaignObjective;
+  goal: string;
+  stance: string;
+  nextStep: string;
+};
+
+const CAMPAIGN_INTENTS: Record<CampaignObjective, Omit<CampaignIntent, "objective">> = {
+  prospecting: {
+    goal: "Faire découvrir ce que propose l'expéditeur et donner une raison concrète d'y prêter attention maintenant.",
+    stance: "Première prise de contact : la personne ne connaît pas l'expéditeur. C'est à l'expéditeur d'apporter la matière — ce qu'il fait, pour qui, quel problème il traite — pas au prospect de se présenter. Ne demande donc pas au prospect d'expliquer son activité comme substitut à une proposition.",
+    nextStep: "Proposer une prochaine étape commerciale légère et concrète (un échange court, une question précise à laquelle répondre).",
+  },
+  follow_up: {
+    goal: "Reprendre le fil d'une relation déjà engagée et faire avancer ce qui était en cours.",
+    stance: "La relation existe déjà. Ne te represente pas comme un inconnu et ne réexplique pas l'offre depuis zéro. N'affirme jamais qu'une action précise était promise ou attendue, sauf si une evidence du prospect le prouve.",
+    nextStep: "Proposer la suite logique de ce qui était déjà engagé.",
+  },
+  reactivation: {
+    goal: "Renouer un contact devenu inactif en redonnant une raison actuelle de reparler.",
+    stance: "Le lien s'est distendu. Reprends contact sans reproche et sans supposer ni expliquer pourquoi la personne n'a pas répondu — le silence ne prouve aucun sentiment ni aucune raison. Un rappel bref de ce que fait l'expéditeur est légitime.",
+    nextStep: "Proposer une reprise de contact à faible engagement.",
+  },
+};
+
+export function buildCampaignIntent(objective: CampaignObjective): CampaignIntent {
+  return { objective, ...CAMPAIGN_INTENTS[objective] };
+}
+
 export type OutreachAngle = {
   whyContactThisPerson: string;
   relevantOffer: string;
@@ -159,6 +259,68 @@ export function buildPersonalizationEvidence(candidate: CandidateFacts, strategy
   return { observedFacts, qualificationContext, strategyContext, uncertainties };
 }
 
+// --- SALES ANGLE ---
+// Offering x Campaign Intent x Prospect Evidence -> the angle.
+//
+// Derived by SELECTION over what is actually known, never assembled from a
+// fixed list of sentences: each field below picks the most specific real
+// datum available and degrades explicitly when nothing is. Two workspaces
+// with different Business Contexts therefore get different angles, and a
+// workspace with nothing gets an angle that says so instead of inventing a
+// reason.
+//
+// The angle is reasoning, not copy. It steers the generator and is shown to
+// the human reviewer; no part of it is pasted into a message.
+export function buildSalesAngle(offering: Offering, intent: CampaignIntent, evidence: PersonalizationEvidence): OutreachAngle {
+  const factTypes = new Set(evidence.observedFacts.map((fact) => fact.type));
+  const filled = populatedOfferingFields(offering);
+
+  // Why this person: the most specific thing genuinely observed about them.
+  // Never the campaign's targeting criteria — those describe who is being
+  // looked for, not who this person is.
+  const roleFact = evidence.observedFacts.find((fact) => fact.type === "role") ?? evidence.observedFacts.find((fact) => fact.type === "headline");
+  const companyFact = evidence.observedFacts.find((fact) => fact.type === "company");
+  const whyContactThisPerson = roleFact && companyFact
+    ? `Fonction observée : ${roleFact.value} — chez ${companyFact.value}.`
+    : roleFact
+      ? `Fonction observée : ${roleFact.value}.`
+      : companyFact
+        ? `Entreprise observée : ${companyFact.value}. Fonction inconnue.`
+        : "Aucun attribut individuel observé au-delà du nom — l'angle ne peut reposer que sur l'offre.";
+
+  // What we can put in front of them: the most specific offering datum we
+  // actually hold, in decreasing order of commercial precision.
+  const relevantOffer = filled.has("valueProposition")
+    ? offering.valueProposition!
+    : filled.has("products")
+      ? offering.products.join(", ")
+      : filled.has("services")
+        ? offering.services.join(", ")
+        : filled.has("businessDescription")
+          ? offering.businessDescription!
+          : "";
+
+  const conversationGoal = relevantOffer
+    ? `${intent.goal} ${intent.nextStep}`
+    : `${intent.goal} Aucune matière commerciale connue : rester sur une prise de contact honnête, sans décrire d'offre.`;
+
+  const tone = intent.objective === "prospecting"
+    ? "direct, concret, sans pression ni flatterie"
+    : intent.objective === "reactivation"
+      ? "chaleureux, sans reproche, faible engagement"
+      : "familier de la relation, orienté suite concrète";
+
+  return {
+    whyContactThisPerson,
+    relevantOffer,
+    // What the angle actually rests on, both sides — the prospect facts used
+    // and the offering fields used, so the reviewer sees its real basis.
+    evidenceUsed: [...factTypes, ...[...filled].map((field) => `offering:${field}`)],
+    conversationGoal,
+    tone,
+  };
+}
+
 // Secondary, narrow safety net (docs spec §5) — NOT the primary defense
 // anymore. Catches a handful of named categories Talvia never actually
 // collects data for, regardless of how the text is phrased. The primary
@@ -191,54 +353,137 @@ function containsUnsupportedClaim(text: string): boolean {
 // This does NOT verify the citation is semantically honest (the model
 // could cite a real type without the sentence truly needing it) — that
 // residual trust gap is disclosed, not hidden; see the Phase 3B report.
-function isGroundedText(text: string, usedFactTypes: string[], observedFactTypes: Set<string>): boolean {
+// Commercial terms Talvia holds NO field for anywhere in business_contexts:
+// price, free trial, duration, discount, guarantee, named social proof. The
+// only way such a claim can be legitimate is if the workspace's own offering
+// text already says it — so it is checked against that text, not against a
+// permission the model grants itself.
+const UNSUPPORTED_OFFER_PATTERNS: RegExp[] = [
+  /\b\d+\s?(?:€|\$|eur|euros|usd|dollars)\b|\b(?:gratuit|gratuite|sans frais|offert|offerte)\b/i,
+  /\bessai\b|\bfree trial\b|\bd[ée]mo gratuite\b/i,
+  /\b(?:remise|r[ée]duction|promo(?:tion)?)\b|-\s?\d+\s?%|\d+\s?% de (?:remise|r[ée]duction)/i,
+  /\b(?:garantie|remboursement)\b|satisfait ou rembours[ée]/i,
+  /\b(?:en|sous) \d+ (?:jours?|semaines?|mois)\b/i,
+  /\b\d+\s?(?:clients|entreprises|utilisateurs)\b|\bleader du march[ée]\b|\bn°\s?1\b|\bnum[ée]ro un\b/i,
+];
+
+// True when the text makes one of those claims WITHOUT the workspace's own
+// offering text containing the same vocabulary. Deliberately conservative:
+// a false positive costs a safe fallback, a false negative puts an invented
+// commercial promise in front of a real prospect.
+function containsUnsupportedOfferClaim(text: string, offering: Offering): boolean {
+  const offeringText = [
+    offering.businessDescription, offering.valueProposition,
+    ...offering.services, ...offering.products, ...offering.painPoints, ...offering.salesAngles,
+  ].filter(Boolean).join(" ");
+  return UNSUPPORTED_OFFER_PATTERNS.some((pattern) => pattern.test(text) && !pattern.test(offeringText));
+}
+
+// The PRIMARY grounding check, now on TWO axes instead of one.
+//
+// The previous single rule ("a sentence citing no prospect fact is only
+// valid if it ends in a question mark") was written when the generator had
+// no commercial material at all. It made every non-question assertive
+// sentence illegal, so the only legal output for a prospect Talvia knows
+// little about was a generic open question — which is precisely the
+// "pouvez-vous me parler de votre entreprise ?" failure. The rule was not
+// wrong about the PROSPECT; it was applied to statements about OURSELVES,
+// where it never belonged.
+//
+// The two axes are now separate, because their proof obligations are:
+//   - a claim about the PROSPECT must be backed by Prospect Evidence;
+//   - a claim about OUR company/offer must be backed by a populated
+//     OFFERING field;
+//   - anything backed by neither may only be a question;
+//   - qualification/targeting is neither, and can never license either
+//     (enforced upstream: it never enters observedFacts).
+function isGroundedText(
+  text: string,
+  usedFactTypes: string[],
+  observedFactTypes: Set<string>,
+  usedOfferingFields: string[],
+  populatedOffering: Set<OfferingField>,
+): boolean {
+  // 1. Every cited prospect fact must really have been observed.
   if (!usedFactTypes.every((type) => observedFactTypes.has(type))) return false;
+  // 2. Every cited offering field must really carry something. Citing an
+  //    empty field is citing something Talvia never knew.
+  if (!usedOfferingFields.every((field) => populatedOffering.has(field as OfferingField))) return false;
+  // 3. An assertion resting on nothing at all stays illegal — but presenting
+  //    our own offer now counts as resting on something.
   const isQuestion = text.trim().endsWith("?");
-  if (usedFactTypes.length === 0 && !isQuestion) return false;
+  if (usedFactTypes.length === 0 && usedOfferingFields.length === 0 && !isQuestion) return false;
   return true;
 }
 
-// Uses ONLY observedFacts + Business Context (docs spec §9) — never
-// qualification.reasons turned into a sentence, never a strategy company
-// type asserted as this prospect's own attribute. `targetType` below
-// describes what TALVIA works with (legitimate business-context-shaped
-// information), phrased as a question about relevance — never as "Acme is
-// an agency".
-function deterministicFallback(candidate: CandidateFacts, businessContext: BusinessContextRecord | null, strategy: CampaignStrategy | null, evidence: PersonalizationEvidence): { outreachAngle: OutreachAngle; invitationNote: string; message: string } {
+// The no-provider path. It is NOT a lesser copy of the AI path: it reasons
+// from the same Sales Angle, and it is honest about being limited.
+//
+// Two things it must never do again:
+//  - throw away the founder's own text. `guidance` is campaign_steps
+//    .message_template, i.e. the message the user wrote in the wizard. It
+//    used to be forwarded only into the LLM prompt, so with no provider it
+//    was silently discarded and replaced by a hardcoded sentence. When it
+//    exists it is now the message, with the same {first_name}/{company}
+//    substitution the conversation channels already use.
+//  - ask the prospect to introduce themselves. In prospecting it is the
+//    sender's job to bring the substance; "pouvez-vous me parler de votre
+//    entreprise ?" was the symptom of having none to bring.
+//
+// What it will not do is pretend: with no offering and no guidance it stays
+// short and says only what is true, rather than filling the gap.
+function deterministicFallback(
+  candidate: CandidateFacts,
+  offering: Offering,
+  intent: CampaignIntent,
+  angle: OutreachAngle,
+  evidence: PersonalizationEvidence,
+  guidance?: string,
+): { invitationNote: string; message: string } {
   const firstName = candidate.name.split(/\s+/)[0] || candidate.name;
-  const hasRole = evidence.observedFacts.some((fact) => fact.type === "role" || fact.type === "headline");
+  const contact = { name: candidate.name, firstName, company: candidate.company ?? null };
   const hasCompany = evidence.observedFacts.some((fact) => fact.type === "company");
-  const targetType = strategy?.companyTypes[0];
 
-  const outreachAngle: OutreachAngle = {
-    whyContactThisPerson: hasRole ? "Le profil correspond au rôle ciblé par la campagne." : "Le profil correspond au type de cible de la campagne.",
-    relevantOffer: businessContext?.businessDescription ?? "",
-    evidenceUsed: evidence.observedFacts.map((fact) => fact.type),
-    conversationGoal: "Ouvrir une conversation sur un besoin potentiel lié à l'offre.",
-    tone: "professionnel, direct, sans pression",
-  };
+  // The founder's own message wins whenever there is one.
+  const authored = guidance?.trim() ? substituteContactPlaceholders(guidance, contact).slice(0, 1000) : null;
 
-  const invitationNote = (businessContext?.companyName
-    ? `Bonjour ${firstName}, je travaille chez ${businessContext.companyName}${hasCompany ? ` et votre profil chez ${candidate.company} m'intéresse` : " et votre profil m'intéresse"}. Ravi d'échanger !`
-    : `Bonjour ${firstName}, votre profil m'intéresse, ravi d'échanger avec vous !`
+  // angle.relevantOffer is already the most specific real offering datum
+  // available (valueProposition > products > services > businessDescription)
+  // — never an invented one, and empty when nothing is known.
+  const offer = angle.relevantOffer.trim();
+  const opener = intent.objective === "prospecting"
+    ? `Bonjour ${firstName},`
+    : intent.objective === "reactivation"
+      ? `Bonjour ${firstName}, cela fait un moment.`
+      : `Bonjour ${firstName}, je reviens vers vous.`;
+
+  const message = authored ?? (offer
+    ? [
+        opener,
+        // Apposition rather than a sentence built around the offer: a
+        // valueProposition can be a noun phrase, an infinitive or a full
+        // sentence, and only an apposition stays grammatical for all three.
+        offering.companyName ? `je travaille chez ${offering.companyName} — ${lowerFirst(offer)}.` : `${offer}.`,
+        hasCompany ? `Est-ce un sujet sur lequel vous travaillez chez ${candidate.company} ?` : "Est-ce un sujet qui vous concerne en ce moment ?",
+      ].join(" ")
+    // Nothing known to present: a short, honest contact rather than a
+    // generic question dressed up as personalization.
+    : `${opener} je me permets de vous contacter directement. Seriez-vous ouvert a un echange rapide ?`);
+
+  const invitationNote = (authored && intent.objective !== "prospecting"
+    ? authored
+    : offering.companyName
+      ? `Bonjour ${firstName}, je travaille chez ${offering.companyName}${offer ? ` — ${lowerFirst(offer)}` : ""}. Ravi d'echanger !`
+      : `Bonjour ${firstName}, ravi d'echanger avec vous !`
   ).slice(0, 300);
 
-  const message = [
-    `Bonjour ${firstName}, merci d'avoir accepté mon invitation !`,
-    targetType ? `Je travaille notamment avec des profils comme ${targetType.toLowerCase()}` : businessContext?.businessDescription ? `Je travaille sur ${businessContext.businessDescription}` : null,
-    hasCompany ? `est-ce un sujet pertinent chez ${candidate.company} ?` : "est-ce un sujet qui pourrait vous intéresser ?",
-  ].filter(Boolean).join(" ");
-
-  return { outreachAngle, invitationNote, message };
+  return { invitationNote, message };
 }
 
-// A follow-up is a message step like any other (docs spec §9) — the
-// executor already sends whatever `approvedText` is keyed to its stepId, so
-// nothing changes there. What a follow-up needs beyond the first message is
-// continuity (docs spec §12): it must read as "coming back to" the prior
-// message, never as a fresh introduction. `previousText` is the best text
-// known so far for the immediately preceding message-type step — approved
-// if approved, otherwise the last proposal — never fabricated content.
+function lowerFirst(value: string): string {
+  return value.charAt(0).toLowerCase() + value.slice(1);
+}
+
 function deterministicFollowUp(candidate: CandidateFacts): string {
   const firstName = candidate.name.split(/\s+/)[0] || candidate.name;
   return `Bonjour ${firstName}, je me permets de revenir vers vous au cas où mon précédent message se serait perdu. Est-ce que le sujet vous intéresse toujours ?`;
@@ -352,6 +597,8 @@ async function generateFollowUpArtifact(
   }
 }
 
+type GeneratedArtifact = { text: string; usedFactTypes: string[]; usedOfferingFields: string[] };
+
 const GENERATED_ARTIFACT_SCHEMA = {
   type: "object",
   properties: {
@@ -360,8 +607,14 @@ const GENERATED_ARTIFACT_SCHEMA = {
     // relied on — validated server-side by isGroundedText(), never trusted
     // blindly (docs spec §6).
     usedFactTypes: { type: "array", items: { type: "string" } },
+    // The second grounding axis: which OFFERING fields this text asserts
+    // something from. Validated the same way — a field named here must
+    // genuinely carry data. Separate from usedFactTypes on purpose: one
+    // proves a claim about the prospect, the other a claim about us, and
+    // conflating them is what let "our offer" borrow the prospect's proof.
+    usedOfferingFields: { type: "array", items: { type: "string", enum: ["companyName", "businessDescription", "valueProposition", "services", "products", "painPoints", "salesAngles"] } },
   },
-  required: ["text", "usedFactTypes"],
+  required: ["text", "usedFactTypes", "usedOfferingFields"],
   additionalProperties: false,
 };
 
@@ -390,64 +643,123 @@ const GENERATION_SCHEMA = {
 // The five explicitly-labeled sections (docs spec §4) — each carries its
 // own epistemic instruction, so the separation lives in what the model
 // actually reads, not only in our internal types.
-function buildGenerationPrompt(businessContext: BusinessContextRecord | null, strategy: CampaignStrategy | null, evidence: PersonalizationEvidence, guidance?: string): string {
-  const observed = evidence.observedFacts.map((fact) => `- ${fact.type}: ${fact.value}`).join("\n") || "(aucun fait observé)";
+function buildOfferingBlock(offering: Offering): string {
+  const lines = [
+    offering.companyName ? `- companyName : ${offering.companyName}` : null,
+    offering.businessDescription ? `- businessDescription : ${offering.businessDescription}` : null,
+    offering.valueProposition ? `- valueProposition : ${offering.valueProposition}` : null,
+    offering.products.length ? `- products : ${offering.products.join(", ")}` : null,
+    offering.services.length ? `- services : ${offering.services.join(", ")}` : null,
+    offering.painPoints.length ? `- painPoints (problemes que l'expediteur traite) : ${offering.painPoints.join(" ; ")}` : null,
+    offering.salesAngles.length ? `- salesAngles (angles commerciaux connus) : ${offering.salesAngles.join(" ; ")}` : null,
+  ].filter(Boolean);
+  return lines.length ? lines.join("\n") : "(aucune information commerciale connue sur l'expediteur)";
+}
+
+// The generator's whole input, in the order the model reads it: what we know
+// about the prospect, what we know about ourselves, what this campaign is
+// for, and the angle Talvia derived from the three. The two evidence regimes
+// are separate blocks with separate proof obligations, and the two blocks
+// that license NEITHER (qualification, targeting) say so in their own header.
+function buildGenerationPrompt(offering: Offering, intent: CampaignIntent, angle: OutreachAngle, evidence: PersonalizationEvidence, guidance?: string): string {
+  const observed = evidence.observedFacts.map((fact) => `- ${fact.type}: ${fact.value}`).join("\n") || "(aucun fait observe)";
   const qualification = evidence.qualificationContext
-    ? `Score: ${evidence.qualificationContext.score}/100, fit: ${evidence.qualificationContext.fit}.\nRaisons internes: ${evidence.qualificationContext.reasons.join("; ") || "aucune"}.\nIncertitudes internes: ${evidence.qualificationContext.uncertainties.join("; ") || "aucune"}.`
+    ? `Score: ${evidence.qualificationContext.score}/100, fit: ${evidence.qualificationContext.fit}. Raisons internes: ${evidence.qualificationContext.reasons.join("; ") || "aucune"}. Incertitudes internes: ${evidence.qualificationContext.uncertainties.join("; ") || "aucune"}.`
     : "(aucune qualification disponible)";
   const strategyBlock = evidence.strategyContext
-    ? `Rôles recherchés par la campagne (en général) : ${evidence.strategyContext.targetRoles.join(", ") || "non précisé"}.\nTypes d'entreprises recherchés (en général) : ${evidence.strategyContext.companyTypes.join(", ") || "non précisé"}.\nSecteurs recherchés (en général) : ${evidence.strategyContext.industries.join(", ") || "non précisé"}.`
-    : "(aucune stratégie disponible)";
+    ? [
+        `Roles recherches par la campagne (en general) : ${evidence.strategyContext.targetRoles.join(", ") || "non precise"}.`,
+        `Types d'entreprises recherches (en general) : ${evidence.strategyContext.companyTypes.join(", ") || "non precise"}.`,
+        `Secteurs recherches (en general) : ${evidence.strategyContext.industries.join(", ") || "non precise"}.`,
+      ].join("\n")
+    : "(aucune strategie disponible)";
   const uncertainties = evidence.uncertainties.length ? evidence.uncertainties.map((note) => `- ${note}`).join("\n") : "(aucune)";
 
+  const instructions = [
+    "INSTRUCTIONS :",
+    "Redige : 1) une note d'invitation LinkedIn courte (300 caracteres maximum, faible pression) ; 2) un premier message post-acceptation, court et conversationnel.",
+    "",
+    "DEUX REGIMES DE PREUVE, a ne jamais confondre :",
+    "- Toute affirmation sur LE PROSPECT (sa fonction, son entreprise, sa situation, ses besoins, ses intentions) exige un element de PROSPECT EVIDENCE. Sans preuve : formule-la en QUESTION OUVERTE, ou ne la dis pas.",
+    "- Toute affirmation sur VOTRE ENTREPRISE OU VOTRE OFFRE exige une information correspondante dans OFFERING. Avec elle, affirme-la directement : c'est le contenu commercial attendu.",
+    "- QUALIFICATION CONTEXT et CAMPAIGN TARGETING ne justifient NI l'un NI l'autre.",
+    "",
+    "INTERDIT ABSOLU : inventer un prix, un tarif, une gratuite, un essai, une duree, un delai, une remise, une promotion, une garantie, un remboursement, une fonctionnalite, un chiffre ou une preuve sociale (nombre de clients, position sur le marche) qui ne figure pas dans OFFERING. Si tu ne le sais pas, ne le dis pas : n'ecris pas d'approximation, ne comble pas le vide.",
+    "",
+    "N'utilise PAS « pouvez-vous me parler de votre entreprise ? » ni aucune variante qui demande au prospect de faire le travail de presentation a ta place : en prospection, c'est a l'expediteur d'apporter la matiere. Si OFFERING est vide, reste sur une prise de contact courte et honnete plutot que sur une question generique de remplissage.",
+    "",
+    "Choisis toi-meme la structure et l'accroche : aucune formule imposee. Pas de « I hope this message finds you well », pas de compliment artificiel, pas de jargon IA.",
+    "",
+    "Pour CHAQUE texte, renseigne usedFactTypes (les types de PROSPECT EVIDENCE reellement utilises) et usedOfferingFields (les champs d'OFFERING reellement utilises). Ces deux listes sont verifiees cote serveur : citer un element absent invalide le texte. Reponds en francais.",
+  ].join("\n");
+
   return [
-    `=== OBSERVED FACTS ===\nFaits directement observés pour CE prospect précis. Tu peux les affirmer comme des faits.\n${observed}`,
-    `=== QUALIFICATION CONTEXT (analyse interne Talvia — PAS des faits observés) ===\nÀ utiliser uniquement pour décider de la pertinence et de l'angle à adopter. Ne présente JAMAIS ces conclusions comme des faits observés sur la personne — ce sont des hypothèses de qualification, pas des observations.\n${qualification}`,
-    `=== CAMPAIGN STRATEGY (décrit qui la campagne veut atteindre en général — PAS un fait sur ce prospect précis) ===\nCeci décrit la cible recherchée en général. Cela ne prouve RIEN sur les attributs individuels de cette personne — par exemple, si la stratégie cible des "agences" et que l'entreprise observée est "Acme", cela ne veut PAS dire qu'Acme est une agence.\n${strategyBlock}`,
-    `=== UNCERTAINTIES / UNKNOWN ===\nCes éléments sont explicitement inconnus. Ne les transforme JAMAIS en affirmation.\n${uncertainties}`,
-    `=== BUSINESS CONTEXT (décrit l'expéditeur, pas le prospect) ===\n${businessContext?.companyName ?? "inconnue"}${businessContext?.businessDescription ? ` — ${businessContext.businessDescription}` : ""}`,
-    guidance ? `Consigne du fondateur pour le message : ${guidance}` : null,
-    `INSTRUCTIONS :\nRédige, fondé UNIQUEMENT sur OBSERVED FACTS (et BUSINESS CONTEXT pour décrire ta propre offre) :\n1) un angle de conversation structuré — il peut s'appuyer sur QUALIFICATION CONTEXT et CAMPAIGN STRATEGY pour choisir la pertinence, mais l'angle reste un raisonnement interne, jamais une observation à énoncer telle quelle ;\n2) une note d'invitation LinkedIn courte (300 caractères maximum, faible pression, pas de pitch commercial) ;\n3) un premier message post-acceptation, court et conversationnel, avec une raison claire de parler.\n\nRÈGLE ABSOLUE : si une idée provient de QUALIFICATION CONTEXT ou CAMPAIGN STRATEGY plutôt que d'OBSERVED FACTS, formule-la comme une QUESTION OUVERTE, jamais comme une affirmation sur cette personne. Interdit : "Je vois que l'acquisition est un problème chez vous." Autorisé : "Est-ce que l'acquisition est un sujet que vous travaillez actuellement ?"\n\nPour l'invitation ET le message, indique aussi \`usedFactTypes\` : la liste des types d'OBSERVED FACTS que tu as réellement utilisés pour écrire ce texte précis. Laisse cette liste vide si le texte ne s'appuie sur aucun fait individuel précis (par exemple une question générique). N'invente rien de la liste UNCERTAINTIES. Pas de formule générique ("I hope this message finds you well"), pas de compliment artificiel, pas de jargon IA. Réponds en français.`,
+    `=== PROSPECT EVIDENCE (faits directement observes sur CE prospect - la SEULE base autorisee pour affirmer quelque chose LE concernant) ===\n${observed}`,
+    `=== OFFERING (ce que vend l'expediteur - la SEULE base autorisee pour affirmer quelque chose sur VOTRE entreprise ou votre offre) ===\nCes informations sont verifiees et viennent du Business Context du workspace. Tu PEUX les affirmer telles quelles : decrire ce que fait l'expediteur, ce qu'il propose et quels problemes il traite est legitime et attendu.\n${buildOfferingBlock(offering)}`,
+    `=== CAMPAIGN INTENT (objectif commercial de CETTE campagne : ${intent.objective}) ===\nBut : ${intent.goal}\nPosture : ${intent.stance}\nProchaine etape a provoquer : ${intent.nextStep}`,
+    `=== SALES ANGLE (raisonnement interne prepare par Talvia - une orientation, PAS un texte a recopier) ===\nPourquoi cette personne : ${angle.whyContactThisPerson}\nCe qui peut lui etre presente : ${angle.relevantOffer || "(rien de connu)"}\nObjectif de la conversation : ${angle.conversationGoal}\nTon : ${angle.tone}`,
+    `=== QUALIFICATION CONTEXT (analyse interne Talvia - NI un fait sur le prospect, NI une information sur l'offre) ===\nA utiliser uniquement pour juger de la pertinence. Ne presente JAMAIS ces conclusions comme des faits observes sur la personne.\n${qualification}`,
+    `=== CAMPAIGN TARGETING (qui la campagne cherche en general - PAS un fait sur ce prospect precis) ===\nCela ne prouve RIEN sur les attributs individuels de cette personne : si le ciblage vise des "agences" et que l'entreprise observee est "Acme", cela ne veut PAS dire qu'Acme est une agence.\n${strategyBlock}`,
+    `=== UNCERTAINTIES / UNKNOWN ===\nCes elements sont explicitement inconnus. Ne les transforme JAMAIS en affirmation.\n${uncertainties}`,
+    guidance ? `=== CONSIGNE DU FONDATEUR (intention redactionnelle a respecter, pas un texte a recopier tel quel) ===\n${guidance}` : null,
+    instructions,
   ].filter(Boolean).join("\n\n");
 }
 
-// The single AI call for this participant (docs spec §15) — evidence,
-// angle, invitation, and message all come back together, never separate
-// round-trips, and never a second "verify the AI" call: grounding is
-// checked from the same response's own usedFactTypes.
+// Offering x Campaign Intent x Prospect Evidence -> Sales Angle -> Message.
+// The angle is derived first and passed to BOTH paths, so the deterministic
+// fallback and the model reason from the same basis and differ only in how
+// well they write it.
 async function generatePersonalization(
-  businessContext: BusinessContextRecord | null,
+  offering: Offering,
+  intent: CampaignIntent,
   strategy: CampaignStrategy | null,
   candidate: CandidateFacts,
   guidance?: string,
 ): Promise<{ evidence: PersonalizationEvidence; outreachAngle: OutreachAngle; invitationNote: string; message: string; invitationMode: GenerationMode; messageMode: GenerationMode; aiModel: string | null }> {
   const evidence = buildPersonalizationEvidence(candidate, strategy);
+  const angle = buildSalesAngle(offering, intent, evidence);
+  const fallback = () => deterministicFallback(candidate, offering, intent, angle, evidence, guidance);
   const provider = getAIProvider();
   // No provider configured is not a hidden condition: the texts below are
   // the deterministic ones, and they are labelled as such all the way to the
   // UI (generationMode) instead of being passed off as AI output.
-  if (!provider) return { evidence, ...deterministicFallback(candidate, businessContext, strategy, evidence), invitationMode: "deterministic_fallback", messageMode: "deterministic_fallback", aiModel: null };
+  if (!provider) return { evidence, outreachAngle: angle, ...fallback(), invitationMode: "deterministic_fallback", messageMode: "deterministic_fallback", aiModel: null };
 
   try {
-    const result = await provider.generateStructured<{ outreachAngle: OutreachAngle; invitation: { text: string; usedFactTypes: string[] }; message: { text: string; usedFactTypes: string[] } }>({
-      system: "Tu écris des messages de prospection LinkedIn humains, courts et fondés STRICTEMENT sur les OBSERVED FACTS fournis. QUALIFICATION CONTEXT et CAMPAIGN STRATEGY sont du contexte interne, jamais des faits à affirmer sur la personne. Formule toute idée non directement observée comme une question, jamais une affirmation. Réponds en français.",
-      prompt: buildGenerationPrompt(businessContext, strategy, evidence, guidance),
+    const result = await provider.generateStructured<{ invitation: GeneratedArtifact; message: GeneratedArtifact }>({
+      system: "Tu ecris des messages de prospection LinkedIn humains et courts. Deux regimes de preuve distincts : toute affirmation sur le PROSPECT exige un element de PROSPECT EVIDENCE, toute affirmation sur l'entreprise ou l'offre de l'EXPEDITEUR exige un champ correspondant d'OFFERING. Presenter ce que vend l'expediteur est legitime et attendu. QUALIFICATION CONTEXT et CAMPAIGN TARGETING ne justifient aucune des deux. N'invente jamais un prix, une gratuite, une duree, une remise, une garantie, une fonctionnalite ou une preuve sociale absente d'OFFERING. Reponds en francais.",
+      prompt: buildGenerationPrompt(offering, intent, angle, evidence, guidance),
       schemaName: "PersonalizationGeneration",
       schema: GENERATION_SCHEMA,
       maxTokens: 1000,
     });
 
     const observedTypes = new Set(evidence.observedFacts.map((fact) => fact.type));
-    const fallback = deterministicFallback(candidate, businessContext, strategy, evidence);
+    const filledOffering = populatedOfferingFields(offering);
+    const safe = fallback();
 
-    const invitationGrounded = isGroundedText(result.data.invitation.text, result.data.invitation.usedFactTypes, observedTypes) && !containsUnsupportedClaim(result.data.invitation.text);
-    const messageGrounded = isGroundedText(result.data.message.text, result.data.message.usedFactTypes, observedTypes) && !containsUnsupportedClaim(result.data.message.text);
+    // Both axes, plus both "never invent" nets: the prospect-side one that
+    // already existed, and the offer-side one this pass adds.
+    // `?? []` on both lists: a model that omits one is claiming to cite
+    // nothing from it, which is the safe reading — never a crash, and never
+    // an implicit pass.
+    const accept = (artifact: GeneratedArtifact) =>
+      isGroundedText(artifact.text, artifact.usedFactTypes ?? [], observedTypes, artifact.usedOfferingFields ?? [], filledOffering)
+      && !containsUnsupportedClaim(artifact.text)
+      && !containsUnsupportedOfferClaim(artifact.text, offering);
+
+    const invitationGrounded = accept(result.data.invitation);
+    const messageGrounded = accept(result.data.message);
 
     return {
       evidence,
-      outreachAngle: result.data.outreachAngle,
-      invitationNote: (invitationGrounded ? result.data.invitation.text : fallback.invitationNote).slice(0, 300),
-      message: messageGrounded ? result.data.message.text : fallback.message,
+      // The angle stays Talvia's own derivation. Letting the model return it
+      // would make the reviewer's stated rationale whatever the model felt
+      // like claiming, including for a text that validation then rejected.
+      outreachAngle: angle,
+      invitationNote: (invitationGrounded ? result.data.invitation.text : safe.invitationNote).slice(0, 300),
+      message: messageGrounded ? result.data.message.text : safe.message,
       invitationMode: invitationGrounded ? "ai_grounded" : "deterministic_fallback",
       messageMode: messageGrounded ? "ai_grounded" : "deterministic_fallback",
       // Reported only when at least one text the caller actually receives
@@ -457,7 +769,7 @@ async function generatePersonalization(
       aiModel: invitationGrounded || messageGrounded ? result.model : null,
     };
   } catch {
-    return { evidence, ...deterministicFallback(candidate, businessContext, strategy, evidence), invitationMode: "deterministic_fallback", messageMode: "deterministic_fallback", aiModel: null };
+    return { evidence, outreachAngle: angle, ...fallback(), invitationMode: "deterministic_fallback", messageMode: "deterministic_fallback", aiModel: null };
   }
 }
 
@@ -521,6 +833,19 @@ export async function generateParticipantPersonalization(context: WorkspaceConte
 
   const strategy = await getCampaignStrategy(context, campaignId);
   const businessContext = await getActiveBusinessContext(context);
+  // The commercial substance of the Business Context, projected into the
+  // shape the generator can actually cite. Previously only companyName and
+  // businessDescription survived this far — valueProposition, products,
+  // services, painPoints and salesAngles were loaded from the same row and
+  // dropped, which is why a prospecting message had nothing to propose.
+  const offering = buildOffering(businessContext);
+  // campaigns.objective: an existing column this path never read, so
+  // prospecting, follow_up and reactivation produced identical text.
+  const campaignRow = await database.query<{ objective: CampaignObjective }>(
+    `select objective from campaigns where workspace_id=$1 and id=$2`,
+    [context.workspaceId, campaignId],
+  );
+  const intent = buildCampaignIntent(campaignRow.rows[0]?.objective ?? "prospecting");
   // ALL message-type steps in order — a follow-up (docs spec §9) is just
   // another step of type 'message', not a second mechanism.
   const messageSteps = await database.query<{ id: string; message_template: string | null }>(
@@ -531,7 +856,7 @@ export async function generateParticipantPersonalization(context: WorkspaceConte
 
   let generated;
   try {
-    generated = await generatePersonalization(businessContext, strategy, candidate, firstStep?.message_template ?? undefined);
+    generated = await generatePersonalization(offering, intent, strategy, candidate, firstStep?.message_template ?? undefined);
   } catch {
     return { ok: false, reason: "AI_GENERATION_FAILED" };
   }
